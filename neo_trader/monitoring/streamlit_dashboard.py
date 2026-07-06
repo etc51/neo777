@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypeVar, cast
 
 from neo_trader.risk.manager import RiskConfig
+from neo_trader.runtime import get_runtime_commit_hash
 
 JsonMapping: TypeAlias = Mapping[str, Any]
 VolatilityRegime: TypeAlias = Literal["low", "normal", "high", "extreme", "unknown"]
@@ -128,6 +129,7 @@ class DashboardState:
     signals: tuple[SignalSnapshot, ...] = ()
     positions: tuple[PositionSnapshot, ...] = ()
     orders: tuple[OrderSnapshot, ...] = ()
+    commit_hash: str = field(default_factory=get_runtime_commit_hash)
 
     @classmethod
     def empty(cls, *, updated_at: datetime | None = None) -> DashboardState:
@@ -195,6 +197,7 @@ def dashboard_state_from_mapping(raw: JsonMapping) -> DashboardState:
         signals=_parse_sequence(raw.get("signals"), _signal_from_mapping),
         positions=_parse_sequence(raw.get("positions"), _position_from_mapping),
         orders=_parse_sequence(raw.get("orders"), _order_from_mapping),
+        commit_hash=str(raw.get("commit_hash") or get_runtime_commit_hash()),
     )
 
 
@@ -230,6 +233,7 @@ def dashboard_state_to_tables(
         "signals": [_signal_row(signal) for signal in state.active_signals],
         "positions": [_position_row(position) for position in state.positions],
         "orders": [_order_row(order) for order in state.orders],
+        "runtime": [{"commit_hash": state.commit_hash}],
     }
 
 
@@ -251,6 +255,7 @@ def run_streamlit_dashboard(config: DashboardRenderConfig | None = None) -> None
             str(resolved_config.state_path) if resolved_config.state_path else "not configured"
         )
         st.text_input("Snapshot path", value=state_path_text, disabled=True)
+        st.text_input("Commit hash", value=state.commit_hash, disabled=True)
         st.metric("Refresh seconds", resolved_config.refresh_seconds)
         st.button("Refresh")
 

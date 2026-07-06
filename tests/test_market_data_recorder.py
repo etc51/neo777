@@ -88,6 +88,7 @@ def test_market_data_recorder_writes_parquet_partitions(tmp_path: Path) -> None:
     )
 
     assert result.events_recorded == 3
+    assert result.commit_hash
     for event_type in MarketDataEventType:
         path = (
             tmp_path
@@ -176,6 +177,7 @@ def test_recorder_reconnects_with_exponential_backoff(tmp_path: Path) -> None:
 
     assert result.events_recorded == 1
     assert result.reconnects == 2
+    assert result.commit_hash
     assert delays == [1, 2]
 
 

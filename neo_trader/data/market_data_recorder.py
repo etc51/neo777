@@ -11,12 +11,14 @@ import importlib
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol, TypeAlias, cast
+
+from neo_trader.runtime import get_runtime_commit_hash
 
 JsonMapping: TypeAlias = Mapping[str, Any]
 AsyncSleepFunc: TypeAlias = Callable[[float], Awaitable[None]]
@@ -338,6 +340,7 @@ class MarketDataRecorderResult:
     events_recorded: int
     reconnects: int
     quality: tuple[MarketDataQualitySnapshot, ...]
+    commit_hash: str = field(default_factory=get_runtime_commit_hash)
 
 
 class MarketDataRecorderError(Exception):

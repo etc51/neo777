@@ -26,6 +26,7 @@ from neo_trader.features.orderbook import (
     spread_bps,
     weighted_imbalance,
 )
+from neo_trader.runtime import get_runtime_commit_hash
 from neo_trader.strategy.opening_range_book_momentum import (
     OpeningRangeBookMomentumConfig,
     OpeningRangeBookMomentumStrategy,
@@ -185,6 +186,7 @@ class BacktestReport:
     metrics: BacktestMetrics
     trades: tuple[BacktestTrade, ...]
     fills: tuple[BacktestFill, ...]
+    commit_hash: str = field(default_factory=get_runtime_commit_hash)
 
     def export_csv(self, directory: Path | str) -> BacktestCsvExport:
         """Write metrics, trades, and fills CSV files into ``directory``."""
@@ -212,6 +214,7 @@ class BacktestReport:
         with Path(path).open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(["metric", "value"])
+            writer.writerow(["commit_hash", self.commit_hash])
             for key, value in _metrics_rows(self.metrics):
                 writer.writerow([key, value])
 
@@ -221,6 +224,7 @@ class BacktestReport:
             writer.writerow(
                 [
                     "instrument_uid",
+                    "commit_hash",
                     "side",
                     "entry_time",
                     "exit_time",
@@ -240,6 +244,7 @@ class BacktestReport:
                 writer.writerow(
                     [
                         trade.instrument_uid,
+                        self.commit_hash,
                         trade.side.value,
                         trade.entry_time.isoformat(),
                         trade.exit_time.isoformat(),
@@ -262,6 +267,7 @@ class BacktestReport:
             writer.writerow(
                 [
                     "timestamp",
+                    "commit_hash",
                     "instrument_uid",
                     "side",
                     "requested_quantity",
@@ -277,6 +283,7 @@ class BacktestReport:
                 writer.writerow(
                     [
                         fill.timestamp.isoformat(),
+                        self.commit_hash,
                         fill.instrument_uid,
                         fill.side.value,
                         str(fill.requested_quantity),
@@ -294,7 +301,8 @@ class BacktestReport:
 
         metrics_html = _html_table(
             ("Metric", "Value"),
-            tuple((name, value) for name, value in _metrics_rows(self.metrics)),
+            (("commit_hash", self.commit_hash),)
+            + tuple((name, value) for name, value in _metrics_rows(self.metrics)),
         )
         trade_rows = tuple(_trade_html_row(trade) for trade in self.trades)
         fills_rows = tuple(_fill_html_row(fill) for fill in self.fills)
@@ -309,6 +317,7 @@ class BacktestReport:
             "th{background:#f4f6f7;}"
             "</style></head><body>"
             "<h1>neo_trader backtest report</h1>"
+            f"<p>Commit hash: {html.escape(self.commit_hash)}</p>"
             "<h2>Metrics</h2>"
             f"{metrics_html}"
             "<h2>Trades</h2>"

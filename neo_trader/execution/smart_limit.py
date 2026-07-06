@@ -7,7 +7,7 @@ broker adapter; callers must provide a gateway implementation explicitly.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from neo_trader.config import Settings, get_settings
 from neo_trader.risk.manager import RiskAction, RiskDecision, RiskManager, RiskState
+from neo_trader.runtime import get_runtime_commit_hash
 
 NumericInput: TypeAlias = Decimal | float | int | str
 UuidFactory: TypeAlias = Callable[[], str]
@@ -170,6 +171,7 @@ class ExecutionReport:
     accepted: bool
     action: ExecutionSide | None
     reason_codes: tuple[ExecutionReasonCode, ...]
+    commit_hash: str = field(default_factory=get_runtime_commit_hash)
     order_id: str | None = None
     idempotency_key: str | None = None
     order_type: ExecutionOrderType | None = None

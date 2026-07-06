@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ class AuditResult:
 
 
 def main() -> int:
+    print(f"runtime_commit_hash: {_runtime_commit_hash()}")
     checks: tuple[Callable[[], AuditResult], ...] = (
         check_live_default,
         check_mode_default,
@@ -277,6 +279,24 @@ def _literal_default(value: ast.expr) -> object:
         if value.args:
             return ast.literal_eval(value.args[0])
     raise ValueError("settings default must be a literal or Field(default=...)")
+
+
+def _runtime_commit_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        return "unknown"
+    return value
 
 
 def _env_example_values() -> dict[str, str]:

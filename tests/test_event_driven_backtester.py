@@ -44,6 +44,7 @@ def test_event_driven_backtester_replays_parquet_and_exports_report(tmp_path: Pa
     assert report.metrics.total_trades == 1
     assert report.metrics.closed_trades == 1
     assert report.metrics.total_pnl == Decimal("1.99")
+    assert report.commit_hash
     assert report.metrics.max_mae < 0
     assert report.metrics.max_mfe > 0
     assert report.trades[0].entry_price == Decimal("102.01")
@@ -61,12 +62,20 @@ def test_event_driven_backtester_replays_parquet_and_exports_report(tmp_path: Pa
     report.to_csv(compact_csv_path)
 
     assert csv_paths.metrics_path.read_text(encoding="utf-8").startswith("metric,value")
-    assert "instrument_uid,side,entry_time" in csv_paths.trades_path.read_text(encoding="utf-8")
+    assert "commit_hash" in csv_paths.metrics_path.read_text(encoding="utf-8")
+    assert "instrument_uid,commit_hash,side,entry_time" in csv_paths.trades_path.read_text(
+        encoding="utf-8"
+    )
     assert "requested_quantity,filled_quantity" in csv_paths.fills_path.read_text(
         encoding="utf-8"
     )
-    assert "neo_trader backtest report" in html_path.read_text(encoding="utf-8")
-    assert "UID1,LONG" in compact_csv_path.read_text(encoding="utf-8")
+    assert "commit_hash" in csv_paths.fills_path.read_text(encoding="utf-8")
+    html = html_path.read_text(encoding="utf-8")
+    assert "neo_trader backtest report" in html
+    assert "Commit hash" in html
+    compact_csv = compact_csv_path.read_text(encoding="utf-8")
+    assert "UID1" in compact_csv
+    assert "LONG" in compact_csv
 
 
 def test_parquet_reader_reads_and_sorts_recorder_partitions(tmp_path: Path) -> None:

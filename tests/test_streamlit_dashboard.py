@@ -19,6 +19,7 @@ def test_dashboard_state_loads_snapshot_and_calculates_pnl(tmp_path: Path) -> No
         """
         {
           "updated_at": "2026-07-06T10:15:00Z",
+          "commit_hash": "abc1234",
           "force_flatten_at": "18:40:00",
           "kill_switch_enabled": false,
           "realized_pnl": "125.50",
@@ -84,6 +85,7 @@ def test_dashboard_state_loads_snapshot_and_calculates_pnl(tmp_path: Path) -> No
     state = load_dashboard_state(path)
 
     assert state.updated_at == datetime(2026, 7, 6, 10, 15, tzinfo=UTC)
+    assert state.commit_hash == "abc1234"
     assert state.force_flatten_at == time(18, 40)
     assert state.realized_pnl == Decimal("125.50")
     assert state.unrealized_pnl == Decimal("12.50")
@@ -149,6 +151,7 @@ def test_dashboard_state_to_tables_contains_requested_sections() -> None:
     assert tables["signals"][0]["action"] == "EXIT"
     assert tables["positions"][0]["unrealized_pnl"] == "10"
     assert tables["orders"] == []
+    assert tables["runtime"][0]["commit_hash"]
 
 
 def test_countdown_to_force_flatten_returns_zero_after_deadline() -> None:

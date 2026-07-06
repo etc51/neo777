@@ -78,6 +78,7 @@ def test_marketable_limit_entry_passes_risk_and_submits_limit_order() -> None:
     )
 
     assert report.accepted is True
+    assert report.commit_hash
     assert report.reason_codes == (ExecutionReasonCode.SUBMITTED,)
     assert report.order_type is ExecutionOrderType.LIMIT
     assert report.idempotency_key == "uuid-entry"

@@ -1,5 +1,6 @@
 {
   "updated_at": "2026-07-06T10:15:00Z",
+  "commit_hash": "example",
   "force_flatten_at": "18:40:00",
   "kill_switch_enabled": false,
   "realized_pnl": "125.50",
