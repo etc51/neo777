@@ -74,6 +74,12 @@ def main() -> int:
         check_risk_manager_tests,
         check_ci_workflow_exists,
         check_config_files_exist,
+        check_run_data_recorder_exists,
+        check_recorder_cli_has_mock_mode,
+        check_recorder_cli_checks_readonly_flags,
+        check_recorder_cli_has_no_order_placement_imports,
+        check_dashboard_state_writer_exists,
+        check_makefile_recording_targets,
     )
     results = [check() for check in checks]
     for result in results:
@@ -518,6 +524,101 @@ def check_config_files_exist() -> AuditResult:
     )
 
 
+def check_run_data_recorder_exists() -> AuditResult:
+    path = ROOT / "scripts" / "run_data_recorder.py"
+    return AuditResult(
+        name="scripts/run_data_recorder.py exists",
+        passed=path.exists(),
+        detail=_relative(path) if path.exists() else "missing recorder CLI",
+    )
+
+
+def check_recorder_cli_has_mock_mode() -> AuditResult:
+    source = _read("scripts/run_data_recorder.py")
+    passed = all(
+        snippet in source
+        for snippet in (
+            '"mock"',
+            "MockMarketDataSource",
+            "_run_mock_mode",
+            "MarketDataRecorder",
+        )
+    )
+    return AuditResult(
+        name="recorder CLI has mock mode",
+        passed=passed,
+        detail="mock mode and synthetic source found" if passed else "missing mock mode",
+    )
+
+
+def check_recorder_cli_checks_readonly_flags() -> AuditResult:
+    source = _read("scripts/run_data_recorder.py")
+    required = (
+        "require_readonly_runtime_flags",
+        "TRADING_MODE",
+        "NEO_TRADER_TRADING_MODE",
+        "LIVE_TRADING_ENABLED",
+        "NEO_TRADER_LIVE_TRADING_ENABLED",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="recorder CLI checks readonly runtime flags",
+        passed=not missing,
+        detail=(
+            "readonly fail-fast checks found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_recorder_cli_has_no_order_placement_imports() -> AuditResult:
+    path = ROOT / "scripts" / "run_data_recorder.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    forbidden: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_forbidden_recorder_import(alias.name):
+                    forbidden.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if _is_forbidden_recorder_import(module):
+                forbidden.append(module)
+    source = path.read_text(encoding="utf-8")
+    if "SmartLimitExecutor" in source:
+        forbidden.append("SmartLimitExecutor")
+    return AuditResult(
+        name="recorder CLI does not import order placement modules",
+        passed=not forbidden,
+        detail=_violation_detail(forbidden),
+    )
+
+
+def check_dashboard_state_writer_exists() -> AuditResult:
+    path = ROOT / "neo_trader" / "monitoring" / "dashboard_state_writer.py"
+    if not path.exists():
+        return AuditResult("dashboard_state_writer exists", False, "missing writer module")
+    source = path.read_text(encoding="utf-8")
+    passed = "write_readonly_dashboard_state" in source and "os.replace" in source
+    return AuditResult(
+        name="dashboard_state_writer exists",
+        passed=passed,
+        detail="atomic writer found" if passed else "missing atomic writer function",
+    )
+
+
+def check_makefile_recording_targets() -> AuditResult:
+    source = _read("Makefile")
+    required = ("record-mock:", "record-readonly:", "run-dashboard-live-state:")
+    missing = [target for target in required if target not in source]
+    return AuditResult(
+        name="Makefile has recording targets",
+        passed=not missing,
+        detail="recording targets found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
 def _settings_default(field_name: str) -> object:
     tree = ast.parse(_read("neo_trader/config.py"))
     for node in tree.body:
@@ -604,6 +705,14 @@ def _looks_like_placeholder(value: str) -> bool:
 
 def _is_forbidden_strategy_import(module: str) -> bool:
     return module.startswith("neo_trader.broker") or module.startswith("neo_trader.execution")
+
+
+def _is_forbidden_recorder_import(module: str) -> bool:
+    return (
+        module.startswith("neo_trader.execution")
+        or module.startswith("neo_trader.risk.manager")
+        or "order_manager" in module
+    )
 
 
 def _read(path: str) -> str:

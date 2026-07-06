@@ -10,6 +10,8 @@ dist/
 build/
 data/raw/
 data/cache/
+data/reports/
+data/monitoring/dashboard_state.json
 review_bundle/
 neo_trader_review_bundle.zip
 neo_trader_review_bundle.sha256

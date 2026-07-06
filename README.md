@@ -160,3 +160,33 @@ python -m streamlit run neo_trader/monitoring/streamlit_dashboard.py -- --state 
 The dashboard shows instruments, spread, imbalance, volatility regime, active
 signals, positions, orders, realized/unrealized PnL, kill switch status, forced
 flatten countdown, and runtime commit hash.
+
+## Data Recording Sprint 1
+
+The recorder is readonly. It records market data snapshots only: no orders, no
+live trading, no paper execution, and no use of execution modules. Keep `.env`
+out of git; raw market data is excluded from git.
+
+Mock pipeline check without T-Bank API:
+
+```powershell
+python scripts\run_data_recorder.py --mode mock --duration-seconds 60 --output data\raw --dashboard-state data\monitoring\dashboard_state.json
+```
+
+Read the generated live-state dashboard snapshot:
+
+```powershell
+python -m streamlit run neo_trader\monitoring\streamlit_dashboard.py -- --state data\monitoring\dashboard_state.json
+```
+
+Makefile shortcuts:
+
+```bash
+make record-mock
+make record-readonly
+make run-dashboard-live-state
+```
+
+`record-readonly` is intentionally guarded by readonly safety flags and requires
+local `T_INVEST_TOKEN`. The real T-Bank stream source is still a TODO stub, and
+it must remain read-only when implemented.
