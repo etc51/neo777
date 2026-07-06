@@ -1,0 +1,15 @@
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+dist/
+build/
+data/raw/
+data/cache/
+review_bundle/
+neo_trader_review_bundle.zip
+neo_trader_review_bundle.sha256
