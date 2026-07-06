@@ -2,6 +2,9 @@
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import cast
+
+import pytest
 
 from neo_trader.execution.smart_limit import (
     BrokerOrderAck,
@@ -169,6 +172,73 @@ def test_cancel_replace_cancels_original_and_submits_remaining_quantity() -> Non
     assert risk_manager.calls == 2
 
 
+def test_cancel_replace_after_partial_fill_with_open_position_is_rejected() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-entry", "uuid-replace"])
+    initial = executor.enter_marketable_limit(
+        account_ref="acc",
+        instrument_id="uid",
+        side=ExecutionSide.BUY,
+        quote=MarketQuote(best_bid=Decimal("99"), best_ask=Decimal("100")),
+        risk_state=_risk_state(),
+        current_time=_now(),
+        stop_price=Decimal("98"),
+        quantity_cap=Decimal("10"),
+    )
+    executor.record_fill(
+        order_id=initial.order_id or "",
+        fill_quantity=Decimal("3"),
+        fill_price=Decimal("100.01"),
+    )
+
+    replacement = executor.cancel_replace(
+        order_id=initial.order_id or "",
+        quote=MarketQuote(best_bid=Decimal("100"), best_ask=Decimal("101")),
+        risk_state=_risk_state(
+            position=RiskPosition(RiskPositionSide.LONG, Decimal("3")),
+        ),
+        current_time=_now(),
+        stop_price=Decimal("98"),
+    )
+
+    assert replacement.accepted is False
+    assert replacement.reason_codes == (ExecutionReasonCode.RISK_REJECTED,)
+    assert replacement.risk_decision is not None
+    assert replacement.risk_decision.reason_codes == (RiskReasonCode.POSITION_ALREADY_OPEN,)
+    assert gateway.canceled == []
+    assert len(gateway.submitted) == 1
+
+
+def test_cancel_remaining_cancels_unfilled_remainder_without_risk_gate() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-entry"])
+    initial = executor.enter_marketable_limit(
+        account_ref="acc",
+        instrument_id="uid",
+        side=ExecutionSide.BUY,
+        quote=MarketQuote(best_bid=Decimal("99"), best_ask=Decimal("100")),
+        risk_state=_risk_state(),
+        current_time=_now(),
+        stop_price=Decimal("98"),
+        quantity_cap=Decimal("10"),
+    )
+    executor.record_fill(
+        order_id=initial.order_id or "",
+        fill_quantity=Decimal("3"),
+        fill_price=Decimal("100.01"),
+    )
+
+    canceled = executor.cancel_remaining(order_id=initial.order_id or "")
+
+    assert canceled.accepted is True
+    assert canceled.reason_codes == (ExecutionReasonCode.CANCEL_REMAINING_SUBMITTED,)
+    assert canceled.remaining_quantity == Decimal("0")
+    assert gateway.canceled == ["order-1"]
+    assert risk_manager.calls == 1
+
+
 def test_market_order_is_forbidden_outside_emergency_exit() -> None:
     risk_manager = CountingRiskManager()
     risk_decision = risk_manager.evaluate(
@@ -221,7 +291,7 @@ def test_quantity_exceeding_risk_approval_is_rejected() -> None:
     assert gateway.submitted == []
 
 
-def test_emergency_exit_allows_market_order_after_risk_and_status_checks() -> None:
+def test_emergency_exit_long_position_creates_sell_market_order() -> None:
     gateway = FakeGateway()
     risk_manager = CountingRiskManager()
     executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
@@ -229,47 +299,109 @@ def test_emergency_exit_allows_market_order_after_risk_and_status_checks() -> No
     report = executor.emergency_exit(
         account_ref="acc",
         instrument_id="uid",
-        side=ExecutionSide.SELL,
         quantity=Decimal("5"),
-        risk_state=RiskState(
-            account_equity=Decimal("100000"),
-            daily_realized_pnl=Decimal("0"),
-            trades_today=0,
-            market_data_last_seen_at=_now() - timedelta(seconds=1),
-            spread_bps=Decimal("2"),
-            expected_slippage_bps=Decimal("5"),
-            position=RiskPosition(RiskPositionSide.LONG, Decimal("5")),
-        ),
+        risk_state=_risk_state(position=RiskPosition(RiskPositionSide.LONG, Decimal("5"))),
         current_time=_now(),
     )
 
     assert report.accepted is True
+    assert report.action is ExecutionSide.SELL
+    assert report.reason_codes == (
+        ExecutionReasonCode.EMERGENCY_EXIT_SIDE_DERIVED,
+        ExecutionReasonCode.SUBMITTED,
+    )
     assert report.order_type is ExecutionOrderType.MARKET
     assert gateway.submitted[0].order_type is ExecutionOrderType.MARKET
+    assert gateway.submitted[0].side is ExecutionSide.SELL
     assert gateway.submitted[0].quantity == Decimal("5")
     assert risk_manager.calls == 1
 
 
-def test_emergency_exit_caps_quantity_to_current_position_size() -> None:
+def test_emergency_exit_short_position_creates_buy_market_order() -> None:
     gateway = FakeGateway()
     risk_manager = CountingRiskManager()
     executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
-    risk_state = RiskState(
-        account_equity=Decimal("100000"),
-        daily_realized_pnl=Decimal("0"),
-        trades_today=0,
-        market_data_last_seen_at=_now() - timedelta(seconds=1),
-        spread_bps=Decimal("2"),
-        expected_slippage_bps=Decimal("5"),
-        position=RiskPosition(RiskPositionSide.LONG, Decimal("3")),
-    )
 
     report = executor.emergency_exit(
         account_ref="acc",
         instrument_id="uid",
-        side=ExecutionSide.SELL,
+        quantity=Decimal("4"),
+        risk_state=_risk_state(position=RiskPosition(RiskPositionSide.SHORT, Decimal("4"))),
+        current_time=_now(),
+    )
+
+    assert report.accepted is True
+    assert report.action is ExecutionSide.BUY
+    assert gateway.submitted[0].side is ExecutionSide.BUY
+    assert gateway.submitted[0].order_type is ExecutionOrderType.MARKET
+    assert gateway.submitted[0].quantity == Decimal("4")
+
+
+def test_emergency_exit_flat_position_is_rejected_noop() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
+
+    report = executor.emergency_exit(
+        account_ref="acc",
+        instrument_id="uid",
+        quantity=Decimal("1"),
+        risk_state=_risk_state(),
+        current_time=_now(),
+    )
+
+    assert report.accepted is False
+    assert report.action is None
+    assert report.reason_codes == (ExecutionReasonCode.NO_POSITION_TO_EXIT,)
+    assert gateway.submitted == []
+    assert risk_manager.calls == 0
+
+
+def test_emergency_exit_rejects_invalid_position_side() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
+
+    report = executor.emergency_exit(
+        account_ref="acc",
+        instrument_id="uid",
+        quantity=Decimal("1"),
+        risk_state=_risk_state(
+            position=RiskPosition(cast(RiskPositionSide, "BROKEN"), Decimal("1")),
+        ),
+        current_time=_now(),
+    )
+
+    assert report.accepted is False
+    assert report.reason_codes == (ExecutionReasonCode.INVALID_POSITION_SIDE,)
+    assert gateway.submitted == []
+    assert risk_manager.calls == 0
+
+
+def test_caller_cannot_pass_emergency_exit_side_manually() -> None:
+    executor = _executor(FakeGateway(), CountingRiskManager(), uuids=["uuid-exit"])
+
+    with pytest.raises(TypeError):
+        executor.emergency_exit(  # type: ignore[call-arg]
+            account_ref="acc",
+            instrument_id="uid",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("1"),
+            risk_state=_risk_state(position=RiskPosition(RiskPositionSide.LONG, Decimal("1"))),
+            current_time=_now(),
+        )
+
+
+def test_emergency_exit_never_increases_exposure() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
+
+    report = executor.emergency_exit(
+        account_ref="acc",
+        instrument_id="uid",
         quantity=Decimal("999999"),
-        risk_state=risk_state,
+        risk_state=_risk_state(position=RiskPosition(RiskPositionSide.LONG, Decimal("3"))),
         current_time=_now(),
     )
 
@@ -389,7 +521,7 @@ def _executor(
     )
 
 
-def _risk_state() -> RiskState:
+def _risk_state(position: RiskPosition | None = None) -> RiskState:
     return RiskState(
         account_equity=Decimal("100000"),
         daily_realized_pnl=Decimal("0"),
@@ -397,6 +529,7 @@ def _risk_state() -> RiskState:
         market_data_last_seen_at=_now() - timedelta(seconds=1),
         spread_bps=Decimal("2"),
         expected_slippage_bps=Decimal("5"),
+        position=position or RiskPosition(),
     )
 
 

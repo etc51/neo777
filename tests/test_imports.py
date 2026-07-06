@@ -9,6 +9,7 @@ MODULES = [
     "neo_trader.broker",
     "neo_trader.broker.tbank",
     "neo_trader.config",
+    "neo_trader.config_loader",
     "neo_trader.data",
     "neo_trader.data.market_data_recorder",
     "neo_trader.execution",

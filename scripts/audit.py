@@ -5,12 +5,15 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 ROOT: Final = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 TEXT_SUFFIXES: Final = {
     "",
     ".example",
@@ -59,6 +62,11 @@ def main() -> int:
         check_market_orders_blocked_for_entries,
         check_position_open_blocks_entries,
         check_emergency_exit_quantity_capped,
+        check_emergency_exit_public_api_has_no_side_parameter,
+        check_emergency_exit_derives_side_from_position,
+        check_strategy_required_reason_codes,
+        check_config_loader_exists,
+        check_configs_load_successfully,
         check_forced_flatten,
         check_kill_switch,
         check_stale_market_data,
@@ -277,12 +285,137 @@ def check_emergency_exit_quantity_capped() -> AuditResult:
     tests = _read("tests/test_smart_limit_executor.py")
     passed = (
         "exit_quantity = min(requested_quantity, risk_decision.position_size)" in source
-        and "test_emergency_exit_caps_quantity_to_current_position_size" in tests
+        and "test_emergency_exit_never_increases_exposure" in tests
     )
     return AuditResult(
         name="emergency_exit quantity capped by position size",
         passed=passed,
         detail="cap and regression test found" if passed else "missing emergency cap",
+    )
+
+
+def check_emergency_exit_public_api_has_no_side_parameter() -> AuditResult:
+    source_path = ROOT / "neo_trader" / "execution" / "smart_limit.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    side_parameter_found = True
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "SmartLimitExecutor":
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.FunctionDef) and statement.name == "emergency_exit":
+                arg_names = [arg.arg for arg in statement.args.args]
+                arg_names.extend(arg.arg for arg in statement.args.kwonlyargs)
+                side_parameter_found = "side" in arg_names
+    tests = _read("tests/test_smart_limit_executor.py")
+    passed = (
+        not side_parameter_found
+        and "test_caller_cannot_pass_emergency_exit_side_manually" in tests
+    )
+    return AuditResult(
+        name="emergency_exit public API has no side parameter",
+        passed=passed,
+        detail="side removed and caller TypeError test found" if passed else "side parameter found",
+    )
+
+
+def check_emergency_exit_derives_side_from_position() -> AuditResult:
+    source = _read("neo_trader/execution/smart_limit.py")
+    tests = _read("tests/test_smart_limit_executor.py")
+    required_source = (
+        "_derive_emergency_exit_side(risk_state.position)",
+        "RiskPositionSide.LONG",
+        "ExecutionSide.SELL",
+        "RiskPositionSide.SHORT",
+        "ExecutionSide.BUY",
+        "NO_POSITION_TO_EXIT",
+        "EMERGENCY_EXIT_SIDE_DERIVED",
+        "INVALID_POSITION_SIDE",
+    )
+    required_tests = (
+        "test_emergency_exit_long_position_creates_sell_market_order",
+        "test_emergency_exit_short_position_creates_buy_market_order",
+        "test_emergency_exit_flat_position_is_rejected_noop",
+        "test_emergency_exit_never_increases_exposure",
+    )
+    missing = [snippet for snippet in required_source if snippet not in source]
+    missing.extend(test_name for test_name in required_tests if test_name not in tests)
+    return AuditResult(
+        name="emergency_exit derives side from position",
+        passed=not missing,
+        detail=(
+            "derived side logic and tests found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_strategy_required_reason_codes() -> AuditResult:
+    source = _read("neo_trader/strategy/opening_range_book_momentum.py")
+    tests = _read("tests/test_opening_range_book_momentum_strategy.py")
+    required = (
+        "VOLATILITY_TOO_LOW",
+        "VOLATILITY_TOO_HIGH",
+        "PRICE_BELOW_VWAP",
+        "PRICE_ABOVE_VWAP",
+        "TREND_FILTER_REJECTED",
+        "SLIPPAGE_TOO_HIGH",
+        "OFI_NOT_CONFIRMED",
+    )
+    missing = [
+        reason for reason in required if reason not in source or f"ReasonCode.{reason}" not in tests
+    ]
+    return AuditResult(
+        name="strategy has required reason codes",
+        passed=not missing,
+        detail=(
+            "required reason codes and tests found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_config_loader_exists() -> AuditResult:
+    source_path = ROOT / "neo_trader" / "config_loader.py"
+    if not source_path.exists():
+        return AuditResult("config loader exists", False, "missing neo_trader/config_loader.py")
+    source = source_path.read_text(encoding="utf-8")
+    required = (
+        "class StrategyConfig",
+        "class RuntimeConfig",
+        "class InstrumentUniverseConfig",
+        "def load_strategy_config",
+        "def load_risk_config",
+        "def load_runtime_config",
+        "def load_instrument_universe_config",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="config loader exists",
+        passed=not missing,
+        detail="typed YAML loader found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_configs_load_successfully() -> AuditResult:
+    try:
+        from neo_trader.config_loader import load_project_config
+
+        loaded = load_project_config()
+    except Exception as exc:  # noqa: BLE001
+        return AuditResult("configs load successfully", False, repr(exc))
+    passed = (
+        loaded.runtime.trading_mode == "readonly"
+        and not loaded.runtime.live_trading_enabled
+        and loaded.strategy.min_confidence > 0
+        and loaded.risk.max_trades_per_day >= 0
+        and bool(loaded.instruments.instruments)
+    )
+    return AuditResult(
+        name="configs load successfully",
+        passed=passed,
+        detail="runtime/strategy/risk/instruments loaded" if passed else "loaded values invalid",
     )
 
 

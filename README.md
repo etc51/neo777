@@ -20,10 +20,13 @@ approves it.
 - `OpeningRangeBookMomentumStrategy` returns `BUY`, `SELL`, `EXIT`, or `HOLD`
   signals only.
 - `SmartLimitExecutor` exposes only `enter_marketable_limit`, `cancel_replace`,
-  and `emergency_exit`.
+  `cancel_remaining`, and `emergency_exit`.
 - All executor order paths require a `RiskManager` decision.
 - Entry quantity cannot exceed the risk-approved position size.
-- Emergency exit quantity is capped by the current position size.
+- Emergency exit side is derived from the current position: `LONG -> SELL`,
+  `SHORT -> BUY`, `FLAT -> no-op`.
+- Emergency exit quantity is capped by the current position size and cannot
+  increase exposure.
 - Market orders are rejected except for `emergency_exit`.
 
 ## Install
@@ -69,10 +72,14 @@ Reference parameter files live under `configs/`:
 - `configs/instruments.yaml`: enabled instrument universe and placeholder
   market identifiers.
 
-The YAML files are operational references. The typed Python defaults in
-`neo_trader.config`, `neo_trader.risk.manager`, and
-`neo_trader.strategy.opening_range_book_momentum` remain the source of truth
-until a dedicated config loader is introduced.
+The YAML files are the runtime source of truth. Load them through
+`neo_trader.config_loader`:
+
+- `load_runtime_config()`
+- `load_strategy_config()`
+- `load_risk_config()`
+- `load_instrument_universe_config()`
+- `load_project_config()`
 
 ## Components
 
@@ -126,6 +133,9 @@ blocks, and kill switch behavior.
 
 `SmartLimitExecutor` is not a broker adapter. It prepares guarded gateway
 requests only after RiskManager approval and trading-status checks.
+
+`cancel_remaining(order_id)` is a cancel-only risk reduction path. It does not
+replace the order and does not increase exposure.
 
 ### Backtest
 

@@ -15,7 +15,14 @@ from typing import Protocol, TypeAlias
 from uuid import uuid4
 
 from neo_trader.config import Settings, get_settings
-from neo_trader.risk.manager import RiskAction, RiskDecision, RiskManager, RiskState
+from neo_trader.risk.manager import (
+    RiskAction,
+    RiskDecision,
+    RiskManager,
+    RiskPosition,
+    RiskPositionSide,
+    RiskState,
+)
 from neo_trader.runtime import get_runtime_commit_hash
 
 NumericInput: TypeAlias = Decimal | float | int | str
@@ -62,6 +69,7 @@ class ExecutionReasonCode(StrEnum):
 
     SUBMITTED = "SUBMITTED"
     CANCEL_REPLACE_SUBMITTED = "CANCEL_REPLACE_SUBMITTED"
+    CANCEL_REMAINING_SUBMITTED = "CANCEL_REMAINING_SUBMITTED"
     PARTIAL_FILL = "PARTIAL_FILL"
     FILLED = "FILLED"
     LIVE_TRADING_DISABLED = "LIVE_TRADING_DISABLED"
@@ -69,6 +77,9 @@ class ExecutionReasonCode(StrEnum):
     TRADING_STATUS_BLOCKED = "TRADING_STATUS_BLOCKED"
     RISK_REJECTED = "RISK_REJECTED"
     QUANTITY_EXCEEDS_RISK_APPROVAL = "QUANTITY_EXCEEDS_RISK_APPROVAL"
+    NO_POSITION_TO_EXIT = "NO_POSITION_TO_EXIT"
+    EMERGENCY_EXIT_SIDE_DERIVED = "EMERGENCY_EXIT_SIDE_DERIVED"
+    INVALID_POSITION_SIDE = "INVALID_POSITION_SIDE"
     ORDER_NOT_FOUND = "ORDER_NOT_FOUND"
     ORDER_ALREADY_TERMINAL = "ORDER_ALREADY_TERMINAL"
     INVALID_FILL = "INVALID_FILL"
@@ -350,6 +361,32 @@ class SmartLimitExecutor:
             )
         return report
 
+    def cancel_remaining(self, *, order_id: str) -> ExecutionReport:
+        """Cancel the unfilled remainder of an active order.
+
+        This is always allowed because it reduces outstanding entry risk and
+        does not submit a replacement order.
+        """
+
+        existing_order = self._orders.get(order_id)
+        if existing_order is None:
+            return _rejected(ExecutionReasonCode.ORDER_NOT_FOUND)
+        if existing_order.is_terminal:
+            return _order_report(
+                existing_order,
+                accepted=False,
+                reason_codes=(ExecutionReasonCode.ORDER_ALREADY_TERMINAL,),
+            )
+
+        self.gateway.cancel_order(order_id)
+        existing_order.status = ExecutionOrderStatus.CANCELED
+        existing_order.remaining_quantity = Decimal("0")
+        return _order_report(
+            existing_order,
+            accepted=True,
+            reason_codes=(ExecutionReasonCode.CANCEL_REMAINING_SUBMITTED,),
+        )
+
     def record_fill(
         self,
         *,
@@ -400,14 +437,16 @@ class SmartLimitExecutor:
         *,
         account_ref: str,
         instrument_id: str,
-        side: ExecutionSide | str,
         quantity: NumericInput,
         risk_state: RiskState,
         current_time: datetime,
     ) -> ExecutionReport:
-        """Submit an emergency market exit after risk and status checks."""
+        """Submit an emergency market exit derived from the current position."""
 
-        resolved_side = _normalize_side(side)
+        derived_side = _derive_emergency_exit_side(risk_state.position)
+        if isinstance(derived_side, ExecutionReasonCode):
+            return _rejected(derived_side)
+
         risk_decision = self.risk_manager.evaluate(
             desired_action=RiskAction.EXIT,
             state=risk_state,
@@ -416,7 +455,7 @@ class SmartLimitExecutor:
         if not risk_decision.approved:
             return _rejected(
                 ExecutionReasonCode.RISK_REJECTED,
-                action=resolved_side,
+                action=derived_side,
                 risk_decision=risk_decision,
             )
 
@@ -424,20 +463,39 @@ class SmartLimitExecutor:
         exit_quantity = min(requested_quantity, risk_decision.position_size)
         if exit_quantity <= 0:
             return _rejected(
-                ExecutionReasonCode.RISK_REJECTED,
-                action=resolved_side,
+                ExecutionReasonCode.NO_POSITION_TO_EXIT,
+                action=derived_side,
                 risk_decision=risk_decision,
             )
 
-        return self._submit_checked_order(
+        report = self._submit_checked_order(
             account_ref=account_ref,
             instrument_id=instrument_id,
-            side=resolved_side,
+            side=derived_side,
             order_type=ExecutionOrderType.MARKET,
             quantity=exit_quantity,
             price=None,
             risk_decision=risk_decision,
             emergency_exit=True,
+        )
+        if not report.accepted:
+            return report
+        return ExecutionReport(
+            accepted=True,
+            action=report.action,
+            reason_codes=(
+                ExecutionReasonCode.EMERGENCY_EXIT_SIDE_DERIVED,
+                *report.reason_codes,
+            ),
+            order_id=report.order_id,
+            idempotency_key=report.idempotency_key,
+            order_type=report.order_type,
+            limit_price=report.limit_price,
+            requested_quantity=report.requested_quantity,
+            filled_quantity=report.filled_quantity,
+            remaining_quantity=report.remaining_quantity,
+            avg_fill_price=report.avg_fill_price,
+            risk_decision=report.risk_decision,
         )
 
     def _submit_order_test_only(
@@ -597,6 +655,22 @@ def _normalize_order_type(value: ExecutionOrderType | str) -> ExecutionOrderType
     if isinstance(value, ExecutionOrderType):
         return value
     return ExecutionOrderType(str(value).upper())
+
+
+def _derive_emergency_exit_side(position: RiskPosition) -> ExecutionSide | ExecutionReasonCode:
+    if position.quantity <= 0 or position.is_flat:
+        return ExecutionReasonCode.NO_POSITION_TO_EXIT
+    try:
+        position_side = RiskPositionSide(str(position.side).upper())
+    except ValueError:
+        return ExecutionReasonCode.INVALID_POSITION_SIDE
+    if position_side is RiskPositionSide.LONG:
+        return ExecutionSide.SELL
+    if position_side is RiskPositionSide.SHORT:
+        return ExecutionSide.BUY
+    if position_side is RiskPositionSide.FLAT:
+        return ExecutionReasonCode.NO_POSITION_TO_EXIT
+    return ExecutionReasonCode.INVALID_POSITION_SIDE
 
 
 def _positive_decimal(value: object, field_name: str) -> Decimal:
