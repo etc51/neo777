@@ -1,0 +1,10 @@
+# Reference instrument universe. UIDs are intentionally blank placeholders.
+instruments:
+  - ticker: SBER
+    class_code: TQBR
+    uid: ""
+    enabled: true
+  - ticker: T
+    class_code: TQBR
+    uid: ""
+    enabled: false

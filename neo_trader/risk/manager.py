@@ -44,6 +44,7 @@ class RiskReasonCode(StrEnum):
     NO_NEW_ENTRIES_TIME = "NO_NEW_ENTRIES_TIME"
     FORCE_FLATTEN_TIME = "FORCE_FLATTEN_TIME"
     POSITION_FLATTEN_REQUIRED = "POSITION_FLATTEN_REQUIRED"
+    POSITION_ALREADY_OPEN = "POSITION_ALREADY_OPEN"
     STALE_MARKET_DATA = "STALE_MARKET_DATA"
     SPREAD_LIMIT = "SPREAD_LIMIT"
     SLIPPAGE_LIMIT = "SLIPPAGE_LIMIT"
@@ -208,6 +209,13 @@ class RiskManager:
                 action=RiskAction.HOLD,
                 approved=True,
                 reason_codes=(RiskReasonCode.HOLD_PASSTHROUGH,),
+            )
+
+        if _is_entry(action) and not state.position.is_flat:
+            return RiskDecision(
+                action=RiskAction.HOLD,
+                approved=False,
+                reason_codes=(RiskReasonCode.POSITION_ALREADY_OPEN,),
             )
 
         block_reason = _entry_block_reason(

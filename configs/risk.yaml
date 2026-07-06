@@ -1,0 +1,14 @@
+# RiskManager defaults. New entries are blocked when a position is already open.
+max_daily_loss: "1000"
+max_trades_per_day: 10
+no_new_entries_after: "18:30:00"
+force_flatten_at: "18:40:00"
+max_market_data_stale_seconds: "5"
+max_spread_bps: "15"
+max_slippage_bps: "20"
+risk_per_trade_fraction: "0.01"
+max_position_notional_fraction: "1"
+quantity_step: "1"
+min_quantity: "0"
+kill_switch: false
+flatten_on_daily_loss: true

@@ -204,6 +204,74 @@ def test_slippage_limit_blocks_new_entry() -> None:
     assert decision.reason_codes == (RiskReasonCode.SLIPPAGE_LIMIT,)
 
 
+def test_long_position_blocks_additional_buy_entry() -> None:
+    decision = RiskManager(_config()).evaluate(
+        desired_action=RiskAction.BUY,
+        state=replace(
+            _state(),
+            position=RiskPosition(RiskPositionSide.LONG, Decimal("5")),
+        ),
+        current_time=_now(),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("98"),
+    )
+
+    assert decision.action is RiskAction.HOLD
+    assert decision.approved is False
+    assert decision.reason_codes == (RiskReasonCode.POSITION_ALREADY_OPEN,)
+
+
+def test_long_position_blocks_sell_entry() -> None:
+    decision = RiskManager(_config()).evaluate(
+        desired_action=RiskAction.SELL,
+        state=replace(
+            _state(),
+            position=RiskPosition(RiskPositionSide.LONG, Decimal("5")),
+        ),
+        current_time=_now(),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("102"),
+    )
+
+    assert decision.action is RiskAction.HOLD
+    assert decision.approved is False
+    assert decision.reason_codes == (RiskReasonCode.POSITION_ALREADY_OPEN,)
+
+
+def test_short_position_blocks_additional_sell_entry() -> None:
+    decision = RiskManager(_config()).evaluate(
+        desired_action=RiskAction.SELL,
+        state=replace(
+            _state(),
+            position=RiskPosition(RiskPositionSide.SHORT, Decimal("5")),
+        ),
+        current_time=_now(),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("102"),
+    )
+
+    assert decision.action is RiskAction.HOLD
+    assert decision.approved is False
+    assert decision.reason_codes == (RiskReasonCode.POSITION_ALREADY_OPEN,)
+
+
+def test_short_position_blocks_buy_entry() -> None:
+    decision = RiskManager(_config()).evaluate(
+        desired_action=RiskAction.BUY,
+        state=replace(
+            _state(),
+            position=RiskPosition(RiskPositionSide.SHORT, Decimal("5")),
+        ),
+        current_time=_now(),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("98"),
+    )
+
+    assert decision.action is RiskAction.HOLD
+    assert decision.approved is False
+    assert decision.reason_codes == (RiskReasonCode.POSITION_ALREADY_OPEN,)
+
+
 def test_kill_switch_blocks_when_flat_and_forces_exit_when_open() -> None:
     manager = RiskManager(replace(_config(), kill_switch=True))
 

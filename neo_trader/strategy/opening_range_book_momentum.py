@@ -47,6 +47,13 @@ class ReasonCode(StrEnum):
     OPENING_RANGE_NOT_READY = "OPENING_RANGE_NOT_READY"
     OUTSIDE_ENTRY_WINDOW = "OUTSIDE_ENTRY_WINDOW"
     SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
+    VOLATILITY_TOO_LOW = "VOLATILITY_TOO_LOW"
+    VOLATILITY_TOO_HIGH = "VOLATILITY_TOO_HIGH"
+    PRICE_BELOW_VWAP = "PRICE_BELOW_VWAP"
+    PRICE_ABOVE_VWAP = "PRICE_ABOVE_VWAP"
+    TREND_FILTER_REJECTED = "TREND_FILTER_REJECTED"
+    SLIPPAGE_TOO_HIGH = "SLIPPAGE_TOO_HIGH"
+    OFI_NOT_CONFIRMED = "OFI_NOT_CONFIRMED"
     LONG_BREAKOUT = "LONG_BREAKOUT"
     SHORT_BREAKDOWN = "SHORT_BREAKDOWN"
     ORDERBOOK_CONFIRMATION = "ORDERBOOK_CONFIRMATION"
@@ -85,10 +92,17 @@ class OpeningRangeBookMomentumConfig:
     force_exit_minutes_before_close: int = 5
     breakout_buffer_bps: Decimal = Decimal("2")
     max_spread_bps: Decimal = Decimal("10")
+    min_volatility_percentile: Decimal | None = Decimal("15")
+    max_volatility_percentile: Decimal | None = Decimal("95")
+    low_volatility_regimes: tuple[str, ...] = ("low",)
+    high_volatility_regimes: tuple[str, ...] = ("extreme",)
+    max_expected_slippage_bps: Decimal | None = Decimal("15")
     min_imbalance: Decimal = Decimal("0.15")
     min_weighted_imbalance: Decimal = Decimal("0.10")
     min_microprice_edge_bps: Decimal = Decimal("1")
     max_opposing_wall_score: Decimal = Decimal("3")
+    require_ofi_confirmation: bool = False
+    min_ofi_confirmation: Decimal = Decimal("0")
     min_confidence: Decimal = Decimal("0.55")
     atr_window: int = 14
     stop_atr_multiple: Decimal = Decimal("1")
@@ -108,6 +122,24 @@ class OpeningRangeBookMomentumConfig:
             raise ValueError("force_exit_minutes_before_close must be non-negative.")
         if self.max_spread_bps <= 0:
             raise ValueError("max_spread_bps must be positive.")
+        if self.min_volatility_percentile is not None and not (
+            Decimal("0") <= self.min_volatility_percentile <= Decimal("100")
+        ):
+            raise ValueError("min_volatility_percentile must be in [0, 100].")
+        if self.max_volatility_percentile is not None and not (
+            Decimal("0") <= self.max_volatility_percentile <= Decimal("100")
+        ):
+            raise ValueError("max_volatility_percentile must be in [0, 100].")
+        if (
+            self.min_volatility_percentile is not None
+            and self.max_volatility_percentile is not None
+            and self.min_volatility_percentile > self.max_volatility_percentile
+        ):
+            raise ValueError("min_volatility_percentile must be <= max_volatility_percentile.")
+        if self.max_expected_slippage_bps is not None and self.max_expected_slippage_bps <= 0:
+            raise ValueError("max_expected_slippage_bps must be positive when provided.")
+        if self.min_ofi_confirmation < 0:
+            raise ValueError("min_ofi_confirmation must be non-negative.")
         if self.atr_window <= 0:
             raise ValueError("atr_window must be positive.")
         if self.stop_atr_multiple < 0:
@@ -149,6 +181,14 @@ class _BookFeatures:
     microprice: Decimal
     bid_wall_score: Decimal
     ask_wall_score: Decimal
+    volatility_percentile: Decimal | None = None
+    volatility_regime: str | None = None
+    vwap: Decimal | None = None
+    ema_fast: Decimal | None = None
+    ema_slow: Decimal | None = None
+    expected_slippage_bps: Decimal | None = None
+    ofi: Decimal | None = None
+    ofi_confirmed: bool | None = None
 
 
 class OpeningRangeBookMomentumStrategy:
@@ -206,27 +246,65 @@ class OpeningRangeBookMomentumStrategy:
         if not _inside_entry_window(current_time, opening_range, resolved_config):
             return Signal(SignalAction.HOLD, (ReasonCode.OUTSIDE_ENTRY_WINDOW,))
 
-        if long_breakout and self._book_confirms("BUY", features, resolved_config):
-            return self._entry_signal(
-                action=SignalAction.BUY,
-                base_reason=ReasonCode.LONG_BREAKOUT,
-                latest_close=latest_close,
-                opening_range=opening_range,
-                features=features,
-                rolling_candles=rolling_candles,
-                config=resolved_config,
+        if long_breakout:
+            filter_rejection = self._entry_filter_rejection(
+                "BUY",
+                latest_close,
+                features,
+                resolved_config,
             )
+            if filter_rejection is not None:
+                return Signal(
+                    SignalAction.HOLD,
+                    (filter_rejection,),
+                    confidence_score=self._confidence(
+                        "BUY",
+                        latest_close,
+                        opening_range,
+                        features,
+                        resolved_config,
+                    ),
+                )
+            if self._book_confirms("BUY", features, resolved_config):
+                return self._entry_signal(
+                    action=SignalAction.BUY,
+                    base_reason=ReasonCode.LONG_BREAKOUT,
+                    latest_close=latest_close,
+                    opening_range=opening_range,
+                    features=features,
+                    rolling_candles=rolling_candles,
+                    config=resolved_config,
+                )
 
-        if short_breakdown and self._book_confirms("SELL", features, resolved_config):
-            return self._entry_signal(
-                action=SignalAction.SELL,
-                base_reason=ReasonCode.SHORT_BREAKDOWN,
-                latest_close=latest_close,
-                opening_range=opening_range,
-                features=features,
-                rolling_candles=rolling_candles,
-                config=resolved_config,
+        if short_breakdown:
+            filter_rejection = self._entry_filter_rejection(
+                "SELL",
+                latest_close,
+                features,
+                resolved_config,
             )
+            if filter_rejection is not None:
+                return Signal(
+                    SignalAction.HOLD,
+                    (filter_rejection,),
+                    confidence_score=self._confidence(
+                        "SELL",
+                        latest_close,
+                        opening_range,
+                        features,
+                        resolved_config,
+                    ),
+                )
+            if self._book_confirms("SELL", features, resolved_config):
+                return self._entry_signal(
+                    action=SignalAction.SELL,
+                    base_reason=ReasonCode.SHORT_BREAKDOWN,
+                    latest_close=latest_close,
+                    opening_range=opening_range,
+                    features=features,
+                    rolling_candles=rolling_candles,
+                    config=resolved_config,
+                )
 
         if long_breakout or short_breakdown:
             return Signal(
@@ -499,6 +577,41 @@ class OpeningRangeBookMomentumStrategy:
             + (spread_score * Decimal("0.10"))
         )
 
+    def _entry_filter_rejection(
+        self,
+        direction: Literal["BUY", "SELL"],
+        latest_close: Decimal,
+        features: _BookFeatures,
+        config: OpeningRangeBookMomentumConfig,
+    ) -> ReasonCode | None:
+        volatility_rejection = _volatility_filter_rejection(features, config)
+        if volatility_rejection is not None:
+            return volatility_rejection
+
+        if features.vwap is not None:
+            if direction == "BUY" and latest_close < features.vwap:
+                return ReasonCode.PRICE_BELOW_VWAP
+            if direction == "SELL" and latest_close > features.vwap:
+                return ReasonCode.PRICE_ABOVE_VWAP
+
+        if features.ema_fast is not None and features.ema_slow is not None:
+            if direction == "BUY" and features.ema_fast < features.ema_slow:
+                return ReasonCode.TREND_FILTER_REJECTED
+            if direction == "SELL" and features.ema_fast > features.ema_slow:
+                return ReasonCode.TREND_FILTER_REJECTED
+
+        if (
+            features.expected_slippage_bps is not None
+            and config.max_expected_slippage_bps is not None
+            and features.expected_slippage_bps > config.max_expected_slippage_bps
+        ):
+            return ReasonCode.SLIPPAGE_TOO_HIGH
+
+        if config.require_ofi_confirmation and not _ofi_confirms(direction, features, config):
+            return ReasonCode.OFI_NOT_CONFIRMED
+
+        return None
+
 
 def _build_opening_range(
     candles: Sequence[CandleInput],
@@ -669,6 +782,25 @@ def _normalize_book_features(features: FeatureInput) -> _BookFeatures:
             _field_default(features, Decimal("1"), "ask_wall_score", "ask_wall"),
             "ask_wall_score",
         ),
+        volatility_percentile=_optional_non_negative_decimal(
+            features,
+            "volatility_percentile",
+            "realized_volatility_percentile",
+        ),
+        volatility_regime=_optional_normalized_string(
+            features,
+            "volatility_regime",
+            "realized_volatility_regime",
+        ),
+        vwap=_optional_positive_decimal(features, "vwap"),
+        ema_fast=_optional_positive_decimal(features, "ema_fast", "fast_ema"),
+        ema_slow=_optional_positive_decimal(features, "ema_slow", "slow_ema"),
+        expected_slippage_bps=_optional_non_negative_decimal(
+            features,
+            "expected_slippage_bps",
+        ),
+        ofi=_optional_decimal(features, "ofi", "order_flow_imbalance"),
+        ofi_confirmed=_optional_bool(features, "ofi_confirmed"),
     )
 
 
@@ -687,6 +819,49 @@ def _direction_from_action(action: SignalAction) -> Literal["BUY", "SELL"]:
     if action is SignalAction.SELL:
         return "SELL"
     raise ValueError(f"unsupported directional action: {action}.")
+
+
+def _volatility_filter_rejection(
+    features: _BookFeatures,
+    config: OpeningRangeBookMomentumConfig,
+) -> ReasonCode | None:
+    if features.volatility_regime in _normalized_set(config.low_volatility_regimes):
+        return ReasonCode.VOLATILITY_TOO_LOW
+    if features.volatility_regime in _normalized_set(config.high_volatility_regimes):
+        return ReasonCode.VOLATILITY_TOO_HIGH
+
+    percentile = features.volatility_percentile
+    if percentile is None:
+        return None
+    if (
+        config.min_volatility_percentile is not None
+        and percentile < config.min_volatility_percentile
+    ):
+        return ReasonCode.VOLATILITY_TOO_LOW
+    if (
+        config.max_volatility_percentile is not None
+        and percentile > config.max_volatility_percentile
+    ):
+        return ReasonCode.VOLATILITY_TOO_HIGH
+    return None
+
+
+def _ofi_confirms(
+    direction: Literal["BUY", "SELL"],
+    features: _BookFeatures,
+    config: OpeningRangeBookMomentumConfig,
+) -> bool:
+    if features.ofi_confirmed is not None and not features.ofi_confirmed:
+        return False
+    if features.ofi is None:
+        return features.ofi_confirmed is True
+    if direction == "BUY":
+        return features.ofi >= config.min_ofi_confirmation
+    return features.ofi <= -config.min_ofi_confirmation
+
+
+def _normalized_set(values: Sequence[str]) -> set[str]:
+    return {value.strip().lower() for value in values}
 
 
 def _field_default(value: FeatureInput, default: object, *names: str) -> object:
@@ -709,6 +884,58 @@ def _field(value: Mapping[str, object] | object, name: str) -> object | None:
     if isinstance(value, Mapping):
         return value.get(name)
     return getattr(value, name, None)
+
+
+def _optional_decimal(value: FeatureInput, *names: str) -> Decimal | None:
+    for name in names:
+        field_value = _field(value, name)
+        if field_value is not None:
+            return _to_decimal(field_value)
+    return None
+
+
+def _optional_positive_decimal(value: FeatureInput, *names: str) -> Decimal | None:
+    decimal_value = _optional_decimal(value, *names)
+    if decimal_value is None:
+        return None
+    if decimal_value <= 0:
+        joined = ", ".join(names)
+        raise ValueError(f"optional field must be positive: {joined}.")
+    return decimal_value
+
+
+def _optional_non_negative_decimal(value: FeatureInput, *names: str) -> Decimal | None:
+    decimal_value = _optional_decimal(value, *names)
+    if decimal_value is None:
+        return None
+    if decimal_value < 0:
+        joined = ", ".join(names)
+        raise ValueError(f"optional field must be non-negative: {joined}.")
+    return decimal_value
+
+
+def _optional_normalized_string(value: FeatureInput, *names: str) -> str | None:
+    for name in names:
+        field_value = _field(value, name)
+        if field_value is not None:
+            return str(field_value).strip().lower()
+    return None
+
+
+def _optional_bool(value: FeatureInput, *names: str) -> bool | None:
+    for name in names:
+        field_value = _field(value, name)
+        if field_value is None:
+            continue
+        if isinstance(field_value, bool):
+            return field_value
+        normalized = str(field_value).strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+        raise ValueError(f"optional boolean field is invalid: {name}.")
+    return None
 
 
 def _candle_time(candle: CandleInput) -> datetime | None:

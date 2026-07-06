@@ -19,6 +19,8 @@ TEXT_SUFFIXES: Final = {
     ".py",
     ".toml",
     ".txt",
+    ".yaml",
+    ".yml",
 }
 EXCLUDED_DIR_NAMES: Final = {
     ".git",
@@ -52,12 +54,18 @@ def main() -> int:
         check_no_account_marker,
         check_strategy_boundary,
         check_execution_requires_risk_manager,
+        check_public_submit_order_absent_or_internal,
+        check_quantity_cannot_exceed_risk_approval,
         check_market_orders_blocked_for_entries,
+        check_position_open_blocks_entries,
+        check_emergency_exit_quantity_capped,
         check_forced_flatten,
         check_kill_switch,
         check_stale_market_data,
         check_orderbook_feature_tests,
         check_risk_manager_tests,
+        check_ci_workflow_exists,
+        check_config_files_exist,
     )
     results = [check() for check in checks]
     for result in results:
@@ -180,6 +188,50 @@ def check_execution_requires_risk_manager() -> AuditResult:
     )
 
 
+def check_public_submit_order_absent_or_internal() -> AuditResult:
+    source_path = ROOT / "neo_trader" / "execution" / "smart_limit.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    public_submit_found = False
+    internal_test_hook_found = False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "SmartLimitExecutor":
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.FunctionDef):
+                if statement.name == "submit_order":
+                    public_submit_found = True
+                if statement.name == "_submit_order_test_only":
+                    docstring = ast.get_docstring(statement) or ""
+                    internal_test_hook_found = "test-only" in docstring.lower()
+    passed = not public_submit_found and internal_test_hook_found
+    return AuditResult(
+        name="public submit_order absent or explicitly internal",
+        passed=passed,
+        detail=(
+            "SmartLimitExecutor exposes only internal test-only submit hook"
+            if passed
+            else "public submit_order found or internal hook missing test-only marker"
+        ),
+    )
+
+
+def check_quantity_cannot_exceed_risk_approval() -> AuditResult:
+    source = _read("neo_trader/execution/smart_limit.py")
+    tests = _read("tests/test_smart_limit_executor.py")
+    passed = all(
+        snippet in source
+        for snippet in (
+            "QUANTITY_EXCEEDS_RISK_APPROVAL",
+            "quantity > risk_decision.position_size",
+        )
+    ) and "test_quantity_exceeding_risk_approval_is_rejected" in tests
+    return AuditResult(
+        name="quantity cannot exceed risk approval",
+        passed=passed,
+        detail="executor gate and regression test found" if passed else "missing quantity cap",
+    )
+
+
 def check_market_orders_blocked_for_entries() -> AuditResult:
     source = _read("neo_trader/execution/smart_limit.py")
     passed = (
@@ -192,6 +244,45 @@ def check_market_orders_blocked_for_entries() -> AuditResult:
         detail=(
             "ordinary MARKET order returns MARKET_ORDER_FORBIDDEN" if passed else "missing block"
         ),
+    )
+
+
+def check_position_open_blocks_entries() -> AuditResult:
+    source = _read("neo_trader/risk/manager.py")
+    tests = _read("tests/test_risk_manager.py")
+    required_tests = (
+        "test_long_position_blocks_additional_buy_entry",
+        "test_long_position_blocks_sell_entry",
+        "test_short_position_blocks_additional_sell_entry",
+        "test_short_position_blocks_buy_entry",
+    )
+    passed = (
+        "POSITION_ALREADY_OPEN" in source
+        and "not state.position.is_flat" in source
+        and all(test_name in tests for test_name in required_tests)
+    )
+    return AuditResult(
+        name="RiskManager blocks entry while position open",
+        passed=passed,
+        detail=(
+            "entry block and directional tests found"
+            if passed
+            else "missing open-position gate"
+        ),
+    )
+
+
+def check_emergency_exit_quantity_capped() -> AuditResult:
+    source = _read("neo_trader/execution/smart_limit.py")
+    tests = _read("tests/test_smart_limit_executor.py")
+    passed = (
+        "exit_quantity = min(requested_quantity, risk_decision.position_size)" in source
+        and "test_emergency_exit_caps_quantity_to_current_position_size" in tests
+    )
+    return AuditResult(
+        name="emergency_exit quantity capped by position size",
+        passed=passed,
+        detail="cap and regression test found" if passed else "missing emergency cap",
     )
 
 
@@ -254,6 +345,43 @@ def check_risk_manager_tests() -> AuditResult:
         name="risk manager tests exist",
         passed=passed,
         detail=_relative(path) if passed else "missing tests/test_risk_manager.py",
+    )
+
+
+def check_ci_workflow_exists() -> AuditResult:
+    path = ROOT / ".github" / "workflows" / "ci.yml"
+    if not path.exists():
+        return AuditResult("GitHub CI workflow exists", False, "missing .github/workflows/ci.yml")
+    text = path.read_text(encoding="utf-8")
+    required = (
+        'python -m pip install -e ".[dev,dashboard]"',
+        "ruff check .",
+        "mypy neo_trader",
+        "pytest -q",
+        "python scripts/audit.py",
+    )
+    missing = [command for command in required if command not in text]
+    return AuditResult(
+        name="GitHub CI workflow exists",
+        passed=not missing,
+        detail="required CI commands found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_config_files_exist() -> AuditResult:
+    required = (
+        ROOT / "configs" / "strategy.yaml",
+        ROOT / "configs" / "risk.yaml",
+        ROOT / "configs" / "instruments.yaml",
+        ROOT / "configs" / "runtime.yaml",
+    )
+    missing = [_relative(path) for path in required if not path.exists()]
+    return AuditResult(
+        name="configs/*.yaml exist",
+        passed=not missing,
+        detail="strategy/risk/instruments/runtime configs found"
+        if not missing
+        else "missing: " + ", ".join(missing),
     )
 
 

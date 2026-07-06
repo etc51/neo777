@@ -1,0 +1,30 @@
+# OpeningRangeBookMomentumStrategy defaults.
+#
+# These values are reference runtime parameters. The strategy remains a pure
+# signal component and never submits orders.
+session_start: "10:00:00"
+session_end: "18:45:00"
+opening_range_minutes: 30
+entry_window_minutes: 120
+force_exit_minutes_before_close: 5
+breakout_buffer_bps: "2"
+max_spread_bps: "10"
+min_volatility_percentile: "15"
+max_volatility_percentile: "95"
+low_volatility_regimes:
+  - low
+high_volatility_regimes:
+  - extreme
+max_expected_slippage_bps: "15"
+min_imbalance: "0.15"
+min_weighted_imbalance: "0.10"
+min_microprice_edge_bps: "1"
+max_opposing_wall_score: "3"
+require_ofi_confirmation: false
+min_ofi_confirmation: "0"
+min_confidence: "0.55"
+atr_window: 14
+stop_atr_multiple: "1"
+take_profit_r_multiples:
+  - "1"
+  - "2"

@@ -1,0 +1,13 @@
+# Runtime safety defaults. Keep live trading disabled unless a manual review
+# explicitly approves a separate live broker adapter.
+environment: development
+log_level: INFO
+dry_run: true
+trading_mode: readonly
+live_trading_enabled: false
+broker_name: paper
+tbank_mode: readonly
+dashboard:
+  state_path: data/monitoring/dashboard_state.example.json
+  host: 0.0.0.0
+  port: 8501

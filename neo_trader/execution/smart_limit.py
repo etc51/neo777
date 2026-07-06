@@ -68,6 +68,7 @@ class ExecutionReasonCode(StrEnum):
     MARKET_ORDER_FORBIDDEN = "MARKET_ORDER_FORBIDDEN"
     TRADING_STATUS_BLOCKED = "TRADING_STATUS_BLOCKED"
     RISK_REJECTED = "RISK_REJECTED"
+    QUANTITY_EXCEEDS_RISK_APPROVAL = "QUANTITY_EXCEEDS_RISK_APPROVAL"
     ORDER_NOT_FOUND = "ORDER_NOT_FOUND"
     ORDER_ALREADY_TERMINAL = "ORDER_ALREADY_TERMINAL"
     INVALID_FILL = "INVALID_FILL"
@@ -419,18 +420,27 @@ class SmartLimitExecutor:
                 risk_decision=risk_decision,
             )
 
+        requested_quantity = _positive_decimal(quantity, "quantity")
+        exit_quantity = min(requested_quantity, risk_decision.position_size)
+        if exit_quantity <= 0:
+            return _rejected(
+                ExecutionReasonCode.RISK_REJECTED,
+                action=resolved_side,
+                risk_decision=risk_decision,
+            )
+
         return self._submit_checked_order(
             account_ref=account_ref,
             instrument_id=instrument_id,
             side=resolved_side,
             order_type=ExecutionOrderType.MARKET,
-            quantity=_positive_decimal(quantity, "quantity"),
+            quantity=exit_quantity,
             price=None,
             risk_decision=risk_decision,
             emergency_exit=True,
         )
 
-    def submit_order(
+    def _submit_order_test_only(
         self,
         *,
         account_ref: str,
@@ -442,11 +452,11 @@ class SmartLimitExecutor:
         risk_decision: RiskDecision,
         emergency_exit: bool = False,
     ) -> ExecutionReport:
-        """Submit a pre-risked order request.
+        """Internal test-only hook for submitting a pre-risked order request.
 
-        This escape hatch still enforces live flag, trading status, and the
-        market-order prohibition. Normal entry flow should use
-        ``enter_marketable_limit`` so sizing goes through RiskManager here.
+        Production callers must use ``enter_marketable_limit``,
+        ``cancel_replace``, or ``emergency_exit``. This method exists only to
+        unit-test shared safety gates that sit below the public API.
         """
 
         resolved_side = _normalize_side(side)
@@ -479,6 +489,12 @@ class SmartLimitExecutor:
         if not risk_decision.approved:
             return _rejected(
                 ExecutionReasonCode.RISK_REJECTED,
+                action=side,
+                risk_decision=risk_decision,
+            )
+        if quantity > risk_decision.position_size:
+            return _rejected(
+                ExecutionReasonCode.QUANTITY_EXCEEDS_RISK_APPROVAL,
                 action=side,
                 risk_decision=risk_decision,
             )

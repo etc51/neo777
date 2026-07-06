@@ -15,7 +15,16 @@ from neo_trader.execution.smart_limit import (
     TradingStatus,
     TradingStatusSnapshot,
 )
-from neo_trader.risk.manager import RiskAction, RiskConfig, RiskManager, RiskState
+from neo_trader.risk.manager import (
+    RiskAction,
+    RiskConfig,
+    RiskDecision,
+    RiskManager,
+    RiskPosition,
+    RiskPositionSide,
+    RiskReasonCode,
+    RiskState,
+)
 
 
 class FakeGateway:
@@ -169,18 +178,47 @@ def test_market_order_is_forbidden_outside_emergency_exit() -> None:
     )
     executor = _executor(FakeGateway(), risk_manager, uuids=["uuid-market"])
 
-    report = executor.submit_order(
+    report = executor._submit_order_test_only(
         account_ref="acc",
         instrument_id="uid",
         side=ExecutionSide.SELL,
         order_type=ExecutionOrderType.MARKET,
         quantity=Decimal("1"),
         price=None,
-        risk_decision=risk_decision,
+        risk_decision=RiskDecision(
+            action=RiskAction.EXIT,
+            approved=True,
+            reason_codes=risk_decision.reason_codes,
+            position_size=Decimal("1"),
+        ),
     )
 
     assert report.accepted is False
     assert report.reason_codes == (ExecutionReasonCode.MARKET_ORDER_FORBIDDEN,)
+
+
+def test_quantity_exceeding_risk_approval_is_rejected() -> None:
+    gateway = FakeGateway()
+    executor = _executor(gateway, CountingRiskManager(), uuids=["uuid-entry"])
+
+    report = executor._submit_order_test_only(
+        account_ref="acc",
+        instrument_id="uid",
+        side=ExecutionSide.BUY,
+        order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal("999999"),
+        price=Decimal("100"),
+        risk_decision=RiskDecision(
+            action=RiskAction.BUY,
+            approved=True,
+            reason_codes=(RiskReasonCode.APPROVED,),
+            position_size=Decimal("1"),
+        ),
+    )
+
+    assert report.accepted is False
+    assert report.reason_codes == (ExecutionReasonCode.QUANTITY_EXCEEDS_RISK_APPROVAL,)
+    assert gateway.submitted == []
 
 
 def test_emergency_exit_allows_market_order_after_risk_and_status_checks() -> None:
@@ -193,14 +231,51 @@ def test_emergency_exit_allows_market_order_after_risk_and_status_checks() -> No
         instrument_id="uid",
         side=ExecutionSide.SELL,
         quantity=Decimal("5"),
-        risk_state=_risk_state(),
+        risk_state=RiskState(
+            account_equity=Decimal("100000"),
+            daily_realized_pnl=Decimal("0"),
+            trades_today=0,
+            market_data_last_seen_at=_now() - timedelta(seconds=1),
+            spread_bps=Decimal("2"),
+            expected_slippage_bps=Decimal("5"),
+            position=RiskPosition(RiskPositionSide.LONG, Decimal("5")),
+        ),
         current_time=_now(),
     )
 
     assert report.accepted is True
     assert report.order_type is ExecutionOrderType.MARKET
     assert gateway.submitted[0].order_type is ExecutionOrderType.MARKET
+    assert gateway.submitted[0].quantity == Decimal("5")
     assert risk_manager.calls == 1
+
+
+def test_emergency_exit_caps_quantity_to_current_position_size() -> None:
+    gateway = FakeGateway()
+    risk_manager = CountingRiskManager()
+    executor = _executor(gateway, risk_manager, uuids=["uuid-exit"])
+    risk_state = RiskState(
+        account_equity=Decimal("100000"),
+        daily_realized_pnl=Decimal("0"),
+        trades_today=0,
+        market_data_last_seen_at=_now() - timedelta(seconds=1),
+        spread_bps=Decimal("2"),
+        expected_slippage_bps=Decimal("5"),
+        position=RiskPosition(RiskPositionSide.LONG, Decimal("3")),
+    )
+
+    report = executor.emergency_exit(
+        account_ref="acc",
+        instrument_id="uid",
+        side=ExecutionSide.SELL,
+        quantity=Decimal("999999"),
+        risk_state=risk_state,
+        current_time=_now(),
+    )
+
+    assert report.accepted is True
+    assert report.requested_quantity == Decimal("3")
+    assert gateway.submitted[0].quantity == Decimal("3")
 
 
 def test_trading_status_blocks_order_before_submit() -> None:

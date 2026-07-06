@@ -1,5 +1,6 @@
 """Tests for opening range book momentum strategy decisions."""
 
+from dataclasses import replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
@@ -166,6 +167,141 @@ def test_strategy_rejects_entry_when_spread_is_too_wide() -> None:
 
     assert signal.action is SignalAction.HOLD
     assert signal.reason_codes == (ReasonCode.SPREAD_TOO_WIDE,)
+
+
+def test_strategy_rejects_entry_when_volatility_percentile_is_too_low() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy")
+        | {"volatility_percentile": Decimal("5")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.VOLATILITY_TOO_LOW,)
+
+
+def test_strategy_rejects_entry_when_volatility_regime_is_too_high() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy")
+        | {"volatility_regime": "extreme"},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.VOLATILITY_TOO_HIGH,)
+
+
+def test_strategy_rejects_long_entry_below_vwap() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy") | {"vwap": Decimal("103")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.PRICE_BELOW_VWAP,)
+
+
+def test_strategy_rejects_short_entry_above_vwap() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("98"),
+            high=Decimal("98.8"),
+            low=Decimal("97.8"),
+        ),
+        latest_orderbook_features=_book_features(direction="sell") | {"vwap": Decimal("97")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.PRICE_ABOVE_VWAP,)
+
+
+def test_strategy_rejects_entry_when_ema_trend_disagrees() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy")
+        | {"ema_fast": Decimal("99"), "ema_slow": Decimal("100")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.TREND_FILTER_REJECTED,)
+
+
+def test_strategy_rejects_entry_when_expected_slippage_is_too_high() -> None:
+    strategy = OpeningRangeBookMomentumStrategy(_config())
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy")
+        | {"expected_slippage_bps": Decimal("99")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.SLIPPAGE_TOO_HIGH,)
+
+
+def test_strategy_rejects_entry_when_required_ofi_is_not_confirmed() -> None:
+    config = replace(
+        _config(),
+        require_ofi_confirmation=True,
+        min_ofi_confirmation=Decimal("0.10"),
+    )
+    strategy = OpeningRangeBookMomentumStrategy(config)
+
+    signal = strategy.evaluate(
+        rolling_candles=_candles_with_latest(
+            close=Decimal("102"),
+            high=Decimal("102.2"),
+            low=Decimal("101.2"),
+        ),
+        latest_orderbook_features=_book_features(direction="buy") | {"ofi": Decimal("0.01")},
+        current_position=None,
+        current_time=datetime(2026, 7, 6, 10, 35),
+    )
+
+    assert signal.action is SignalAction.HOLD
+    assert signal.reason_codes == (ReasonCode.OFI_NOT_CONFIRMED,)
 
 
 def _config() -> OpeningRangeBookMomentumConfig:
