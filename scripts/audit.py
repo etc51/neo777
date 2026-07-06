@@ -25,7 +25,10 @@ EXCLUDED_DIR_NAMES: Final = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".venv",
     "__pycache__",
+    "build",
+    "dist",
     "review_bundle",
 }
 EXCLUDED_FILE_NAMES: Final = {
@@ -316,6 +319,8 @@ def _iter_text_files() -> Iterable[Path]:
         if not path.is_file():
             continue
         if any(part in EXCLUDED_DIR_NAMES for part in path.parts):
+            continue
+        if any(part.endswith(".egg-info") for part in path.parts):
             continue
         if path.name in EXCLUDED_FILE_NAMES:
             continue
