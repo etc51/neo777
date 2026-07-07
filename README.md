@@ -191,9 +191,19 @@ Makefile shortcuts:
 make record-mock
 make record-readonly
 make run-dashboard-live-state
+make analyze-recording
 ```
 
 `record-readonly` is intentionally guarded by readonly safety flags and requires
 local `T_INVEST_TOKEN` or `NEO_TRADER_TBANK_TOKEN`, configured instrument UIDs,
 and the T-Invest Python SDK import path `t_tech.invest` or `tinkoff.invest`.
 It uses only the T-Bank market-data stream path and must remain read-only.
+
+Analyze recorded market data and generate an active universe:
+
+```powershell
+python scripts\analyze_recording_quality.py --raw data\raw --reports-dir data\reports --active-universe configs\active_universe.yaml
+```
+
+The analyzer writes liquidity reports to `data/reports/` and generates
+`configs/active_universe.yaml` from read-only parquet data.

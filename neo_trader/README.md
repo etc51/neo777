@@ -10,6 +10,7 @@ This is the main Python package for NeoIntraday Engine.
 - `execution/` - gateway abstraction for simulated/safe order intent handling.
 - `features/` - pure feature calculations from candles and order books.
 - `monitoring/` - Streamlit dashboard and dashboard state writer.
+- `research/` - offline recording analysis and active universe selection.
 - `risk/` - risk gates, position sizing, kill switch, and flatten timing.
 - `strategy/` - signal generation only.
 - `config.py` - pydantic settings and environment defaults.
@@ -24,4 +25,3 @@ This is the main Python package for NeoIntraday Engine.
 - Strategy code must not import broker or execution modules.
 - Execution code must always pass through risk checks.
 - Tokens, account ids, and secrets must never be logged or committed.
-

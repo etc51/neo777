@@ -11,6 +11,7 @@ This folder contains pytest coverage for safety, imports, features, strategy, ri
 - `test_risk_manager.py` - risk gate tests.
 - `test_smart_limit_executor.py` - execution gateway safety tests.
 - `test_market_data_recorder.py`, `test_run_data_recorder_cli.py`, `test_dashboard_state_writer.py`, and `test_recording_quality_report.py` - recorder pipeline tests.
+- `test_recording_quality_analyzer.py` and `test_universe_selector.py` - liquidity report and active universe tests.
 - `test_event_driven_backtester.py` - backtester tests.
 - `test_streamlit_dashboard.py` - dashboard state/model rendering helpers.
 
@@ -20,4 +21,3 @@ This folder contains pytest coverage for safety, imports, features, strategy, ri
 - Use synthetic fixtures for market data and order books.
 - Safety regressions need direct tests plus audit coverage when possible.
 - Keep tests deterministic and runnable with `pytest -q`.
-

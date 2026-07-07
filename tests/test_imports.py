@@ -24,6 +24,8 @@ MODULES = [
     "neo_trader.monitoring.streamlit_dashboard",
     "neo_trader.risk",
     "neo_trader.risk.manager",
+    "neo_trader.research",
+    "neo_trader.research.universe_selector",
     "neo_trader.runtime",
     "neo_trader.strategy",
     "neo_trader.strategy.opening_range_book_momentum",

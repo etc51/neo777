@@ -1,7 +1,7 @@
 PYTHON ?= python
 DASHBOARD_STATE ?= data/monitoring/dashboard_state.example.json
 
-.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state
+.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording
 
 install:
 	$(PYTHON) -m pip install -e ".[dev,dashboard]"
@@ -29,3 +29,6 @@ record-readonly:
 
 run-dashboard-live-state:
 	$(PYTHON) -m streamlit run neo_trader/monitoring/streamlit_dashboard.py -- --state data/monitoring/dashboard_state.json
+
+analyze-recording:
+	$(PYTHON) scripts/analyze_recording_quality.py --raw data/raw --reports-dir data/reports --active-universe configs/active_universe.yaml

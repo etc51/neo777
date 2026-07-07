@@ -83,6 +83,10 @@ def main() -> int:
         check_recorder_cli_has_no_order_api_calls,
         check_dashboard_state_writer_exists,
         check_makefile_recording_targets,
+        check_recording_quality_analyzer_exists,
+        check_universe_selector_exists,
+        check_research_tools_have_no_execution_imports,
+        check_active_universe_generation_supported,
     )
     results = [check() for check in checks]
     for result in results:
@@ -678,6 +682,96 @@ def check_makefile_recording_targets() -> AuditResult:
         name="Makefile has recording targets",
         passed=not missing,
         detail="recording targets found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_recording_quality_analyzer_exists() -> AuditResult:
+    path = ROOT / "scripts" / "analyze_recording_quality.py"
+    if not path.exists():
+        return AuditResult("recording quality analyzer exists", False, "missing analyzer script")
+    source = path.read_text(encoding="utf-8")
+    required = (
+        "analyze_recording_quality",
+        "liquidity_report_",
+        "events_per_minute",
+        "expected_slippage_bps",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="recording quality analyzer exists",
+        passed=not missing,
+        detail="analyzer script found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_universe_selector_exists() -> AuditResult:
+    path = ROOT / "neo_trader" / "research" / "universe_selector.py"
+    if not path.exists():
+        return AuditResult("universe selector exists", False, "missing selector module")
+    source = path.read_text(encoding="utf-8")
+    required = (
+        "class InstrumentQualityMetrics",
+        "class UniverseScore",
+        "liquidity_score",
+        "volume_score",
+        "volatility_score",
+        "spread_penalty",
+        "slippage_penalty",
+        "stale_penalty",
+        "rank_universe",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="universe selector exists",
+        passed=not missing,
+        detail=(
+            "selector scoring formula found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_research_tools_have_no_execution_imports() -> AuditResult:
+    paths = (
+        ROOT / "scripts" / "analyze_recording_quality.py",
+        ROOT / "neo_trader" / "research" / "universe_selector.py",
+    )
+    violations: list[str] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("neo_trader.execution"):
+                        violations.append(f"{_relative(path)} imports {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module.startswith("neo_trader.execution"):
+                    violations.append(f"{_relative(path)} imports {module}")
+    return AuditResult(
+        name="research tools have no execution imports",
+        passed=not violations,
+        detail=_violation_detail(violations),
+    )
+
+
+def check_active_universe_generation_supported() -> AuditResult:
+    analyzer = _read("scripts/analyze_recording_quality.py")
+    selector = _read("neo_trader/research/universe_selector.py")
+    makefile = _read("Makefile")
+    required = (
+        "configs/active_universe.yaml" in analyzer,
+        "write_active_universe" in selector,
+        "analyze-recording:" in makefile,
+    )
+    passed = all(required)
+    return AuditResult(
+        name="active_universe.yaml generation supported",
+        passed=passed,
+        detail="analyzer, selector, and Makefile target found" if passed else "missing support",
     )
 
 
