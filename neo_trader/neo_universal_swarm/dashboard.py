@@ -11,8 +11,18 @@ from pathlib import Path
 from uuid import uuid4
 
 from neo_trader.neo_universal_swarm.bots import CuratorBot, UniversalAccountBot
+from neo_trader.neo_universal_swarm.instruments import (
+    SwarmInstrumentMetadata,
+    load_swarm_instrument_catalog,
+)
 from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVPrediction
-from neo_trader.neo_universal_swarm.types import ActivePair, BookSnapshot, SwarmMetrics, as_utc
+from neo_trader.neo_universal_swarm.types import (
+    ActivePair,
+    BookSnapshot,
+    SwarmInstrument,
+    SwarmMetrics,
+    as_utc,
+)
 from neo_trader.runtime import get_runtime_commit_hash
 
 
@@ -22,6 +32,7 @@ def build_swarm_dashboard_state(
     latest_snapshots: Sequence[BookSnapshot],
     metrics: SwarmMetrics | None = None,
     predictions: Mapping[str, PairEVPrediction] | None = None,
+    instrument_metadata: Mapping[SwarmInstrument, SwarmInstrumentMetadata] | None = None,
     updated_at: datetime | None = None,
     commit_hash: str | None = None,
 ) -> dict[str, object]:
@@ -32,6 +43,7 @@ def build_swarm_dashboard_state(
     prediction_map = predictions or {
         snapshot.instrument.value: model.predict(snapshot) for snapshot in latest_snapshots
     }
+    metadata = dict(instrument_metadata or _load_default_instrument_metadata())
     realized_pnl = metrics.pair_ev_rub * Decimal(metrics.total_pairs) if metrics else Decimal("0")
     return {
         "updated_at": now.isoformat(),
@@ -39,7 +51,10 @@ def build_swarm_dashboard_state(
         "force_flatten_at": "20:45:00",
         "kill_switch_enabled": False,
         "realized_pnl": str(realized_pnl),
-        "instruments": [_instrument_payload(snapshot) for snapshot in latest_snapshots],
+        "instruments": [
+            _instrument_payload(snapshot, metadata.get(snapshot.instrument))
+            for snapshot in latest_snapshots
+        ],
         "signals": [_signal_payload(snapshot, prediction_map) for snapshot in latest_snapshots],
         "positions": [],
         "orders": [],
@@ -57,7 +72,8 @@ def build_swarm_dashboard_state(
                 _active_pair_payload(pair) for pair in curator.active_pairs.values()
             ],
             "latest_market": [
-                _market_payload(snapshot, prediction_map) for snapshot in latest_snapshots
+                _market_payload(snapshot, prediction_map, metadata.get(snapshot.instrument))
+                for snapshot in latest_snapshots
             ],
             "metrics": {} if metrics is None else _metrics_payload(metrics),
             "model_quality": {} if metrics is None else _model_quality_payload(metrics),
@@ -73,6 +89,7 @@ def write_swarm_dashboard_state(
     latest_snapshots: Sequence[BookSnapshot],
     metrics: SwarmMetrics | None = None,
     predictions: Mapping[str, PairEVPrediction] | None = None,
+    instrument_metadata: Mapping[SwarmInstrument, SwarmInstrumentMetadata] | None = None,
     updated_at: datetime | None = None,
     commit_hash: str | None = None,
 ) -> Path:
@@ -83,6 +100,7 @@ def write_swarm_dashboard_state(
         latest_snapshots=latest_snapshots,
         metrics=metrics,
         predictions=predictions,
+        instrument_metadata=instrument_metadata,
         updated_at=updated_at,
         commit_hash=commit_hash,
     )
@@ -101,11 +119,17 @@ def write_swarm_dashboard_state(
     return resolved_path
 
 
-def _instrument_payload(snapshot: BookSnapshot) -> dict[str, object]:
+def _instrument_payload(
+    snapshot: BookSnapshot,
+    metadata: SwarmInstrumentMetadata | None,
+) -> dict[str, object]:
+    uid = metadata.uid if metadata is not None else snapshot.instrument.value
+    ticker = metadata.ticker if metadata is not None else snapshot.instrument.value
+    name = metadata.tbank_query if metadata is not None else snapshot.instrument.value
     return {
-        "instrument_uid": snapshot.instrument.value,
-        "ticker": snapshot.instrument.value,
-        "name": snapshot.instrument.value,
+        "instrument_uid": uid,
+        "ticker": ticker,
+        "name": name,
         "spread_bps": str((snapshot.spread_price / snapshot.mid_price) * Decimal("10000")),
         "imbalance": str(snapshot.imbalance(3)),
         "volatility_regime": _regime_from_snapshot(snapshot),
@@ -173,10 +197,16 @@ def _active_pair_payload(pair: ActivePair) -> dict[str, object]:
 def _market_payload(
     snapshot: BookSnapshot,
     predictions: Mapping[str, PairEVPrediction],
+    metadata: SwarmInstrumentMetadata | None,
 ) -> dict[str, object]:
     prediction = predictions.get(snapshot.instrument.value)
     return {
         "instrument": snapshot.instrument.value,
+        "ticker": None if metadata is None else metadata.ticker,
+        "uid": None if metadata is None else metadata.uid,
+        "figi": None if metadata is None else metadata.figi,
+        "class_code": None if metadata is None else metadata.class_code,
+        "position_uid": None if metadata is None else metadata.position_uid,
         "best_bid": str(snapshot.best_bid),
         "best_ask": str(snapshot.best_ask),
         "spread_ticks": str(snapshot.spread_ticks),
@@ -254,6 +284,13 @@ def _regime_from_snapshot(snapshot: BookSnapshot) -> str:
     if snapshot.volatility_15s <= Decimal("0.5"):
         return "low"
     return "normal"
+
+
+def _load_default_instrument_metadata() -> dict[SwarmInstrument, SwarmInstrumentMetadata]:
+    try:
+        return load_swarm_instrument_catalog().by_instrument()
+    except FileNotFoundError:
+        return {}
 
 
 __all__ = [

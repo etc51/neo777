@@ -28,6 +28,7 @@ MODULES = [
     "neo_trader.neo_universal_swarm.daemon",
     "neo_trader.neo_universal_swarm.dashboard",
     "neo_trader.neo_universal_swarm.data",
+    "neo_trader.neo_universal_swarm.instruments",
     "neo_trader.neo_universal_swarm.model",
     "neo_trader.neo_universal_swarm.paper",
     "neo_trader.neo_universal_swarm.server_dashboard",

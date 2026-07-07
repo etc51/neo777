@@ -12,6 +12,11 @@ from neo_trader.neo_universal_swarm.daemon import (
     SwarmDaemonCycle,
     run_swarm_daemon,
 )
+from neo_trader.neo_universal_swarm.instruments import (
+    SwarmInstrumentCatalog,
+    SwarmInstrumentMetadata,
+    load_swarm_instrument_catalog,
+)
 from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVModelConfig, PairEVPrediction
 from neo_trader.neo_universal_swarm.paper import (
     PaperSimulationArtifacts,
@@ -62,12 +67,15 @@ __all__ = [
     "SwarmAccountsConfig",
     "SwarmDaemonConfig",
     "SwarmDaemonCycle",
+    "SwarmInstrumentCatalog",
+    "SwarmInstrumentMetadata",
     "SwarmInstrument",
     "SwarmMetrics",
     "UniversalAccountBot",
     "UniversalBotConfig",
     "aggregate_pair_metrics",
     "load_accounts_config",
+    "load_swarm_instrument_catalog",
     "load_swarm_state",
     "render_swarm_dashboard_html",
     "run_paper_simulation",

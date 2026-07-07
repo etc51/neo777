@@ -15,6 +15,7 @@ from neo_trader.neo_universal_swarm import (
     PairEVModelConfig,
     SwarmInstrument,
     load_accounts_config,
+    load_swarm_instrument_catalog,
     run_paper_simulation,
 )
 from neo_trader.neo_universal_swarm.dashboard import build_swarm_dashboard_state
@@ -32,6 +33,20 @@ def test_accounts_config_loads_ten_paper_only_bots() -> None:
         SwarmInstrument.NEOBITOK,
         SwarmInstrument.NEOEFIR,
     )
+
+
+def test_swarm_instrument_catalog_loads_tbank_identifiers() -> None:
+    catalog = load_swarm_instrument_catalog()
+
+    neobitok = catalog.get(SwarmInstrument.NEOBITOK)
+    neoefir = catalog.get(SwarmInstrument.NEOEFIR)
+
+    assert neobitok.ticker == "BTCUSDperpA"
+    assert neobitok.uid == "4effa274-4e8f-422c-93ff-04aa34fe8e39"
+    assert neobitok.position_uid == "53573505-f4d3-4f7a-9b1c-cb199385f2b7"
+    assert neoefir.ticker == "ETHUSDperpA"
+    assert neoefir.uid == "eceb99e7-5935-412a-9515-975ec4b5e244"
+    assert neoefir.position_uid == "098640ef-40ba-4d08-99d5-fc9ab4cd1d3e"
 
 
 def test_pair_ev_model_gates_edge_and_rejects_chop() -> None:
@@ -127,6 +142,9 @@ def test_dashboard_state_contains_curator_bots_metrics_and_market() -> None:
     assert swarm["curator"]["trading_enabled"] is False
     assert swarm["metrics"]["total_pairs"] == 20
     assert swarm["latest_market"][0]["model_ev_ticks"] is not None
+    assert swarm["latest_market"][0]["ticker"] == "BTCUSDperpA"
+    assert swarm["latest_market"][0]["uid"] == "4effa274-4e8f-422c-93ff-04aa34fe8e39"
+    assert swarm["latest_market"][0]["position_uid"] == "53573505-f4d3-4f7a-9b1c-cb199385f2b7"
 
 
 def test_paper_simulation_runs_requested_pair_count_without_live_mode(tmp_path: Path) -> None:

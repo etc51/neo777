@@ -1,0 +1,17 @@
+instruments:
+  NEOBITOK:
+    tbank_query: Neo Bitcoin
+    ticker: BTCUSDperpA
+    class_code: SPBDMFUT
+    figi: BTCUSDPERP00
+    uid: 4effa274-4e8f-422c-93ff-04aa34fe8e39
+    position_uid: 53573505-f4d3-4f7a-9b1c-cb199385f2b7
+    enabled: true
+  NEOEFIR:
+    tbank_query: Neo Ethereum
+    ticker: ETHUSDperpA
+    class_code: SPBDMFUT
+    figi: ETHUSDPERP00
+    uid: eceb99e7-5935-412a-9515-975ec4b5e244
+    position_uid: 098640ef-40ba-4d08-99d5-fc9ab4cd1d3e
+    enabled: true

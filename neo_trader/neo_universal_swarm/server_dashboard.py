@@ -40,6 +40,9 @@ def render_swarm_dashboard_html(state: JsonMapping) -> str:
         latest_market,
         (
             "instrument",
+            "ticker",
+            "uid",
+            "position_uid",
             "spread_ticks",
             "microprice",
             "imbalance_3",
