@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import math
 import os
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, Protocol, TypeAlias, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -27,8 +28,10 @@ from neo_trader.config_loader import (  # noqa: E402
     load_instrument_universe_config,
 )
 from neo_trader.data.market_data_recorder import (  # noqa: E402
+    SUBSCRIBE_ACTION,
     MarketDataEventType,
     MarketDataRecorder,
+    MarketDataRecorderError,
     MarketDataSubscription,
     RawMarketDataEvent,
 )
@@ -42,11 +45,13 @@ from neo_trader.monitoring.dashboard_state_writer import (  # noqa: E402
 )
 
 SAFE_FALSE_VALUES: Final = {"0", "false", "no", "off"}
+T_INVEST_TOKEN_ENV: Final = "T_INVEST_TOKEN"
 EVENT_TYPES: Final = (
     MarketDataEventType.ORDERBOOK,
     MarketDataEventType.TRADES,
     MarketDataEventType.CANDLES,
 )
+TBankStreamClientFactory: TypeAlias = Callable[[str], "TBankMarketDataStreamClient"]
 
 
 class RecorderCliError(Exception):
@@ -81,6 +86,16 @@ class SafetyFlags:
         }
 
 
+class TBankMarketDataStreamClient(Protocol):
+    """Minimal async stream client used by the readonly source."""
+
+    def stream_market_data(
+        self,
+        subscriptions: Sequence[MarketDataSubscription],
+    ) -> AsyncIterator[object]:
+        """Yield raw T-Bank SDK stream response objects."""
+
+
 class MockMarketDataSource:
     """Synthetic finite market-data source for pipeline testing."""
 
@@ -107,6 +122,67 @@ class MockMarketDataSource:
                 sequence += 1
 
 
+class TBankInvestSdkStreamClient:
+    """Thin adapter around ``tinkoff.invest.AsyncClient`` market-data stream."""
+
+    def __init__(
+        self,
+        *,
+        token: str,
+        keepalive_seconds: float = 1.0,
+        sdk_module: object | None = None,
+    ) -> None:
+        if keepalive_seconds <= 0:
+            raise ValueError("keepalive_seconds must be positive.")
+        self._token = token
+        self._keepalive_seconds = keepalive_seconds
+        self._sdk_module = sdk_module or _load_tbank_sdk_module()
+
+    async def stream_market_data(
+        self,
+        subscriptions: Sequence[MarketDataSubscription],
+    ) -> AsyncIterator[object]:
+        sdk = self._sdk_module
+        async_client_type = sdk.AsyncClient
+        async with async_client_type(self._token) as client:
+            market_data_stream = client.market_data_stream
+            stream_method = market_data_stream.market_data_stream
+            async for response in stream_method(self._request_iterator(sdk, subscriptions)):
+                yield response
+
+    async def _request_iterator(
+        self,
+        sdk: object,
+        subscriptions: Sequence[MarketDataSubscription],
+    ) -> AsyncIterator[object]:
+        for request in _build_sdk_market_data_requests(sdk, subscriptions):
+            yield request
+        while True:
+            await asyncio.sleep(self._keepalive_seconds)
+
+
+class TBankReadonlyMarketDataSource:
+    """Readonly T-Bank market-data source that yields recorder raw events."""
+
+    def __init__(
+        self,
+        *,
+        token: str,
+        stream_client: TBankMarketDataStreamClient | None = None,
+    ) -> None:
+        self._token = token
+        self._stream_client = stream_client
+
+    async def stream(
+        self,
+        subscriptions: Sequence[MarketDataSubscription],
+    ) -> AsyncIterator[RawMarketDataEvent]:
+        stream_client = self._stream_client or TBankInvestSdkStreamClient(token=self._token)
+        async for response in stream_client.stream_market_data(subscriptions):
+            for event in tbank_stream_response_to_raw_events(response, subscriptions):
+                yield event
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the recorder CLI and return a process exit code."""
 
@@ -118,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             quality_report_path = asyncio.run(
                 _run_mock_mode(
                     duration_seconds=args.duration_seconds,
+                    max_events=args.max_events,
                     output_path=args.output,
                     dashboard_state_path=args.dashboard_state,
                     reports_dir=args.report_dir,
@@ -128,15 +205,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"recording_quality_report={quality_report_path}")
             return 0
         if args.mode == "tbank-readonly":
-            _run_tbank_readonly_mode(
-                instruments_config=args.instruments_config,
-                safety_flags=safety_flags,
+            quality_report_path = asyncio.run(
+                _run_tbank_readonly_mode(
+                    duration_seconds=args.duration_seconds,
+                    max_events=args.max_events,
+                    output_path=args.output,
+                    dashboard_state_path=args.dashboard_state,
+                    reports_dir=args.report_dir,
+                    instruments_config=args.instruments_config,
+                    safety_flags=safety_flags,
+                )
             )
+            print(f"recording_quality_report={quality_report_path}")
             return 0
         raise RecorderCliError(f"unsupported recorder mode: {args.mode}")
     except RecorderCliError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except MarketDataRecorderError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
     except NotImplementedError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
@@ -168,6 +256,7 @@ def require_readonly_runtime_flags(env: Mapping[str, str] | None = None) -> Safe
 async def _run_mock_mode(
     *,
     duration_seconds: float,
+    max_events: int | None,
     output_path: Path,
     dashboard_state_path: Path,
     reports_dir: Path,
@@ -184,6 +273,9 @@ async def _run_mock_mode(
 
     ticks = max(1, math.ceil(duration_seconds))
     subscriptions = _subscriptions(instruments)
+    stop_after_events = len(subscriptions) * ticks
+    if max_events is not None:
+        stop_after_events = min(max_events, stop_after_events)
     started_at = datetime.now(UTC)
     recorder = MarketDataRecorder(
         root=output_path,
@@ -195,7 +287,7 @@ async def _run_mock_mode(
     result = await recorder.run(
         lambda: MockMarketDataSource(ticks=ticks, started_at=started_at),
         subscriptions,
-        stop_after_events=len(subscriptions) * ticks,
+        stop_after_events=stop_after_events,
         max_reconnects=0,
     )
     finished_at = datetime.now(UTC)
@@ -221,21 +313,77 @@ async def _run_mock_mode(
     return write_recording_quality_report(report, reports_dir=reports_dir)
 
 
-def _run_tbank_readonly_mode(
+async def _run_tbank_readonly_mode(
     *,
+    duration_seconds: float,
+    max_events: int | None,
+    output_path: Path,
+    dashboard_state_path: Path,
+    reports_dir: Path,
     instruments_config: Path,
     safety_flags: SafetyFlags,
-) -> None:
-    _ = safety_flags
-    token = os.getenv("T_INVEST_TOKEN")
-    if not token:
-        raise RecorderCliError(
-            "T_INVEST_TOKEN is required for --mode tbank-readonly. "
-            "Set it in the local environment only; do not commit it."
-        )
+    stream_client_factory: TBankStreamClientFactory | None = None,
+) -> Path:
+    if duration_seconds <= 0:
+        raise RecorderCliError("--duration-seconds must be positive.")
+    if max_events is not None and max_events <= 0:
+        raise RecorderCliError("--max-events must be positive when provided.")
 
+    token = _tbank_token_from_env()
     instrument_universe = load_instrument_universe_config(instruments_config)
     instruments = _enabled_instruments(instrument_universe.instruments)
+    if not instruments:
+        raise RecorderCliError("configs/instruments.yaml must contain at least one instrument.")
+    _require_configured_uids(instruments)
+
+    subscriptions = _subscriptions(instruments)
+    started_at = datetime.now(UTC)
+    recorder = MarketDataRecorder(root=output_path, flush_rows=1)
+    result = await recorder.run(
+        lambda: TBankReadonlyMarketDataSource(
+            token=token,
+            stream_client=(
+                stream_client_factory(token) if stream_client_factory is not None else None
+            ),
+        ),
+        subscriptions,
+        stop_after_events=max_events,
+        stop_after_seconds=duration_seconds,
+    )
+    finished_at = datetime.now(UTC)
+
+    dashboard_instruments = _dashboard_instruments(instruments, updated_at=finished_at)
+    write_readonly_dashboard_state(
+        dashboard_state_path,
+        instruments=dashboard_instruments,
+        kill_switch_enabled=False,
+        commit_hash=result.commit_hash,
+        updated_at=finished_at,
+    )
+    report = build_recording_quality_report(
+        mode="tbank-readonly",
+        started_at=started_at,
+        finished_at=finished_at,
+        result=result,
+        instruments=[instrument.instrument_uid for instrument in instruments],
+        output_path=output_path,
+        dashboard_state_path=dashboard_state_path,
+        safety_flags=safety_flags.to_report_dict(),
+    )
+    return write_recording_quality_report(report, reports_dir=reports_dir)
+
+
+def _tbank_token_from_env() -> str:
+    token = os.getenv(T_INVEST_TOKEN_ENV)
+    if token is None or not token.strip():
+        raise RecorderCliError(
+            f"{T_INVEST_TOKEN_ENV} is required for --mode tbank-readonly. "
+            "Set it in the local environment only; do not commit it."
+        )
+    return token.strip()
+
+
+def _require_configured_uids(instruments: Sequence[ResolvedInstrument]) -> None:
     missing_uid = [instrument.ticker for instrument in instruments if not instrument.configured_uid]
     if missing_uid:
         joined = ", ".join(missing_uid)
@@ -243,12 +391,6 @@ def _run_tbank_readonly_mode(
             "configs/instruments.yaml has enabled instruments without uid: "
             f"{joined}. Fill instruments[].uid before using tbank-readonly."
         )
-
-    raise NotImplementedError(
-        "TODO: implement a readonly T-Bank market-data stream source. "
-        "This mode must remain readonly-only, must not import execution modules, "
-        "and must never submit orders."
-    )
 
 
 def _enabled_instruments(configs: Sequence[InstrumentConfig]) -> tuple[ResolvedInstrument, ...]:
@@ -331,10 +473,463 @@ def _mock_payload(subscription: MarketDataSubscription, tick: int) -> dict[str, 
     raise RecorderCliError(f"unsupported mock event type: {subscription.event_type}")
 
 
+def tbank_stream_response_to_raw_events(
+    response: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> tuple[RawMarketDataEvent, ...]:
+    """Convert one T-Bank stream response into zero or more recorder events."""
+
+    received_at = datetime.now(UTC)
+    events: list[RawMarketDataEvent] = []
+    orderbook = _field(response, "orderbook", "order_book")
+    trade = _field(response, "trade")
+    candle = _field(response, "candle")
+
+    if orderbook is not None:
+        event_time = _event_time(orderbook, "time")
+        payload = _orderbook_payload(orderbook, subscriptions)
+        events.append(
+            RawMarketDataEvent.from_payload(
+                instrument_uid=cast(str, payload["instrument_uid"]),
+                event_type=MarketDataEventType.ORDERBOOK,
+                payload=payload,
+                received_at=received_at,
+                event_time=event_time,
+            )
+        )
+
+    if trade is not None:
+        event_time = _event_time(trade, "time")
+        payload = _trade_payload(trade, subscriptions)
+        events.append(
+            RawMarketDataEvent.from_payload(
+                instrument_uid=cast(str, payload["instrument_uid"]),
+                event_type=MarketDataEventType.TRADES,
+                payload=payload,
+                received_at=received_at,
+                event_time=event_time,
+            )
+        )
+
+    if candle is not None:
+        event_time = _event_time(candle, "time")
+        payload = _candle_payload(candle, subscriptions)
+        events.append(
+            RawMarketDataEvent.from_payload(
+                instrument_uid=cast(str, payload["instrument_uid"]),
+                event_type=MarketDataEventType.CANDLES,
+                payload=payload,
+                received_at=received_at,
+                event_time=event_time,
+            )
+        )
+
+    return tuple(events)
+
+
+def _orderbook_payload(
+    orderbook: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> dict[str, object]:
+    return {
+        "source": "tbank",
+        "instrument_uid": _instrument_uid_from_event(orderbook, subscriptions),
+        "figi": _optional_string(_field(orderbook, "figi")),
+        "depth": _optional_int(_field(orderbook, "depth")),
+        "is_consistent": _optional_bool(_field(orderbook, "is_consistent", "isConsistent")),
+        "time": _optional_datetime(_event_time(orderbook, "time")),
+        "limit_up": _optional_decimal_string(_field(orderbook, "limit_up", "limitUp")),
+        "limit_down": _optional_decimal_string(_field(orderbook, "limit_down", "limitDown")),
+        "bids": _price_levels(_field(orderbook, "bids")),
+        "asks": _price_levels(_field(orderbook, "asks")),
+    }
+
+
+def _trade_payload(
+    trade: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> dict[str, object]:
+    return {
+        "source": "tbank",
+        "instrument_uid": _instrument_uid_from_event(trade, subscriptions),
+        "figi": _optional_string(_field(trade, "figi")),
+        "direction": _enum_or_string(_field(trade, "direction")),
+        "price": _optional_decimal_string(_field(trade, "price")),
+        "quantity": _optional_int(_field(trade, "quantity")),
+        "time": _optional_datetime(_event_time(trade, "time")),
+        "trade_source": _enum_or_string(_field(trade, "trade_source", "tradeSource")),
+        "open_interest": _optional_int(_field(trade, "open_interest", "openInterest")),
+    }
+
+
+def _candle_payload(
+    candle: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> dict[str, object]:
+    return {
+        "source": "tbank",
+        "instrument_uid": _instrument_uid_from_event(candle, subscriptions),
+        "figi": _optional_string(_field(candle, "figi")),
+        "interval": _enum_or_string(_field(candle, "interval")),
+        "open": _optional_decimal_string(_field(candle, "open")),
+        "high": _optional_decimal_string(_field(candle, "high")),
+        "low": _optional_decimal_string(_field(candle, "low")),
+        "close": _optional_decimal_string(_field(candle, "close")),
+        "volume": _optional_int(_field(candle, "volume")),
+        "time": _optional_datetime(_event_time(candle, "time")),
+        "last_trade_ts": _optional_datetime(
+            _event_time(candle, "last_trade_ts", "lastTradeTs")
+        ),
+    }
+
+
+def _price_levels(levels: object) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for level in _sequence(levels):
+        result.append(
+            {
+                "price": _optional_decimal_string(_field(level, "price")),
+                "quantity": _optional_int(_field(level, "quantity")),
+            }
+        )
+    return result
+
+
+def _instrument_uid_from_event(
+    event_payload: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> str:
+    direct = _optional_string(
+        _field(
+            event_payload,
+            "instrument_uid",
+            "instrumentUid",
+            "instrument_id",
+            "instrumentId",
+            "uid",
+        )
+    )
+    if direct:
+        for subscription in subscriptions:
+            if direct in {subscription.instrument_uid, subscription.resolved_instrument_id}:
+                return subscription.instrument_uid
+        return direct
+
+    figi = _optional_string(_field(event_payload, "figi"))
+    if figi:
+        for subscription in subscriptions:
+            if figi in {subscription.instrument_uid, subscription.resolved_instrument_id}:
+                return subscription.instrument_uid
+        return figi
+
+    unique_uids = {subscription.instrument_uid for subscription in subscriptions}
+    if len(unique_uids) == 1:
+        return next(iter(unique_uids))
+    raise RecorderCliError("T-Bank stream event has no instrument uid.")
+
+
+def _build_sdk_market_data_requests(
+    sdk: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> tuple[object, ...]:
+    requests: list[object] = []
+    action = _sdk_enum(sdk, "SubscriptionAction", SUBSCRIBE_ACTION)
+
+    orderbook_subscriptions = [
+        subscription
+        for subscription in subscriptions
+        if subscription.event_type is MarketDataEventType.ORDERBOOK
+    ]
+    trade_subscriptions = [
+        subscription
+        for subscription in subscriptions
+        if subscription.event_type is MarketDataEventType.TRADES
+    ]
+    candle_subscriptions = [
+        subscription
+        for subscription in subscriptions
+        if subscription.event_type is MarketDataEventType.CANDLES
+    ]
+
+    if orderbook_subscriptions:
+        requests.append(_sdk_orderbook_request(sdk, action, orderbook_subscriptions))
+    if trade_subscriptions:
+        requests.append(_sdk_trades_request(sdk, action, trade_subscriptions))
+    if candle_subscriptions:
+        requests.append(_sdk_candles_request(sdk, action, candle_subscriptions))
+    return tuple(requests)
+
+
+def _sdk_orderbook_request(
+    sdk: object,
+    action: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> object:
+    instrument_type = sdk.OrderBookInstrument
+    request_type = sdk.SubscribeOrderBookRequest
+    envelope_type = sdk.MarketDataRequest
+    instruments = [
+        _construct_sdk_message(
+            instrument_type,
+            (
+                {
+                    "instrument_id": subscription.resolved_instrument_id,
+                    "depth": subscription.depth,
+                    "order_book_type": _sdk_enum_or_none(
+                        sdk,
+                        "OrderBookType",
+                        subscription.order_book_type,
+                    ),
+                },
+                {
+                    "instrument_id": subscription.resolved_instrument_id,
+                    "depth": subscription.depth,
+                },
+                {"figi": subscription.resolved_instrument_id, "depth": subscription.depth},
+            ),
+        )
+        for subscription in subscriptions
+    ]
+    request = _construct_sdk_message(
+        request_type,
+        ({"subscription_action": action, "instruments": instruments},),
+    )
+    return envelope_type(subscribe_order_book_request=request)
+
+
+def _sdk_trades_request(
+    sdk: object,
+    action: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> object:
+    instrument_type = sdk.TradeInstrument
+    request_type = sdk.SubscribeTradesRequest
+    envelope_type = sdk.MarketDataRequest
+    instruments = [
+        _construct_sdk_message(
+            instrument_type,
+            (
+                {
+                    "instrument_id": subscription.resolved_instrument_id,
+                    "trade_source": _sdk_enum_or_none(
+                        sdk,
+                        "TradeSourceType",
+                        subscription.trade_source,
+                    ),
+                    "with_open_interest": subscription.with_open_interest,
+                },
+                {"instrument_id": subscription.resolved_instrument_id},
+                {"figi": subscription.resolved_instrument_id},
+            ),
+        )
+        for subscription in subscriptions
+    ]
+    request = _construct_sdk_message(
+        request_type,
+        ({"subscription_action": action, "instruments": instruments},),
+    )
+    return envelope_type(subscribe_trades_request=request)
+
+
+def _sdk_candles_request(
+    sdk: object,
+    action: object,
+    subscriptions: Sequence[MarketDataSubscription],
+) -> object:
+    instrument_type = sdk.CandleInstrument
+    request_type = sdk.SubscribeCandlesRequest
+    envelope_type = sdk.MarketDataRequest
+    instruments = [
+        _construct_sdk_message(
+            instrument_type,
+            (
+                {
+                    "instrument_id": subscription.resolved_instrument_id,
+                    "interval": _sdk_enum(
+                        sdk,
+                        "SubscriptionInterval",
+                        subscription.candle_interval,
+                    ),
+                },
+                {
+                    "figi": subscription.resolved_instrument_id,
+                    "interval": _sdk_enum(
+                        sdk,
+                        "SubscriptionInterval",
+                        subscription.candle_interval,
+                    ),
+                },
+            ),
+        )
+        for subscription in subscriptions
+    ]
+    waiting_close = any(subscription.waiting_close for subscription in subscriptions)
+    request = _construct_sdk_message(
+        request_type,
+        (
+            {
+                "subscription_action": action,
+                "instruments": instruments,
+                "waiting_close": waiting_close,
+            },
+            {"subscription_action": action, "instruments": instruments},
+        ),
+    )
+    return envelope_type(subscribe_candles_request=request)
+
+
+def _construct_sdk_message(
+    message_type: object,
+    alternatives: Sequence[Mapping[str, object | None]],
+) -> object:
+    last_error: TypeError | None = None
+    for kwargs in alternatives:
+        clean_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        try:
+            return cast(Any, message_type)(**clean_kwargs)
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RecorderCliError("No SDK message constructor alternatives were provided.")
+
+
+def _sdk_enum(sdk: object, enum_name: str, member_name: str) -> object:
+    enum_type = getattr(sdk, enum_name)
+    return getattr(enum_type, member_name)
+
+
+def _sdk_enum_or_none(sdk: object, enum_name: str, member_name: str) -> object | None:
+    enum_type = getattr(sdk, enum_name, None)
+    if enum_type is None:
+        return None
+    return getattr(enum_type, member_name, None)
+
+
+def _load_tbank_sdk_module() -> object:
+    try:
+        return importlib.import_module("tinkoff.invest")
+    except ImportError as exc:
+        raise RecorderCliError(
+            "tbank-readonly requires the T-Invest Python SDK import path "
+            "'tinkoff.invest'. Install the SDK locally before real recording."
+        ) from exc
+
+
+def _field(value: object, *names: str) -> object | None:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value and value[name] is not None:
+                return value[name]
+    for name in names:
+        if hasattr(value, name):
+            attr = getattr(value, name)
+            if attr is not None:
+                return attr
+    return None
+
+
+def _sequence(value: object) -> tuple[object, ...]:
+    if value is None or isinstance(value, str | bytes | Mapping):
+        return ()
+    if isinstance(value, Sequence):
+        return tuple(value)
+    return ()
+
+
+def _event_time(value: object, *names: str) -> datetime | None:
+    for name in names:
+        candidate = _field(value, name)
+        parsed = _datetime_from_object(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _datetime_from_object(value: object | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if isinstance(value, str):
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    to_datetime = getattr(value, "ToDatetime", None)
+    if callable(to_datetime):
+        parsed = to_datetime()
+        if isinstance(parsed, datetime):
+            return _as_utc(parsed)
+    return None
+
+
+def _optional_datetime(value: datetime | None) -> str | None:
+    return None if value is None else _as_utc(value).isoformat()
+
+
+def _optional_string(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_bool(value: object | None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _optional_int(value: object | None) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value)
+    return None
+
+
+def _enum_or_string(value: object | None) -> str | None:
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    return str(value)
+
+
+def _optional_decimal_string(value: object | None) -> str | None:
+    decimal_value = _decimal_from_quotation_like(value)
+    return None if decimal_value is None else str(decimal_value)
+
+
+def _decimal_from_quotation_like(value: object | None) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int | str):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    units = _field(value, "units")
+    nano = _field(value, "nano")
+    if units is None and nano is None:
+        return None
+    return Decimal(_optional_int(units) or 0) + (
+        Decimal(_optional_int(nano) or 0) / Decimal("1000000000")
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Readonly market-data recorder")
     parser.add_argument("--mode", choices=("mock", "tbank-readonly"), required=True)
     parser.add_argument("--duration-seconds", type=float, required=True)
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Stop after N recorded events; useful for safe short smoke tests.",
+    )
     parser.add_argument("--output", type=Path, default=Path("data/raw"))
     parser.add_argument(
         "--dashboard-state",

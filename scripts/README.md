@@ -12,5 +12,5 @@ This folder contains command-line utilities for local operation and audits.
 - Scripts must fail fast when safety flags are unsafe.
 - Do not log or print tokens, account ids, or secrets.
 - Recorder scripts must not import order placement modules.
+- `tbank-readonly` may use only T-Bank market-data stream APIs.
 - Prefer reusable package code over large script-only logic when behavior grows.
-

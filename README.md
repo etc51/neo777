@@ -173,6 +173,12 @@ Mock pipeline check without T-Bank API:
 python scripts\run_data_recorder.py --mode mock --duration-seconds 60 --output data\raw --dashboard-state data\monitoring\dashboard_state.json
 ```
 
+Short readonly T-Bank stream smoke test:
+
+```powershell
+python scripts\run_data_recorder.py --mode tbank-readonly --duration-seconds 60 --max-events 10 --output data\raw --dashboard-state data\monitoring\dashboard_state.json
+```
+
 Read the generated live-state dashboard snapshot:
 
 ```powershell
@@ -188,5 +194,6 @@ make run-dashboard-live-state
 ```
 
 `record-readonly` is intentionally guarded by readonly safety flags and requires
-local `T_INVEST_TOKEN`. The real T-Bank stream source is still a TODO stub, and
-it must remain read-only when implemented.
+local `T_INVEST_TOKEN`, configured instrument UIDs, and the T-Invest Python SDK
+import path `tinkoff.invest`. It uses only the T-Bank market-data stream path
+and must remain read-only.

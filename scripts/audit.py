@@ -76,8 +76,11 @@ def main() -> int:
         check_config_files_exist,
         check_run_data_recorder_exists,
         check_recorder_cli_has_mock_mode,
+        check_tbank_readonly_implementation_exists,
+        check_recorder_cli_has_max_events,
         check_recorder_cli_checks_readonly_flags,
         check_recorder_cli_has_no_order_placement_imports,
+        check_recorder_cli_has_no_order_api_calls,
         check_dashboard_state_writer_exists,
         check_makefile_recording_targets,
     )
@@ -551,6 +554,38 @@ def check_recorder_cli_has_mock_mode() -> AuditResult:
     )
 
 
+def check_tbank_readonly_implementation_exists() -> AuditResult:
+    source = _read("scripts/run_data_recorder.py")
+    required = (
+        "class TBankReadonlyMarketDataSource",
+        "class TBankInvestSdkStreamClient",
+        "tbank_stream_response_to_raw_events",
+        "_run_tbank_readonly_mode",
+        "stream_market_data",
+        "MarketDataRecorder",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="tbank-readonly implementation exists",
+        passed=not missing,
+        detail=(
+            "readonly T-Bank stream source found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_recorder_cli_has_max_events() -> AuditResult:
+    source = _read("scripts/run_data_recorder.py")
+    passed = '"--max-events"' in source and "max_events" in source
+    return AuditResult(
+        name="recorder CLI has --max-events",
+        passed=passed,
+        detail="safe smoke-test stop flag found" if passed else "missing --max-events",
+    )
+
+
 def check_recorder_cli_checks_readonly_flags() -> AuditResult:
     source = _read("scripts/run_data_recorder.py")
     required = (
@@ -569,6 +604,33 @@ def check_recorder_cli_checks_readonly_flags() -> AuditResult:
             if not missing
             else "missing: " + ", ".join(missing)
         ),
+    )
+
+
+def check_recorder_cli_has_no_order_api_calls() -> AuditResult:
+    path = ROOT / "scripts" / "run_data_recorder.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    forbidden: list[str] = []
+    forbidden_names = {
+        "post_order",
+        "cancel_order",
+        "replace_order",
+        "get_orders",
+        "post_sandbox_order",
+        "cancel_sandbox_order",
+        "stop_orders",
+        "orders",
+        "orders_service",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.lower() in forbidden_names:
+            forbidden.append(node.attr)
+        elif isinstance(node, ast.Name) and node.id.lower() in forbidden_names:
+            forbidden.append(node.id)
+    return AuditResult(
+        name="recorder CLI has no order API calls",
+        passed=not forbidden,
+        detail=_violation_detail(forbidden),
     )
 
 

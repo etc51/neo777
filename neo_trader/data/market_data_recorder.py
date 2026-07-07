@@ -12,7 +12,7 @@ import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -384,6 +384,7 @@ class MarketDataRecorder:
         subscriptions: Sequence[MarketDataSubscription],
         *,
         stop_after_events: int | None = None,
+        stop_after_seconds: float | None = None,
         max_reconnects: int | None = None,
     ) -> MarketDataRecorderResult:
         """Subscribe, record raw events, heartbeat, and reconnect on stream failures."""
@@ -392,12 +393,19 @@ class MarketDataRecorder:
             raise ValueError("subscriptions must not be empty.")
         if stop_after_events is not None and stop_after_events <= 0:
             raise ValueError("stop_after_events must be positive when provided.")
+        if stop_after_seconds is not None and stop_after_seconds <= 0:
+            raise ValueError("stop_after_seconds must be positive when provided.")
         if max_reconnects is not None and max_reconnects < 0:
             raise ValueError("max_reconnects must be non-negative when provided.")
 
         events_recorded = 0
         reconnects = 0
         backoff_seconds = self.initial_backoff_seconds
+        deadline = (
+            _as_utc(self.clock()) + timedelta(seconds=stop_after_seconds)
+            if stop_after_seconds is not None
+            else None
+        )
 
         while True:
             source = source_factory()
@@ -406,13 +414,31 @@ class MarketDataRecorder:
             last_heartbeat_at = _as_utc(self.clock())
             try:
                 while True:
-                    timeout_seconds = self._seconds_until_heartbeat(last_heartbeat_at)
+                    if self._deadline_reached(deadline):
+                        self.writer.flush()
+                        return MarketDataRecorderResult(
+                            events_recorded=events_recorded,
+                            reconnects=reconnects,
+                            quality=self.quality.snapshots(),
+                        )
+
+                    timeout_seconds = self._next_wait_timeout(
+                        last_heartbeat_at,
+                        deadline=deadline,
+                    )
                     try:
                         event = await asyncio.wait_for(
                             iterator.__anext__(),
                             timeout=timeout_seconds,
                         )
                     except TimeoutError:
+                        if self._deadline_reached(deadline):
+                            self.writer.flush()
+                            return MarketDataRecorderResult(
+                                events_recorded=events_recorded,
+                                reconnects=reconnects,
+                                quality=self.quality.snapshots(),
+                            )
                         last_heartbeat_at = self._heartbeat()
                         continue
 
@@ -462,6 +488,21 @@ class MarketDataRecorder:
     def _seconds_until_heartbeat(self, last_heartbeat_at: datetime) -> float:
         elapsed = (_as_utc(self.clock()) - last_heartbeat_at).total_seconds()
         return max(self.heartbeat_interval_seconds - elapsed, 0.001)
+
+    def _next_wait_timeout(
+        self,
+        last_heartbeat_at: datetime,
+        *,
+        deadline: datetime | None,
+    ) -> float:
+        timeout_seconds = self._seconds_until_heartbeat(last_heartbeat_at)
+        if deadline is None:
+            return timeout_seconds
+        seconds_until_deadline = (deadline - _as_utc(self.clock())).total_seconds()
+        return max(min(timeout_seconds, seconds_until_deadline), 0.001)
+
+    def _deadline_reached(self, deadline: datetime | None) -> bool:
+        return deadline is not None and _as_utc(self.clock()) >= deadline
 
     async def _sleep_before_reconnect(self, backoff_seconds: float) -> None:
         if backoff_seconds > 0:
