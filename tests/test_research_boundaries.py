@@ -34,11 +34,11 @@ def test_research_tools_do_not_import_execution_or_order_modules() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.startswith("neo_trader.execution"):
+                    if alias.name.startswith(("neo_trader.broker", "neo_trader.execution")):
                         violations.append(f"{path}: import {alias.name}")
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
-                if module.startswith("neo_trader.execution"):
+                if module.startswith(("neo_trader.broker", "neo_trader.execution")):
                     violations.append(f"{path}: from {module}")
             elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ORDER_NAMES:
                 violations.append(f"{path}: attribute {node.attr}")

@@ -1,0 +1,9 @@
+# Offline research/backtest settings.
+#
+# These settings are for local research only. They do not apply to live trading,
+# broker adapters, risk gates, or execution.
+research:
+  session_profile: auto_from_data
+  opening_range_minutes: 15
+  min_rows_after_opening_range: 100
+  allow_short_recording_backtest: true

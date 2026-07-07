@@ -1,7 +1,7 @@
 PYTHON ?= python
 DASHBOARD_STATE ?= data/monitoring/dashboard_state.example.json
 
-.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording build-features research-backtest research-cycle
+.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording build-features research-backtest research-backtest-simple research-cycle
 
 install:
 	$(PYTHON) -m pip install -e ".[dev,dashboard]"
@@ -37,6 +37,9 @@ build-features:
 	$(PYTHON) scripts/build_feature_store.py --raw data/raw --output data/features --active-universe configs/active_universe.yaml
 
 research-backtest:
-	$(PYTHON) scripts/run_research_backtest.py --features data/features --reports-dir data/reports --active-universe configs/active_universe.yaml
+	$(PYTHON) scripts/run_research_backtest.py --features data/features --reports-dir data/reports --active-universe configs/active_universe.yaml --research-config configs/research.yaml --strategy opening_range_book_momentum
+
+research-backtest-simple:
+	$(PYTHON) scripts/run_research_backtest.py --features data/features --reports-dir data/reports --active-universe configs/active_universe.yaml --research-config configs/research.yaml --strategy simple_book_momentum_research
 
 research-cycle: analyze-recording build-features research-backtest

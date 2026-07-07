@@ -87,6 +87,9 @@ def main() -> int:
         check_universe_selector_exists,
         check_feature_store_exists,
         check_research_backtest_runner_exists,
+        check_research_config_exists,
+        check_auto_from_data_supported,
+        check_research_only_strategy_not_live_imported,
         check_makefile_research_cycle_exists,
         check_research_reports_generated_path_supported,
         check_research_tools_have_no_execution_imports,
@@ -525,12 +528,13 @@ def check_config_files_exist() -> AuditResult:
         ROOT / "configs" / "risk.yaml",
         ROOT / "configs" / "instruments.yaml",
         ROOT / "configs" / "runtime.yaml",
+        ROOT / "configs" / "research.yaml",
     )
     missing = [_relative(path) for path in required if not path.exists()]
     return AuditResult(
         name="configs/*.yaml exist",
         passed=not missing,
-        detail="strategy/risk/instruments/runtime configs found"
+        detail="strategy/risk/instruments/runtime/research configs found"
         if not missing
         else "missing: " + ", ".join(missing),
     )
@@ -776,9 +780,9 @@ def check_research_backtest_runner_exists() -> AuditResult:
     required = (
         "run_research_backtest",
         "OpeningRangeBookMomentumStrategy",
-        "backtest_report_",
-        "backtest_trades_",
-        "backtest_summary_",
+        "backtest_or_auto",
+        "backtest_simple_book_momentum",
+        "research_diagnostics_",
         "reason_code_distribution",
     )
     missing = [snippet for snippet in required if snippet not in source]
@@ -793,9 +797,85 @@ def check_research_backtest_runner_exists() -> AuditResult:
     )
 
 
+def check_research_config_exists() -> AuditResult:
+    path = ROOT / "configs" / "research.yaml"
+    if not path.exists():
+        return AuditResult("research.yaml exists", False, "missing configs/research.yaml")
+    source = path.read_text(encoding="utf-8")
+    required = (
+        "session_profile: auto_from_data",
+        "opening_range_minutes",
+        "min_rows_after_opening_range",
+        "allow_short_recording_backtest",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="research.yaml exists",
+        passed=not missing,
+        detail="research session config found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_auto_from_data_supported() -> AuditResult:
+    source = _read("neo_trader/research/backtest_runner.py")
+    required = (
+        "AUTO_FROM_DATA",
+        "auto_from_data",
+        "_resolve_session_window",
+        "_research_strategy_config",
+        "start = first_time",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="auto_from_data supported",
+        passed=not missing,
+        detail=(
+            "research session auto profile found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_research_only_strategy_not_live_imported() -> AuditResult:
+    live_paths = (
+        ROOT / "neo_trader" / "strategy",
+        ROOT / "neo_trader" / "broker",
+        ROOT / "neo_trader" / "execution",
+        ROOT / "neo_trader" / "risk",
+        ROOT / "scripts" / "run_data_recorder.py",
+    )
+    violations: list[str] = []
+    marker = "simple_book_momentum_research"
+    for path_or_dir in live_paths:
+        paths = path_or_dir.rglob("*.py") if path_or_dir.is_dir() else (path_or_dir,)
+        for path in paths:
+            if not path.exists():
+                continue
+            if marker in path.read_text(encoding="utf-8", errors="ignore"):
+                violations.append(_relative(path))
+    source = _read("neo_trader/research/backtest_runner.py")
+    required = marker in source and "RESEARCH_ONLY_NOT_FOR_LIVE" in source
+    return AuditResult(
+        name="research-only strategy cannot be imported by live runtime",
+        passed=required and not violations,
+        detail=(
+            "research-only marker isolated from live modules"
+            if required and not violations
+            else _violation_detail(violations)
+        ),
+    )
+
+
 def check_makefile_research_cycle_exists() -> AuditResult:
     source = _read("Makefile")
-    required = ("build-features:", "research-backtest:", "research-cycle:")
+    required = (
+        "build-features:",
+        "research-backtest:",
+        "research-backtest-simple:",
+        "research-cycle:",
+        "--research-config configs/research.yaml",
+    )
     missing = [target for target in required if target not in source]
     return AuditResult(
         name="Makefile research-cycle exists",
@@ -808,9 +888,9 @@ def check_research_reports_generated_path_supported() -> AuditResult:
     source = _read("neo_trader/research/backtest_runner.py")
     required = (
         "data/reports",
-        "backtest_report_",
-        "backtest_trades_",
-        "backtest_summary_",
+        "backtest_or_auto",
+        "backtest_simple_book_momentum",
+        "research_diagnostics_",
     )
     missing = [snippet for snippet in required if snippet not in source]
     return AuditResult(
@@ -834,14 +914,14 @@ def check_research_tools_have_no_execution_imports() -> AuditResult:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.startswith("neo_trader.execution"):
+                    if _is_forbidden_research_import(alias.name):
                         violations.append(f"{_relative(path)} imports {alias.name}")
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
-                if module.startswith("neo_trader.execution"):
+                if _is_forbidden_research_import(module):
                     violations.append(f"{_relative(path)} imports {module}")
     return AuditResult(
-        name="research tools have no execution imports",
+        name="research tools have no broker/execution imports",
         passed=not violations,
         detail=_violation_detail(violations),
     )
@@ -990,6 +1070,10 @@ def _research_boundary_paths() -> tuple[Path, ...]:
         ROOT / "neo_trader" / "research" / "feature_store.py",
         ROOT / "neo_trader" / "research" / "backtest_runner.py",
     )
+
+
+def _is_forbidden_research_import(module: str) -> bool:
+    return module.startswith("neo_trader.broker") or module.startswith("neo_trader.execution")
 
 
 def _is_forbidden_recorder_import(module: str) -> bool:

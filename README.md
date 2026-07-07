@@ -215,9 +215,14 @@ Build offline features and run the first research backtest:
 
 ```powershell
 python scripts\build_feature_store.py --raw data\raw --output data\features --active-universe configs\active_universe.yaml
-python scripts\run_research_backtest.py --features data\features --reports-dir data\reports --active-universe configs\active_universe.yaml
+python scripts\run_research_backtest.py --features data\features --reports-dir data\reports --active-universe configs\active_universe.yaml --research-config configs\research.yaml --strategy opening_range_book_momentum
+python scripts\run_research_backtest.py --features data\features --reports-dir data\reports --active-universe configs\active_universe.yaml --research-config configs\research.yaml --strategy simple_book_momentum_research
 ```
 
 The feature store writes ignored parquet under `data/features/`. The research
 backtest writes JSON, trade CSV, and HTML reports under `data/reports/` and does
-not import broker or execution modules.
+not import broker or execution modules. `configs/research.yaml` controls offline
+session profiles. `auto_from_data` builds the opening range from the first valid
+feature timestamp and is intended for short research recordings. The
+`simple_book_momentum_research` strategy is diagnostic only and is marked
+`RESEARCH_ONLY_NOT_FOR_LIVE` in reports.
