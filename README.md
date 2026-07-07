@@ -194,6 +194,6 @@ make run-dashboard-live-state
 ```
 
 `record-readonly` is intentionally guarded by readonly safety flags and requires
-local `T_INVEST_TOKEN`, configured instrument UIDs, and the T-Invest Python SDK
-import path `tinkoff.invest`. It uses only the T-Bank market-data stream path
-and must remain read-only.
+local `T_INVEST_TOKEN` or `NEO_TRADER_TBANK_TOKEN`, configured instrument UIDs,
+and the T-Invest Python SDK import path `t_tech.invest` or `tinkoff.invest`.
+It uses only the T-Bank market-data stream path and must remain read-only.

@@ -45,7 +45,7 @@ from neo_trader.monitoring.dashboard_state_writer import (  # noqa: E402
 )
 
 SAFE_FALSE_VALUES: Final = {"0", "false", "no", "off"}
-T_INVEST_TOKEN_ENV: Final = "T_INVEST_TOKEN"
+T_INVEST_TOKEN_ENVS: Final = ("T_INVEST_TOKEN", "NEO_TRADER_TBANK_TOKEN")
 EVENT_TYPES: Final = (
     MarketDataEventType.ORDERBOOK,
     MarketDataEventType.TRADES,
@@ -338,6 +338,13 @@ async def _run_tbank_readonly_mode(
 
     subscriptions = _subscriptions(instruments)
     started_at = datetime.now(UTC)
+    dashboard_instruments = _dashboard_instruments(instruments, updated_at=started_at)
+    write_readonly_dashboard_state(
+        dashboard_state_path,
+        instruments=dashboard_instruments,
+        kill_switch_enabled=False,
+        updated_at=started_at,
+    )
     recorder = MarketDataRecorder(root=output_path, flush_rows=1)
     result = await recorder.run(
         lambda: TBankReadonlyMarketDataSource(
@@ -374,13 +381,15 @@ async def _run_tbank_readonly_mode(
 
 
 def _tbank_token_from_env() -> str:
-    token = os.getenv(T_INVEST_TOKEN_ENV)
-    if token is None or not token.strip():
-        raise RecorderCliError(
-            f"{T_INVEST_TOKEN_ENV} is required for --mode tbank-readonly. "
-            "Set it in the local environment only; do not commit it."
-        )
-    return token.strip()
+    for env_name in T_INVEST_TOKEN_ENVS:
+        token = os.getenv(env_name)
+        if token is not None and token.strip():
+            return token.strip()
+    joined_names = " or ".join(T_INVEST_TOKEN_ENVS)
+    raise RecorderCliError(
+        f"{joined_names} is required for --mode tbank-readonly. "
+        "Set it in the local environment only; do not commit it."
+    )
 
 
 def _require_configured_uids(instruments: Sequence[ResolvedInstrument]) -> None:
@@ -807,13 +816,15 @@ def _sdk_enum_or_none(sdk: object, enum_name: str, member_name: str) -> object |
 
 
 def _load_tbank_sdk_module() -> object:
-    try:
-        return importlib.import_module("tinkoff.invest")
-    except ImportError as exc:
-        raise RecorderCliError(
-            "tbank-readonly requires the T-Invest Python SDK import path "
-            "'tinkoff.invest'. Install the SDK locally before real recording."
-        ) from exc
+    for module_name in ("t_tech.invest", "tinkoff.invest"):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError:
+            continue
+    raise RecorderCliError(
+        "tbank-readonly requires the T-Invest Python SDK import path "
+        "'t_tech.invest' or 'tinkoff.invest'. Install the SDK locally before real recording."
+    )
 
 
 def _field(value: object, *names: str) -> object | None:

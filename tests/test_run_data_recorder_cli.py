@@ -98,6 +98,7 @@ def test_tbank_readonly_without_token_returns_clear_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.delenv("T_INVEST_TOKEN", raising=False)
+    monkeypatch.delenv("NEO_TRADER_TBANK_TOKEN", raising=False)
     monkeypatch.delenv("TRADING_MODE", raising=False)
     monkeypatch.delenv("NEO_TRADER_TRADING_MODE", raising=False)
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
@@ -118,7 +119,7 @@ def test_tbank_readonly_without_token_returns_clear_error(
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "T_INVEST_TOKEN is required" in captured.err
+    assert "T_INVEST_TOKEN or NEO_TRADER_TBANK_TOKEN is required" in captured.err
 
 
 def test_tbank_readonly_with_missing_uid_returns_clear_error(
@@ -127,6 +128,7 @@ def test_tbank_readonly_with_missing_uid_returns_clear_error(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("T_INVEST_TOKEN", "fake-token")
+    monkeypatch.delenv("NEO_TRADER_TBANK_TOKEN", raising=False)
     monkeypatch.delenv("TRADING_MODE", raising=False)
     monkeypatch.delenv("NEO_TRADER_TRADING_MODE", raising=False)
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
@@ -160,6 +162,7 @@ def test_tbank_readonly_unsafe_flags_are_blocked(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("T_INVEST_TOKEN", "fake-token")
+    monkeypatch.delenv("NEO_TRADER_TBANK_TOKEN", raising=False)
     monkeypatch.setenv("TRADING_MODE", "sandbox")
     config_path = _write_instruments_config(tmp_path, uid="UID1")
 
@@ -188,6 +191,7 @@ def test_tbank_readonly_fake_stream_writes_parquet_dashboard_and_report(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("T_INVEST_TOKEN", "fake-token")
+    monkeypatch.delenv("NEO_TRADER_TBANK_TOKEN", raising=False)
     monkeypatch.delenv("TRADING_MODE", raising=False)
     monkeypatch.delenv("NEO_TRADER_TRADING_MODE", raising=False)
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
