@@ -1,6 +1,42 @@
 generated_by: neo_trader.research.universe_selector
 instruments:
-- ticker: SBER
-  uid: e6123145-9665-43e0-8413-cd61b8aa9b13
+- ticker: BTCUSDperpA
+  uid: 4effa274-4e8f-422c-93ff-04aa34fe8e39
   enabled: true
-  score: '21.3315475914667084416233985'
+  score: '43.6063656109684883437602312'
+- ticker: ETHUSDperpA
+  uid: eceb99e7-5935-412a-9515-975ec4b5e244
+  enabled: true
+  score: '23.4701030391924800813023653'
+- ticker: SOLUSDperpA
+  uid: 0ba36a98-663b-4a33-983f-26a44ab64e62
+  enabled: true
+  score: '22.0904505244318672881276663'
+- ticker: XRPUSDperpA
+  uid: 6ca12a2a-965c-4bdf-a9bf-59e3e78b231f
+  enabled: true
+  score: '-3.5669761472646702769566470'
+- ticker: HOODperpA
+  uid: 2bd4e17b-2312-464a-adc2-8e76e37c3368
+  enabled: true
+  score: '-10.3947530249031685812426650'
+- ticker: CMGperpA
+  uid: b1d08720-ad61-47e6-ba38-a7c6d2d541dd
+  enabled: true
+  score: '-20.44577042123312234728353940'
+- ticker: SMCIperpA
+  uid: 5d653c25-0a33-445e-99e6-f7851679d989
+  enabled: true
+  score: '-24.06834123659732199267863641'
+- ticker: AMZNperpA
+  uid: 42dee536-6f2d-4ab6-8b77-da2c3999916a
+  enabled: true
+  score: '-31.48239007755460268619448420'
+- ticker: TRXUSDperpA
+  uid: f4272f02-6e3f-49b9-b48d-c8aedfcb1617
+  enabled: true
+  score: '-36.03485723979007895662003474'
+- ticker: CVNAperpA
+  uid: 58526851-d4cc-4080-b2d3-c6e7140d0e0e
+  enabled: true
+  score: '-36.42511166798156426181225542'

@@ -9,7 +9,9 @@ from pathlib import Path
 RESEARCH_PATHS = (
     Path("scripts/analyze_recording_quality.py"),
     Path("scripts/build_feature_store.py"),
+    Path("scripts/discover_neoassets.py"),
     Path("scripts/run_research_backtest.py"),
+    Path("neo_trader/research/neoassets.py"),
     Path("neo_trader/research/universe_selector.py"),
     Path("neo_trader/research/feature_store.py"),
     Path("neo_trader/research/backtest_runner.py"),

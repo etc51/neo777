@@ -46,6 +46,7 @@ from neo_trader.monitoring.dashboard_state_writer import (  # noqa: E402
 
 SAFE_FALSE_VALUES: Final = {"0", "false", "no", "off"}
 T_INVEST_TOKEN_ENVS: Final = ("T_INVEST_TOKEN", "NEO_TRADER_TBANK_TOKEN")
+DEFAULT_UNIVERSE_CONFIG: Final = Path("configs/neoassets_universe.yaml")
 EVENT_TYPES: Final = (
     MarketDataEventType.ORDERBOOK,
     MarketDataEventType.TRADES,
@@ -269,7 +270,9 @@ async def _run_mock_mode(
     instrument_universe = load_instrument_universe_config(instruments_config)
     instruments = _enabled_instruments(instrument_universe.instruments)
     if not instruments:
-        raise RecorderCliError("configs/instruments.yaml must contain at least one instrument.")
+        raise RecorderCliError(
+            f"{instruments_config} must contain at least one instrument."
+        )
 
     ticks = max(1, math.ceil(duration_seconds))
     subscriptions = _subscriptions(instruments)
@@ -333,7 +336,9 @@ async def _run_tbank_readonly_mode(
     instrument_universe = load_instrument_universe_config(instruments_config)
     instruments = _enabled_instruments(instrument_universe.instruments)
     if not instruments:
-        raise RecorderCliError("configs/instruments.yaml must contain at least one instrument.")
+        raise RecorderCliError(
+            f"{instruments_config} must contain at least one instrument."
+        )
     _require_configured_uids(instruments)
 
     subscriptions = _subscriptions(instruments)
@@ -397,7 +402,7 @@ def _require_configured_uids(instruments: Sequence[ResolvedInstrument]) -> None:
     if missing_uid:
         joined = ", ".join(missing_uid)
         raise RecorderCliError(
-            "configs/instruments.yaml has enabled instruments without uid: "
+            "instrument universe config has enabled instruments without uid: "
             f"{joined}. Fill instruments[].uid before using tbank-readonly."
         )
 
@@ -950,8 +955,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-dir", type=Path, default=Path("data/reports"))
     parser.add_argument(
         "--instruments-config",
+        "--universe-config",
+        dest="instruments_config",
         type=Path,
-        default=Path("configs/instruments.yaml"),
+        default=DEFAULT_UNIVERSE_CONFIG,
+        help="Instrument universe YAML. Defaults to configs/neoassets_universe.yaml.",
     )
     return parser
 

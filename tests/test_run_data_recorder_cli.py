@@ -43,6 +43,7 @@ def test_mock_recorder_writes_parquet_dashboard_state_and_quality_report(
     raw_dir = tmp_path / "raw"
     dashboard_path = tmp_path / "monitoring" / "dashboard_state.json"
     reports_dir = tmp_path / "reports"
+    config_path = _write_instruments_config(tmp_path, uid="UID1")
 
     exit_code = run_data_recorder.main(
         [
@@ -56,6 +57,8 @@ def test_mock_recorder_writes_parquet_dashboard_state_and_quality_report(
             str(dashboard_path),
             "--report-dir",
             str(reports_dir),
+            "--universe-config",
+            str(config_path),
         ]
     )
 
@@ -73,6 +76,25 @@ def test_mock_recorder_writes_parquet_dashboard_state_and_quality_report(
     assert report["mode"] == "mock"
     assert report["events_recorded"] == 3
     assert report["dashboard_state_path"] == str(dashboard_path)
+
+
+def test_universe_config_alias_and_default() -> None:
+    parser = run_data_recorder._build_parser()
+
+    args = parser.parse_args(
+        [
+            "--mode",
+            "mock",
+            "--duration-seconds",
+            "1",
+            "--universe-config",
+            "configs/custom_universe.yaml",
+        ]
+    )
+    assert args.instruments_config == Path("configs/custom_universe.yaml")
+
+    default_args = parser.parse_args(["--mode", "mock", "--duration-seconds", "1"])
+    assert default_args.instruments_config == Path("configs/neoassets_universe.yaml")
 
 
 def test_unsafe_flags_block_recorder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

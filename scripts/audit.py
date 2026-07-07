@@ -78,11 +78,16 @@ def main() -> int:
         check_recorder_cli_has_mock_mode,
         check_tbank_readonly_implementation_exists,
         check_recorder_cli_has_max_events,
+        check_recorder_cli_supports_universe_config,
         check_recorder_cli_checks_readonly_flags,
         check_recorder_cli_has_no_order_placement_imports,
         check_recorder_cli_has_no_order_api_calls,
         check_dashboard_state_writer_exists,
         check_makefile_recording_targets,
+        check_discover_neoassets_exists,
+        check_neoassets_universe_generation_supported,
+        check_neoasset_discovery_tools_have_no_order_execution_imports,
+        check_risk_and_execution_unchanged_from_head,
         check_recording_quality_analyzer_exists,
         check_universe_selector_exists,
         check_feature_store_exists,
@@ -599,6 +604,20 @@ def check_recorder_cli_has_max_events() -> AuditResult:
     )
 
 
+def check_recorder_cli_supports_universe_config() -> AuditResult:
+    source = _read("scripts/run_data_recorder.py")
+    passed = (
+        '"--universe-config"' in source
+        and "DEFAULT_UNIVERSE_CONFIG" in source
+        and "configs/neoassets_universe.yaml" in source
+    )
+    return AuditResult(
+        name="recorder supports --universe-config",
+        passed=passed,
+        detail="neoassets universe CLI flag found" if passed else "missing --universe-config",
+    )
+
+
 def check_recorder_cli_checks_readonly_flags() -> AuditResult:
     source = _read("scripts/run_data_recorder.py")
     required = (
@@ -691,6 +710,121 @@ def check_makefile_recording_targets() -> AuditResult:
         name="Makefile has recording targets",
         passed=not missing,
         detail="recording targets found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_discover_neoassets_exists() -> AuditResult:
+    path = ROOT / "scripts" / "discover_neoassets.py"
+    if not path.exists():
+        return AuditResult("discover_neoassets.py exists", False, "missing discovery script")
+    source = path.read_text(encoding="utf-8")
+    required = (
+        "parse_neoasset_candidates",
+        "apply_liquidity_precheck",
+        "write_neoassets_universe",
+        "TBankReadonlyRestClient",
+        "MARKETDATA_GET_ORDER_BOOK",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="discover_neoassets.py exists",
+        passed=not missing,
+        detail=(
+            "readonly discovery script found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_neoassets_universe_generation_supported() -> AuditResult:
+    script = _read("scripts/discover_neoassets.py")
+    module = _read("neo_trader/research/neoassets.py")
+    makefile = _read("Makefile")
+    required = (
+        "configs/neoassets_universe.yaml" in script,
+        "def write_neoassets_universe" in module,
+        "neoassets_discovery_" in module,
+        "discover-neoassets:" in makefile,
+        "record-neoassets-smoke:" in makefile,
+        "record-neoassets-2h:" in makefile,
+    )
+    passed = all(required)
+    return AuditResult(
+        name="neoassets_universe.yaml generation supported",
+        passed=passed,
+        detail=(
+            "discovery output, reports, and Makefile targets found"
+            if passed
+            else "missing support"
+        ),
+    )
+
+
+def check_neoasset_discovery_tools_have_no_order_execution_imports() -> AuditResult:
+    forbidden_names = {
+        "SmartLimitExecutor",
+        "submit_order",
+        "post_order",
+        "cancel_order",
+        "replace_order",
+        "get_orders",
+        "orders_service",
+        "stop_orders",
+        "OrdersService",
+    }
+    violations: list[str] = []
+    for path in (
+        ROOT / "scripts" / "discover_neoassets.py",
+        ROOT / "neo_trader" / "research" / "neoassets.py",
+    ):
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("neo_trader.execution"):
+                        violations.append(f"{_relative(path)} imports {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module.startswith("neo_trader.execution"):
+                    violations.append(f"{_relative(path)} imports {module}")
+            elif isinstance(node, ast.Attribute) and node.attr in forbidden_names:
+                violations.append(f"{_relative(path)} references {node.attr}")
+            elif isinstance(node, ast.Name) and node.id in forbidden_names:
+                violations.append(f"{_relative(path)} references {node.id}")
+        source = path.read_text(encoding="utf-8")
+        if "OrdersService" in source:
+            violations.append(f"{_relative(path)} references OrdersService")
+    return AuditResult(
+        name="neoasset discovery has no order/execution imports",
+        passed=not violations,
+        detail=_violation_detail(violations),
+    )
+
+
+def check_risk_and_execution_unchanged_from_head() -> AuditResult:
+    violations: list[str] = []
+    for path in (
+        ROOT / "neo_trader" / "risk" / "manager.py",
+        ROOT / "neo_trader" / "execution" / "smart_limit.py",
+    ):
+        relative = _relative(path)
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0 or result.stdout != path.read_text(encoding="utf-8"):
+            violations.append(relative)
+    return AuditResult(
+        name="RiskManager and SmartLimitExecutor unchanged",
+        passed=not violations,
+        detail=_violation_detail(violations),
     )
 
 
@@ -1065,7 +1199,9 @@ def _research_boundary_paths() -> tuple[Path, ...]:
     return (
         ROOT / "scripts" / "analyze_recording_quality.py",
         ROOT / "scripts" / "build_feature_store.py",
+        ROOT / "scripts" / "discover_neoassets.py",
         ROOT / "scripts" / "run_research_backtest.py",
+        ROOT / "neo_trader" / "research" / "neoassets.py",
         ROOT / "neo_trader" / "research" / "universe_selector.py",
         ROOT / "neo_trader" / "research" / "feature_store.py",
         ROOT / "neo_trader" / "research" / "backtest_runner.py",

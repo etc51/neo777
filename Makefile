@@ -1,7 +1,7 @@
 PYTHON ?= python
 DASHBOARD_STATE ?= data/monitoring/dashboard_state.example.json
 
-.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording build-features research-backtest research-backtest-simple research-cycle
+.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly discover-neoassets record-neoassets-smoke record-neoassets-2h run-dashboard-live-state analyze-recording build-features research-backtest research-backtest-simple research-cycle
 
 install:
 	$(PYTHON) -m pip install -e ".[dev,dashboard]"
@@ -26,6 +26,15 @@ record-mock:
 
 record-readonly:
 	$(PYTHON) scripts/run_data_recorder.py --mode tbank-readonly --duration-seconds 3600 --output data/raw --dashboard-state data/monitoring/dashboard_state.json
+
+discover-neoassets:
+	$(PYTHON) scripts/discover_neoassets.py --output-config configs/neoassets_universe.yaml --reports-dir data/reports
+
+record-neoassets-smoke:
+	$(PYTHON) scripts/run_data_recorder.py --mode tbank-readonly --universe-config configs/neoassets_universe.yaml --duration-seconds 60 --max-events 50 --output data/raw --dashboard-state data/monitoring/dashboard_state.json
+
+record-neoassets-2h:
+	$(PYTHON) scripts/run_data_recorder.py --mode tbank-readonly --universe-config configs/neoassets_universe.yaml --duration-seconds 7200 --output data/raw --dashboard-state data/monitoring/dashboard_state.json
 
 run-dashboard-live-state:
 	$(PYTHON) -m streamlit run neo_trader/monitoring/streamlit_dashboard.py -- --state data/monitoring/dashboard_state.json
