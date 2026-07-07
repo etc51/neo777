@@ -1,0 +1,75 @@
+curator:
+  bot_id: CURATOR
+  trading_enabled: false
+
+universal_bots:
+  - bot_id: BOT_01
+    account_ref: PAPER_ACCOUNT_01
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_02
+    account_ref: PAPER_ACCOUNT_02
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_03
+    account_ref: PAPER_ACCOUNT_03
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_04
+    account_ref: PAPER_ACCOUNT_04
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_05
+    account_ref: PAPER_ACCOUNT_05
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_06
+    account_ref: PAPER_ACCOUNT_06
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_07
+    account_ref: PAPER_ACCOUNT_07
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_08
+    account_ref: PAPER_ACCOUNT_08
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_09
+    account_ref: PAPER_ACCOUNT_09
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
+  - bot_id: BOT_10
+    account_ref: PAPER_ACCOUNT_10
+    role: UNIVERSAL
+    allowed_instruments: [NEOBITOK, NEOEFIR]
+    max_lot: 1
+    paper_enabled: true
+    live_enabled: false
