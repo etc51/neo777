@@ -166,6 +166,7 @@ def _bot_payload(bot: UniversalAccountBot) -> dict[str, object]:
     return {
         "bot_id": bot.bot_id,
         "account_ref": bot.account_ref,
+        "account_kind": bot.config.account_kind.value,
         "state": bot.state.value,
         "assigned_pair_id": bot.assigned_pair_id,
         "allowed_instruments": [

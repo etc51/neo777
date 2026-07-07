@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, TypeAlias
 
@@ -15,7 +16,15 @@ JsonMapping: TypeAlias = Mapping[str, Any]
 ROOT: Final = Path(__file__).resolve().parents[2]
 CONFIG_DIR: Final = ROOT / "configs"
 DEFAULT_ACCOUNTS_CONFIG: Final = CONFIG_DIR / "accounts.yaml"
+DEFAULT_LOCAL_ACCOUNTS_CONFIG: Final = CONFIG_DIR / "accounts.local.yaml"
 EXPECTED_UNIVERSAL_BOTS: Final = 10
+
+
+class AccountKind(StrEnum):
+    """Account backing type used by the paper swarm."""
+
+    SIMULATED_PAPER = "SIMULATED_PAPER"
+    TBANK_READONLY_DATA = "TBANK_READONLY_DATA"
 
 
 @dataclass(frozen=True)
@@ -40,6 +49,7 @@ class UniversalBotConfig:
 
     bot_id: str
     account_ref: str
+    account_kind: AccountKind
     role: str
     allowed_instruments: tuple[SwarmInstrument, ...]
     max_lot: int
@@ -57,6 +67,8 @@ class UniversalBotConfig:
             raise ValueError(f"{self.bot_id}.paper_enabled must be true for phase 1.")
         if self.live_enabled:
             raise ValueError(f"{self.bot_id}.live_enabled must remain false.")
+        if self.account_kind is AccountKind.TBANK_READONLY_DATA and self.max_lot != 1:
+            raise ValueError(f"{self.bot_id}.max_lot must be 1 for read-only data account.")
 
 
 @dataclass(frozen=True)
@@ -80,11 +92,42 @@ class SwarmAccountsConfig:
     def bot_ids(self) -> tuple[str, ...]:
         return tuple(bot.bot_id for bot in self.universal_bots)
 
+    @property
+    def read_only_data_bots(self) -> tuple[UniversalBotConfig, ...]:
+        return tuple(
+            bot
+            for bot in self.universal_bots
+            if bot.account_kind is AccountKind.TBANK_READONLY_DATA
+        )
 
-def load_accounts_config(path: Path | str | None = None) -> SwarmAccountsConfig:
-    """Load and validate ``configs/accounts.yaml``."""
+    @property
+    def simulated_bots(self) -> tuple[UniversalBotConfig, ...]:
+        return tuple(
+            bot for bot in self.universal_bots if bot.account_kind is AccountKind.SIMULATED_PAPER
+        )
+
+
+def load_accounts_config(
+    path: Path | str | None = None,
+    *,
+    local_override_path: Path | str | None = None,
+) -> SwarmAccountsConfig:
+    """Load and validate swarm accounts config.
+
+    ``configs/accounts.local.yaml`` is applied automatically only when the
+    default config path is used. It is ignored by git and may contain the real
+    read-only T-Bank account reference.
+    """
 
     raw = _load_yaml_mapping(Path(path) if path is not None else DEFAULT_ACCOUNTS_CONFIG)
+    if path is None:
+        override_path = (
+            Path(local_override_path)
+            if local_override_path is not None
+            else DEFAULT_LOCAL_ACCOUNTS_CONFIG
+        )
+        if override_path.exists():
+            raw = _merge_accounts_mapping(raw, _load_yaml_mapping(override_path))
     curator_raw = _mapping(_required(raw, "curator"), "curator")
     bots_raw = _sequence(_required(raw, "universal_bots"), "universal_bots")
     return SwarmAccountsConfig(
@@ -106,6 +149,9 @@ def _universal_bot_from_mapping(raw: JsonMapping) -> UniversalBotConfig:
     return UniversalBotConfig(
         bot_id=_string(_required(raw, "bot_id"), "bot_id"),
         account_ref=_string(_required(raw, "account_ref"), "account_ref"),
+        account_kind=AccountKind(
+            _string(raw.get("account_kind", "SIMULATED_PAPER"), "account_kind")
+        ),
         role=_string(_required(raw, "role"), "role"),
         allowed_instruments=tuple(
             SwarmInstrument(_string(item, "allowed_instruments[]"))
@@ -122,6 +168,33 @@ def _load_yaml_mapping(path: Path) -> JsonMapping:
         raise FileNotFoundError(f"accounts config not found: {path}")
     loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
     return _mapping(loaded, str(path))
+
+
+def _merge_accounts_mapping(base: JsonMapping, override: JsonMapping) -> JsonMapping:
+    merged: dict[str, object] = dict(base)
+    if "curator" in override:
+        merged["curator"] = override["curator"]
+    if "universal_bots" not in override:
+        return merged
+
+    base_bots = [
+        dict(_mapping(item, "universal_bots[]"))
+        for item in _sequence(_required(base, "universal_bots"), "universal_bots")
+    ]
+    override_bots = {
+        _string(_required(_mapping(item, "universal_bots[]"), "bot_id"), "bot_id"): dict(
+            _mapping(item, "universal_bots[]")
+        )
+        for item in _sequence(_required(override, "universal_bots"), "universal_bots")
+    }
+    merged_bots: list[dict[str, object]] = []
+    for bot in base_bots:
+        bot_id = _string(_required(bot, "bot_id"), "bot_id")
+        if bot_id in override_bots:
+            bot.update(override_bots[bot_id])
+        merged_bots.append(bot)
+    merged["universal_bots"] = merged_bots
+    return merged
 
 
 def _required(raw: JsonMapping, key: str) -> object:
@@ -164,6 +237,7 @@ def _int(value: object, field_name: str) -> int:
 
 
 __all__ = [
+    "AccountKind",
     "CuratorConfig",
     "SwarmAccountsConfig",
     "UniversalBotConfig",

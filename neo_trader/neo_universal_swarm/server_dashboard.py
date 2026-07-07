@@ -56,6 +56,7 @@ def render_swarm_dashboard_html(state: JsonMapping) -> str:
         (
             "bot_id",
             "account_ref",
+            "account_kind",
             "state",
             "assigned_pair_id",
             "realized_pnl_ticks",

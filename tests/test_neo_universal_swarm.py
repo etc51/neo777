@@ -6,6 +6,7 @@ from pathlib import Path
 
 from neo_trader.neo_universal_swarm import (
     AccountBotState,
+    AccountKind,
     BookSnapshot,
     CuratorBot,
     HedgePairSimulationConfig,
@@ -33,6 +34,29 @@ def test_accounts_config_loads_ten_paper_only_bots() -> None:
         SwarmInstrument.NEOBITOK,
         SwarmInstrument.NEOEFIR,
     )
+    assert len(config.simulated_bots) == 10
+    assert len(config.read_only_data_bots) == 0
+
+
+def test_accounts_local_override_marks_one_real_data_bot(tmp_path: Path) -> None:
+    local = tmp_path / "accounts.local.yaml"
+    local.write_text(
+        """
+universal_bots:
+  - bot_id: BOT_01
+    account_ref: REAL_DATA_REF
+    account_kind: TBANK_READONLY_DATA
+""",
+        encoding="utf-8",
+    )
+
+    config = load_accounts_config(local_override_path=local)
+
+    assert len(config.universal_bots) == 10
+    assert config.universal_bots[0].account_ref == "REAL_DATA_REF"
+    assert config.universal_bots[0].account_kind is AccountKind.TBANK_READONLY_DATA
+    assert len(config.read_only_data_bots) == 1
+    assert len(config.simulated_bots) == 9
 
 
 def test_swarm_instrument_catalog_loads_tbank_identifiers() -> None:

@@ -2,6 +2,7 @@
 
 from neo_trader.neo_universal_swarm.bots import CuratorBot, UniversalAccountBot
 from neo_trader.neo_universal_swarm.config import (
+    AccountKind,
     CuratorConfig,
     SwarmAccountsConfig,
     UniversalBotConfig,
@@ -48,6 +49,7 @@ from neo_trader.neo_universal_swarm.types import (
 
 __all__ = [
     "AccountBotState",
+    "AccountKind",
     "ActivePair",
     "BookSnapshot",
     "CuratorBot",
