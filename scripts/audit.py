@@ -92,6 +92,7 @@ def main() -> int:
         check_universe_selector_exists,
         check_feature_store_exists,
         check_research_backtest_runner_exists,
+        check_strategy_validation_exists,
         check_research_config_exists,
         check_auto_from_data_supported,
         check_research_only_strategy_not_live_imported,
@@ -931,6 +932,37 @@ def check_research_backtest_runner_exists() -> AuditResult:
     )
 
 
+def check_strategy_validation_exists() -> AuditResult:
+    module = ROOT / "neo_trader" / "research" / "strategy_validation.py"
+    script = ROOT / "scripts" / "validate_strategy.py"
+    if not module.exists() or not script.exists():
+        return AuditResult(
+            "strategy validation exists",
+            False,
+            "missing strategy_validation.py or validate_strategy.py",
+        )
+    source = module.read_text(encoding="utf-8")
+    required = (
+        "validate_strategy_reports",
+        "strategy_validation_",
+        "active_universe_next.yaml",
+        "stress_tests",
+        "anti_overfit",
+        "reason_code_distribution",
+        "reject_reason_distribution",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="strategy validation exists",
+        passed=not missing,
+        detail=(
+            "validation reports, stress tests, and next universe found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
 def check_research_config_exists() -> AuditResult:
     path = ROOT / "configs" / "research.yaml"
     if not path.exists():
@@ -1201,7 +1233,9 @@ def _research_boundary_paths() -> tuple[Path, ...]:
         ROOT / "scripts" / "build_feature_store.py",
         ROOT / "scripts" / "discover_neoassets.py",
         ROOT / "scripts" / "run_research_backtest.py",
+        ROOT / "scripts" / "validate_strategy.py",
         ROOT / "neo_trader" / "research" / "neoassets.py",
+        ROOT / "neo_trader" / "research" / "strategy_validation.py",
         ROOT / "neo_trader" / "research" / "universe_selector.py",
         ROOT / "neo_trader" / "research" / "feature_store.py",
         ROOT / "neo_trader" / "research" / "backtest_runner.py",

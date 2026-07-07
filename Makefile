@@ -1,7 +1,7 @@
 PYTHON ?= python
 DASHBOARD_STATE ?= data/monitoring/dashboard_state.example.json
 
-.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly discover-neoassets record-neoassets-smoke record-neoassets-2h run-dashboard-live-state analyze-recording build-features research-backtest research-backtest-simple research-cycle
+.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly discover-neoassets record-neoassets-smoke record-neoassets-2h run-dashboard-live-state analyze-recording build-features research-backtest research-backtest-simple validate-strategy research-cycle
 
 install:
 	$(PYTHON) -m pip install -e ".[dev,dashboard]"
@@ -50,5 +50,8 @@ research-backtest:
 
 research-backtest-simple:
 	$(PYTHON) scripts/run_research_backtest.py --features data/features --reports-dir data/reports --active-universe configs/active_universe.yaml --research-config configs/research.yaml --strategy simple_book_momentum_research
+
+validate-strategy:
+	$(PYTHON) scripts/validate_strategy.py --reports-dir data/reports --neoassets-config configs/neoassets_universe.yaml --active-universe-next configs/active_universe_next.yaml
 
 research-cycle: analyze-recording build-features research-backtest
