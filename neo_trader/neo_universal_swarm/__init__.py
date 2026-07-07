@@ -7,11 +7,21 @@ from neo_trader.neo_universal_swarm.config import (
     UniversalBotConfig,
     load_accounts_config,
 )
+from neo_trader.neo_universal_swarm.daemon import (
+    SwarmDaemonConfig,
+    SwarmDaemonCycle,
+    run_swarm_daemon,
+)
 from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVModelConfig, PairEVPrediction
 from neo_trader.neo_universal_swarm.paper import (
     PaperSimulationArtifacts,
     PaperSimulationResult,
     run_paper_simulation,
+)
+from neo_trader.neo_universal_swarm.server_dashboard import (
+    load_swarm_state,
+    render_swarm_dashboard_html,
+    serve_swarm_dashboard,
 )
 from neo_trader.neo_universal_swarm.simulator import (
     HedgePairSimulationConfig,
@@ -50,11 +60,17 @@ __all__ = [
     "PaperSimulationResult",
     "RejectionReason",
     "SwarmAccountsConfig",
+    "SwarmDaemonConfig",
+    "SwarmDaemonCycle",
     "SwarmInstrument",
     "SwarmMetrics",
     "UniversalAccountBot",
     "UniversalBotConfig",
     "aggregate_pair_metrics",
     "load_accounts_config",
+    "load_swarm_state",
+    "render_swarm_dashboard_html",
     "run_paper_simulation",
+    "run_swarm_daemon",
+    "serve_swarm_dashboard",
 ]

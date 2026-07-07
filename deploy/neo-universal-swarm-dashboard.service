@@ -1,0 +1,19 @@
+[Unit]
+Description=Neo Universal Bot Swarm minimal dashboard
+After=network-online.target neo-universal-swarm.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-trader
+Group=neo-trader
+WorkingDirectory=/opt/neo_trader
+EnvironmentFile=/etc/neo-trader/neo-universal-swarm.env
+ExecStart=/opt/neo_trader/.venv/bin/python scripts/run_neo_swarm_dashboard.py --state data/monitoring/neo_universal_swarm_dashboard_state.json --host 0.0.0.0 --port 8765
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
