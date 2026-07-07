@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from neo_trader.broker.tbank import TBankOrderBookLevel, TBankOrderBookSnapshot
 from neo_trader.neo_universal_swarm import (
     AccountBotState,
     AccountKind,
@@ -12,11 +13,13 @@ from neo_trader.neo_universal_swarm import (
     HedgePairSimulationConfig,
     HedgePairSimulator,
     LegSide,
+    LivePaperSwarmConfig,
     PairEVModel,
     PairEVModelConfig,
     SwarmInstrument,
     load_accounts_config,
     load_swarm_instrument_catalog,
+    run_live_paper_swarm,
     run_paper_simulation,
 )
 from neo_trader.neo_universal_swarm.dashboard import build_swarm_dashboard_state
@@ -227,6 +230,53 @@ def test_paper_simulation_runs_requested_pair_count_without_live_mode(tmp_path: 
     assert stressed.metrics.pair_ev_ticks > 0
 
 
+def test_live_paper_swarm_uses_tbank_orderbooks_and_writes_dashboard(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("NEO_TRADER_LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_MODE", "readonly")
+    monkeypatch.setenv("NEO_TRADER_TRADING_MODE", "readonly")
+    provider = _FakeOrderBookProvider(
+        (
+            _tbank_book("100", "101"),
+            _tbank_book("101.5", "102"),
+            _tbank_book("106", "107"),
+            _tbank_book("104", "105"),
+        )
+    )
+    current_time = datetime(2026, 7, 7, 8, 0, tzinfo=UTC)
+
+    def clock() -> datetime:
+        nonlocal current_time
+        current_time += timedelta(milliseconds=100)
+        return current_time
+
+    cycles = run_live_paper_swarm(
+        LivePaperSwarmConfig(
+            poll_interval_seconds=0.01,
+            reports_dir=tmp_path / "reports",
+            dashboard_state_path=tmp_path / "dashboard.json",
+            heartbeat_path=tmp_path / "heartbeat.txt",
+            instruments=(SwarmInstrument.NEOBITOK,),
+            max_cycles=4,
+        ),
+        provider=provider,
+        sleep=lambda _: None,
+        clock=clock,
+    )
+
+    assert len(cycles) == 4
+    assert cycles[-1].status == "OK"
+    assert cycles[-1].closed_pairs == 1
+    dashboard = (tmp_path / "dashboard.json").read_text(encoding="utf-8")
+    assert '"runtime_mode": "live-paper"' in dashboard
+    assert '"market_data_source": "tbank-readonly-rest"' in dashboard
+    assert '"total_pairs": 1' in dashboard
+    assert "mode=live-paper" in (tmp_path / "heartbeat.txt").read_text(encoding="utf-8")
+
+
 def _snapshot(
     *,
     direction: LegSide,
@@ -255,6 +305,49 @@ def _snapshot(
         trade_side=direction,
         tick_velocity=tick_velocity,
         volatility_5s=Decimal("1"),
+    )
+
+
+class _FakeOrderBookProvider:
+    def __init__(self, books: tuple[TBankOrderBookSnapshot, ...]) -> None:
+        self._books = books
+        self._index = 0
+
+    def get_orderbook_snapshot(
+        self,
+        instrument_id: str,
+        *,
+        depth: int = 10,
+        order_book_type: str | None = None,
+    ) -> TBankOrderBookSnapshot:
+        del instrument_id, depth, order_book_type
+        book = self._books[min(self._index, len(self._books) - 1)]
+        self._index += 1
+        return book
+
+
+def _tbank_book(best_bid: str, best_ask: str) -> TBankOrderBookSnapshot:
+    bid = Decimal(best_bid)
+    ask = Decimal(best_ask)
+    return TBankOrderBookSnapshot(
+        figi="BTCUSDPERP00",
+        instrument_uid="4effa274-4e8f-422c-93ff-04aa34fe8e39",
+        depth=3,
+        bids=(
+            TBankOrderBookLevel(price=bid, quantity=220, raw={}),
+            TBankOrderBookLevel(price=bid - Decimal("1"), quantity=120, raw={}),
+            TBankOrderBookLevel(price=bid - Decimal("2"), quantity=90, raw={}),
+        ),
+        asks=(
+            TBankOrderBookLevel(price=ask, quantity=45, raw={}),
+            TBankOrderBookLevel(price=ask + Decimal("1"), quantity=40, raw={}),
+            TBankOrderBookLevel(price=ask + Decimal("2"), quantity=30, raw={}),
+        ),
+        last_price=bid,
+        close_price=None,
+        limit_up=None,
+        limit_down=None,
+        raw={},
     )
 
 

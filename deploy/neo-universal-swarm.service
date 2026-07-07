@@ -1,5 +1,5 @@
 [Unit]
-Description=Neo Universal Bot Swarm paper daemon
+Description=Neo Universal Bot Swarm live-data paper daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,7 @@ User=neo-trader
 Group=neo-trader
 WorkingDirectory=/opt/neo_trader
 EnvironmentFile=/etc/neo-trader/neo-universal-swarm.env
-ExecStart=/opt/neo_trader/.venv/bin/python scripts/run_neo_swarm_daemon.py --target-pairs-per-cycle 200 --cycle-interval-seconds 60 --reports-dir data/reports/neo_universal_swarm_daemon --dashboard-state data/monitoring/neo_universal_swarm_dashboard_state.json --heartbeat data/monitoring/neo_universal_swarm_heartbeat.txt
+ExecStart=/opt/neo_trader/.venv/bin/python scripts/run_neo_swarm_live_paper.py --poll-interval-seconds 5 --reports-dir data/reports/neo_universal_swarm_live_paper --dashboard-state data/monitoring/neo_universal_swarm_dashboard_state.json --heartbeat data/monitoring/neo_universal_swarm_heartbeat.txt
 Restart=always
 RestartSec=10
 KillSignal=SIGINT

@@ -1,11 +1,12 @@
 # Neo Universal Swarm Server Deploy
 
-This deploy scaffold runs the swarm as a 24/7 paper/read-only Linux service.
+This deploy scaffold runs the swarm as a 24/7 live-data paper/read-only Linux service.
 It does not enable live trading.
 
 ## Services
 
-- `neo-universal-swarm.service` runs the paper daemon and continuously updates
+- `neo-universal-swarm.service` polls T-Bank read-only order books, runs the
+  live-paper swarm loop, and continuously updates
   `data/monitoring/neo_universal_swarm_dashboard_state.json`.
 - `neo-universal-swarm-dashboard.service` serves a minimal HTTP dashboard on
   port `8765`.

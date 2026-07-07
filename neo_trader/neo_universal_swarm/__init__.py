@@ -18,6 +18,12 @@ from neo_trader.neo_universal_swarm.instruments import (
     SwarmInstrumentMetadata,
     load_swarm_instrument_catalog,
 )
+from neo_trader.neo_universal_swarm.live_paper import (
+    LivePaperSwarmConfig,
+    LivePaperSwarmCycle,
+    orderbook_snapshot_to_book_snapshot,
+    run_live_paper_swarm,
+)
 from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVModelConfig, PairEVPrediction
 from neo_trader.neo_universal_swarm.paper import (
     PaperSimulationArtifacts,
@@ -57,6 +63,8 @@ __all__ = [
     "HedgePairSimulationConfig",
     "HedgePairSimulator",
     "LegSide",
+    "LivePaperSwarmConfig",
+    "LivePaperSwarmCycle",
     "PairEVModel",
     "PairEVModelConfig",
     "PairEVPrediction",
@@ -79,7 +87,9 @@ __all__ = [
     "load_accounts_config",
     "load_swarm_instrument_catalog",
     "load_swarm_state",
+    "orderbook_snapshot_to_book_snapshot",
     "render_swarm_dashboard_html",
+    "run_live_paper_swarm",
     "run_paper_simulation",
     "run_swarm_daemon",
     "serve_swarm_dashboard",
