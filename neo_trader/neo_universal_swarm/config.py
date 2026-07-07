@@ -111,6 +111,7 @@ def load_accounts_config(
     path: Path | str | None = None,
     *,
     local_override_path: Path | str | None = None,
+    include_local_override: bool = True,
 ) -> SwarmAccountsConfig:
     """Load and validate swarm accounts config.
 
@@ -119,8 +120,9 @@ def load_accounts_config(
     read-only T-Bank account reference.
     """
 
-    raw = _load_yaml_mapping(Path(path) if path is not None else DEFAULT_ACCOUNTS_CONFIG)
-    if path is None:
+    config_path = Path(path) if path is not None else DEFAULT_ACCOUNTS_CONFIG
+    raw = _load_yaml_mapping(config_path)
+    if include_local_override and _is_default_accounts_path(config_path):
         override_path = (
             Path(local_override_path)
             if local_override_path is not None
@@ -161,6 +163,13 @@ def _universal_bot_from_mapping(raw: JsonMapping) -> UniversalBotConfig:
         paper_enabled=_bool(_required(raw, "paper_enabled"), "paper_enabled"),
         live_enabled=_bool(_required(raw, "live_enabled"), "live_enabled"),
     )
+
+
+def _is_default_accounts_path(path: Path) -> bool:
+    try:
+        return path.resolve() == DEFAULT_ACCOUNTS_CONFIG.resolve()
+    except FileNotFoundError:
+        return path == DEFAULT_ACCOUNTS_CONFIG
 
 
 def _load_yaml_mapping(path: Path) -> JsonMapping:

@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--select-index", type=int, default=0)
     args = parser.parse_args(argv)
 
-    base = load_accounts_config(args.base)
+    base = load_accounts_config(args.base, include_local_override=False)
     accounts = TBankClient().get_accounts()
     if not accounts:
         raise RuntimeError("T-Bank returned no visible accounts for the configured token.")

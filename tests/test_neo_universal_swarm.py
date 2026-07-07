@@ -23,7 +23,7 @@ from neo_trader.neo_universal_swarm.dashboard import build_swarm_dashboard_state
 
 
 def test_accounts_config_loads_ten_paper_only_bots() -> None:
-    config = load_accounts_config("configs/accounts.yaml")
+    config = load_accounts_config("configs/accounts.yaml", include_local_override=False)
 
     assert config.curator.bot_id == "CURATOR"
     assert config.curator.trading_enabled is False
