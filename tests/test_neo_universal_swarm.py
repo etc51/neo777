@@ -59,6 +59,34 @@ universal_bots:
     assert len(config.simulated_bots) == 9
 
 
+def test_dashboard_masks_real_data_account_ref(tmp_path: Path) -> None:
+    local = tmp_path / "accounts.local.yaml"
+    local.write_text(
+        """
+universal_bots:
+  - bot_id: BOT_01
+    account_ref: REAL1234567890DATA
+    account_kind: TBANK_READONLY_DATA
+""",
+        encoding="utf-8",
+    )
+    config = load_accounts_config(local_override_path=local)
+    curator = CuratorBot(accounts=config)
+    snapshot = _snapshot(direction=LegSide.LONG, bid_qty="220", ask_qty="45")
+
+    state = build_swarm_dashboard_state(
+        curator=curator,
+        latest_snapshots=(snapshot,),
+        updated_at=datetime(2026, 7, 7, tzinfo=UTC),
+        commit_hash="test",
+    )
+
+    swarm = state["swarm"]
+    assert isinstance(swarm, dict)
+    assert swarm["bots"][0]["account_ref"] == "REAL...DATA"
+    assert "REAL1234567890DATA" not in str(state)
+
+
 def test_swarm_instrument_catalog_loads_tbank_identifiers() -> None:
     catalog = load_swarm_instrument_catalog()
 

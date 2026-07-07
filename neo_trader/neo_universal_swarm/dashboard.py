@@ -165,7 +165,7 @@ def _signal_payload(
 def _bot_payload(bot: UniversalAccountBot) -> dict[str, object]:
     return {
         "bot_id": bot.bot_id,
-        "account_ref": bot.account_ref,
+        "account_ref": _display_account_ref(bot.account_ref),
         "account_kind": bot.config.account_kind.value,
         "state": bot.state.value,
         "assigned_pair_id": bot.assigned_pair_id,
@@ -241,7 +241,7 @@ def _metrics_payload(metrics: SwarmMetrics) -> dict[str, object]:
         "profit_factor": str(metrics.profit_factor),
         "max_drawdown": str(metrics.max_drawdown),
         "pnl_by_bot": _decimal_dict(metrics.pnl_by_bot),
-        "pnl_by_account": _decimal_dict(metrics.pnl_by_account),
+        "pnl_by_account": _account_decimal_dict(metrics.pnl_by_account),
         "pnl_by_instrument": _decimal_dict(metrics.pnl_by_instrument),
         "pnl_by_regime": _decimal_dict(metrics.pnl_by_regime),
         "rejected_by_model": metrics.rejected_by_model,
@@ -277,6 +277,18 @@ def _readiness_payload(metrics: SwarmMetrics) -> dict[str, object]:
 
 def _decimal_dict(values: Mapping[str, Decimal]) -> dict[str, str]:
     return {key: str(value) for key, value in values.items()}
+
+
+def _account_decimal_dict(values: Mapping[str, Decimal]) -> dict[str, str]:
+    return {_display_account_ref(key): str(value) for key, value in values.items()}
+
+
+def _display_account_ref(value: str) -> str:
+    if value.startswith("PAPER_ACCOUNT_"):
+        return value
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
 
 
 def _regime_from_snapshot(snapshot: BookSnapshot) -> str:
