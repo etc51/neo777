@@ -10,6 +10,7 @@ dist/
 build/
 data/raw/
 data/cache/
+data/features/
 data/reports/
 data/monitoring/dashboard_state.json
 review_bundle/

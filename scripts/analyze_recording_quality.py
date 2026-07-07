@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Final, cast
 from uuid import uuid4
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -199,7 +201,9 @@ def analyze_recording_quality(
 ) -> dict[str, object]:
     """Analyze parquet recording data and write liquidity reports."""
 
-    ticker_by_uid = _ticker_by_uid(instruments_config)
+    ticker_by_uid = _ticker_by_uid(instruments_config) or _active_ticker_by_uid(
+        active_universe_path
+    )
     allowed_uids = set(ticker_by_uid) or None
     accumulators = _load_accumulators(
         raw_path=raw_path,
@@ -468,6 +472,29 @@ def _ticker_by_uid(path: Path) -> dict[str, str]:
         for instrument in config.instruments
         if instrument.uid.strip()
     }
+
+
+def _active_ticker_by_uid(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, Mapping):
+        return {}
+    instruments = loaded.get("instruments")
+    if not isinstance(instruments, Sequence) or isinstance(instruments, str | bytes):
+        return {}
+    result: dict[str, str] = {}
+    for item in instruments:
+        if not isinstance(item, Mapping):
+            continue
+        uid = _string(item.get("uid")).strip()
+        ticker = _string(item.get("ticker")).strip()
+        if uid and ticker and item.get("enabled", True) is not False:
+            result[uid] = ticker
+    return result
 
 
 def _parse_test_sizes(value: str) -> tuple[Decimal, ...]:

@@ -192,6 +192,9 @@ make record-mock
 make record-readonly
 make run-dashboard-live-state
 make analyze-recording
+make build-features
+make research-backtest
+make research-cycle
 ```
 
 `record-readonly` is intentionally guarded by readonly safety flags and requires
@@ -207,3 +210,14 @@ python scripts\analyze_recording_quality.py --raw data\raw --reports-dir data\re
 
 The analyzer writes liquidity reports to `data/reports/` and generates
 `configs/active_universe.yaml` from read-only parquet data.
+
+Build offline features and run the first research backtest:
+
+```powershell
+python scripts\build_feature_store.py --raw data\raw --output data\features --active-universe configs\active_universe.yaml
+python scripts\run_research_backtest.py --features data\features --reports-dir data\reports --active-universe configs\active_universe.yaml
+```
+
+The feature store writes ignored parquet under `data/features/`. The research
+backtest writes JSON, trade CSV, and HTML reports under `data/reports/` and does
+not import broker or execution modules.

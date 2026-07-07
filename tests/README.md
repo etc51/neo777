@@ -12,6 +12,7 @@ This folder contains pytest coverage for safety, imports, features, strategy, ri
 - `test_smart_limit_executor.py` - execution gateway safety tests.
 - `test_market_data_recorder.py`, `test_run_data_recorder_cli.py`, `test_dashboard_state_writer.py`, and `test_recording_quality_report.py` - recorder pipeline tests.
 - `test_recording_quality_analyzer.py` and `test_universe_selector.py` - liquidity report and active universe tests.
+- `test_feature_store.py`, `test_research_backtest_runner.py`, and `test_research_boundaries.py` - offline feature store, research backtest, and safety-boundary tests.
 - `test_event_driven_backtester.py` - backtester tests.
 - `test_streamlit_dashboard.py` - dashboard state/model rendering helpers.
 

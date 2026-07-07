@@ -85,7 +85,12 @@ def main() -> int:
         check_makefile_recording_targets,
         check_recording_quality_analyzer_exists,
         check_universe_selector_exists,
+        check_feature_store_exists,
+        check_research_backtest_runner_exists,
+        check_makefile_research_cycle_exists,
+        check_research_reports_generated_path_supported,
         check_research_tools_have_no_execution_imports,
+        check_research_tools_have_no_order_api_calls,
         check_active_universe_generation_supported,
     )
     results = [check() for check in checks]
@@ -732,11 +737,95 @@ def check_universe_selector_exists() -> AuditResult:
     )
 
 
-def check_research_tools_have_no_execution_imports() -> AuditResult:
-    paths = (
-        ROOT / "scripts" / "analyze_recording_quality.py",
-        ROOT / "neo_trader" / "research" / "universe_selector.py",
+def check_feature_store_exists() -> AuditResult:
+    module = ROOT / "neo_trader" / "research" / "feature_store.py"
+    script = ROOT / "scripts" / "build_feature_store.py"
+    if not module.exists() or not script.exists():
+        return AuditResult(
+            "feature store exists",
+            False,
+            "missing feature_store.py or build_feature_store.py",
+        )
+    source = module.read_text(encoding="utf-8")
+    required = (
+        "build_feature_store",
+        "data/features",
+        "FEATURE_COLUMNS",
+        "expected_slippage_bps_buy",
+        "volatility_regime",
+        "usable_row",
     )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="feature store exists",
+        passed=not missing,
+        detail="feature-store builder found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_research_backtest_runner_exists() -> AuditResult:
+    module = ROOT / "neo_trader" / "research" / "backtest_runner.py"
+    script = ROOT / "scripts" / "run_research_backtest.py"
+    if not module.exists() or not script.exists():
+        return AuditResult(
+            "research backtest runner exists",
+            False,
+            "missing backtest_runner.py or run_research_backtest.py",
+        )
+    source = module.read_text(encoding="utf-8")
+    required = (
+        "run_research_backtest",
+        "OpeningRangeBookMomentumStrategy",
+        "backtest_report_",
+        "backtest_trades_",
+        "backtest_summary_",
+        "reason_code_distribution",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="research backtest runner exists",
+        passed=not missing,
+        detail=(
+            "runner and report exporters found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
+def check_makefile_research_cycle_exists() -> AuditResult:
+    source = _read("Makefile")
+    required = ("build-features:", "research-backtest:", "research-cycle:")
+    missing = [target for target in required if target not in source]
+    return AuditResult(
+        name="Makefile research-cycle exists",
+        passed=not missing,
+        detail="research targets found" if not missing else "missing: " + ", ".join(missing),
+    )
+
+
+def check_research_reports_generated_path_supported() -> AuditResult:
+    source = _read("neo_trader/research/backtest_runner.py")
+    required = (
+        "data/reports",
+        "backtest_report_",
+        "backtest_trades_",
+        "backtest_summary_",
+    )
+    missing = [snippet for snippet in required if snippet not in source]
+    return AuditResult(
+        name="research reports generated path supported",
+        passed=not missing,
+        detail=(
+            "JSON/CSV/HTML reports under data/reports found"
+            if not missing
+            else "missing support"
+        ),
+    )
+
+
+def check_research_tools_have_no_execution_imports() -> AuditResult:
+    paths = _research_boundary_paths()
     violations: list[str] = []
     for path in paths:
         if not path.exists():
@@ -753,6 +842,35 @@ def check_research_tools_have_no_execution_imports() -> AuditResult:
                     violations.append(f"{_relative(path)} imports {module}")
     return AuditResult(
         name="research tools have no execution imports",
+        passed=not violations,
+        detail=_violation_detail(violations),
+    )
+
+
+def check_research_tools_have_no_order_api_calls() -> AuditResult:
+    forbidden_names = {
+        "post_order",
+        "cancel_order",
+        "replace_order",
+        "get_orders",
+        "post_sandbox_order",
+        "cancel_sandbox_order",
+        "stop_orders",
+        "orders_service",
+        "SmartLimitExecutor",
+    }
+    violations: list[str] = []
+    for path in _research_boundary_paths():
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in forbidden_names:
+                violations.append(f"{_relative(path)} references {node.attr}")
+            elif isinstance(node, ast.Name) and node.id in forbidden_names:
+                violations.append(f"{_relative(path)} references {node.id}")
+    return AuditResult(
+        name="research tools have no order API calls",
         passed=not violations,
         detail=_violation_detail(violations),
     )
@@ -861,6 +979,17 @@ def _looks_like_placeholder(value: str) -> bool:
 
 def _is_forbidden_strategy_import(module: str) -> bool:
     return module.startswith("neo_trader.broker") or module.startswith("neo_trader.execution")
+
+
+def _research_boundary_paths() -> tuple[Path, ...]:
+    return (
+        ROOT / "scripts" / "analyze_recording_quality.py",
+        ROOT / "scripts" / "build_feature_store.py",
+        ROOT / "scripts" / "run_research_backtest.py",
+        ROOT / "neo_trader" / "research" / "universe_selector.py",
+        ROOT / "neo_trader" / "research" / "feature_store.py",
+        ROOT / "neo_trader" / "research" / "backtest_runner.py",
+    )
 
 
 def _is_forbidden_recorder_import(module: str) -> bool:

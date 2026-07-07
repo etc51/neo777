@@ -1,7 +1,7 @@
 PYTHON ?= python
 DASHBOARD_STATE ?= data/monitoring/dashboard_state.example.json
 
-.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording
+.PHONY: install lint typecheck test audit run-dashboard record-mock record-readonly run-dashboard-live-state analyze-recording build-features research-backtest research-cycle
 
 install:
 	$(PYTHON) -m pip install -e ".[dev,dashboard]"
@@ -32,3 +32,11 @@ run-dashboard-live-state:
 
 analyze-recording:
 	$(PYTHON) scripts/analyze_recording_quality.py --raw data/raw --reports-dir data/reports --active-universe configs/active_universe.yaml
+
+build-features:
+	$(PYTHON) scripts/build_feature_store.py --raw data/raw --output data/features --active-universe configs/active_universe.yaml
+
+research-backtest:
+	$(PYTHON) scripts/run_research_backtest.py --features data/features --reports-dir data/reports --active-universe configs/active_universe.yaml
+
+research-cycle: analyze-recording build-features research-backtest

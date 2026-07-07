@@ -25,6 +25,8 @@ MODULES = [
     "neo_trader.risk",
     "neo_trader.risk.manager",
     "neo_trader.research",
+    "neo_trader.research.backtest_runner",
+    "neo_trader.research.feature_store",
     "neo_trader.research.universe_selector",
     "neo_trader.runtime",
     "neo_trader.strategy",
