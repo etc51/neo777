@@ -290,6 +290,61 @@ def test_curator_decisions_written(tmp_path: Path) -> None:
     assert storage.table_counts()["curator_decisions"] > 0
 
 
+def test_market_feed_records_trades_and_candles(tmp_path: Path) -> None:
+    result = run_swarm(
+        load_config(),
+        max_cycles=3,
+        poll_interval_sec=0,
+        provider=MockNeoMarketDataProvider(),
+        db_path=tmp_path / "run.sqlite",
+        reports_dir=tmp_path / "reports",
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
+
+    trade_events = storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM market_events WHERE event_type = 'trade'"
+    )[0]["count"]
+    real_candles = storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM market_events WHERE event_type LIKE 'candle_%'"
+    )[0]["count"]
+
+    assert trade_events >= 6
+    assert real_candles >= 18
+
+
+def test_future_labels_are_written_after_horizon(tmp_path: Path) -> None:
+    start = datetime(2026, 7, 8, tzinfo=UTC)
+    ticks = {"value": 0}
+
+    def clock() -> datetime:
+        value = start + timedelta(seconds=20 * ticks["value"])
+        ticks["value"] += 1
+        return value
+
+    result = run_swarm(
+        load_config(),
+        max_cycles=14,
+        poll_interval_sec=0,
+        provider=MockNeoMarketDataProvider(),
+        db_path=tmp_path / "run.sqlite",
+        reports_dir=tmp_path / "reports",
+        clock=clock,
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
+    labeled = storage.fetch_all(
+        """
+        SELECT COUNT(*) AS count
+        FROM bot_decisions
+        WHERE future_return_15s IS NOT NULL
+          AND future_return_180s IS NOT NULL
+        """
+    )[0]["count"]
+
+    assert labeled > 0
+
+
 def test_report_created(tmp_path: Path) -> None:
     result = run_swarm(
         load_config(),
@@ -307,7 +362,16 @@ def test_report_created(tmp_path: Path) -> None:
 
 
 def test_dashboard_imports(tmp_path: Path) -> None:
-    storage = _storage(tmp_path)
+    result = run_swarm(
+        load_config(),
+        max_cycles=3,
+        poll_interval_sec=0,
+        provider=MockNeoMarketDataProvider(),
+        db_path=tmp_path / "run.sqlite",
+        reports_dir=tmp_path / "reports",
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
     path = write_report(
         storage=storage,
         config=load_config(),
@@ -319,6 +383,12 @@ def test_dashboard_imports(tmp_path: Path) -> None:
     assert path.exists()
     assert "bots" in state
     assert "market" in state
+    assert len(state["bots"]) == 10
+    assert "swarm_equity" in state
+    assert state["best_bot"] is not None
+    assert state["worst_bot"] is not None
+    assert state["instrument_comparison"]
+    assert state["equity_curve"]
 
 
 def _storage(tmp_path: Path) -> SQLiteJournal:

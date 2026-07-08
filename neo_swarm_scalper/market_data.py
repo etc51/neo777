@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,6 +26,19 @@ class ReadOnlyMarketDataProvider(Protocol):
 
     def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
         """Return a read-only order book snapshot."""
+
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        """Return recent read-only trades or last-price records when trades are unavailable."""
+
+    def get_candles(
+        self,
+        instrument_id: str,
+        *,
+        interval: str,
+        from_time: datetime,
+        to_time: datetime,
+    ) -> Sequence[Mapping[str, Any]]:
+        """Return read-only candle payloads for an instrument."""
 
 
 class TBankReadOnlyProvider:
@@ -60,6 +73,24 @@ class TBankReadOnlyProvider:
             "lastPrice": None if book.last_price is None else str(book.last_price),
             "raw": dict(book.raw),
         }
+
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        return self._client.get_last_prices([instrument_id])
+
+    def get_candles(
+        self,
+        instrument_id: str,
+        *,
+        interval: str,
+        from_time: datetime,
+        to_time: datetime,
+    ) -> Sequence[Mapping[str, Any]]:
+        return self._client.get_candles(
+            instrument_id,
+            interval=interval,
+            from_time=from_time,
+            to_time=to_time,
+        )
 
 
 @dataclass(frozen=True)
@@ -129,17 +160,20 @@ class NeoMarketDataFeed:
         )
         return self.status
 
-    def poll_once(self) -> tuple[MarketSnapshot, ...]:
+    def poll_once(self, *, timestamp_utc: datetime | None = None) -> tuple[MarketSnapshot, ...]:
         if self._provider is None:
             self.connect()
+        if self._provider is None:
+            return ()
         snapshots: list[MarketSnapshot] = []
         for metadata in self.metadata:
             try:
+                event_timestamp = timestamp_utc or datetime.now(UTC)
                 raw = self._provider.get_orderbook_snapshot(
                     metadata.instrument_id,
                     depth=self.config.data.orderbook_depth,
                 )
-                snapshot = _snapshot_from_orderbook(raw, metadata)
+                snapshot = _snapshot_from_orderbook(raw, metadata, timestamp_utc=event_timestamp)
                 snapshots.append(snapshot)
                 self.storage.record_market_snapshot(snapshot)
                 if snapshot.orderbook_missing:
@@ -158,6 +192,7 @@ class NeoMarketDataFeed:
                         severity="warning",
                         details={"ticker": metadata.ticker},
                     )
+                self._record_optional_market_events(metadata, snapshot.timestamp_utc)
             except Exception as exc:  # noqa: BLE001 - feed must keep the other instrument alive.
                 self.storage.record_data_quality(
                     timestamp_utc=datetime.now(UTC),
@@ -167,6 +202,75 @@ class NeoMarketDataFeed:
                     details=mask_token_like_text(str(exc)),
                 )
         return tuple(snapshots)
+
+    def _record_optional_market_events(
+        self,
+        metadata: InstrumentMetadata,
+        timestamp_utc: datetime,
+    ) -> None:
+        provider = self._provider
+        if provider is None:
+            return
+        if self.config.data.collect_trades:
+            try:
+                for raw in provider.get_recent_trades(metadata.instrument_id):
+                    event = _trade_from_raw(raw, timestamp_utc)
+                    if event is None:
+                        continue
+                    self.storage.record_market_trade(
+                        timestamp_utc=event["timestamp"],
+                        instrument=metadata.name,
+                        price=event["price"],
+                        quantity=event["quantity"],
+                        side=event["side"],
+                        raw=dict(raw),
+                    )
+            except Exception as exc:  # noqa: BLE001 - trade collection is optional.
+                self.storage.record_data_quality(
+                    timestamp_utc=timestamp_utc,
+                    instrument=metadata.name,
+                    issue_type="trades_unavailable",
+                    severity="warning",
+                    details=mask_token_like_text(str(exc)),
+                )
+
+        for timeframe, enabled, interval in _candle_requests(self.config):
+            if not enabled:
+                continue
+            try:
+                candles = provider.get_candles(
+                    metadata.instrument_id,
+                    interval=interval,
+                    from_time=timestamp_utc - timedelta(minutes=20),
+                    to_time=timestamp_utc,
+                )
+                parsed = [
+                    candle
+                    for raw in candles
+                    if (candle := _candle_from_raw(raw, timestamp_utc)) is not None
+                ]
+                if not parsed:
+                    continue
+                candle = max(parsed, key=lambda item: item["timestamp"])
+                self.storage.record_candle(
+                    timestamp_utc=candle["timestamp"],
+                    instrument=metadata.name,
+                    timeframe=timeframe,
+                    open_price=candle["open"],
+                    high=candle["high"],
+                    low=candle["low"],
+                    close=candle["close"],
+                    volume=candle["volume"],
+                    raw=candle["raw"],
+                )
+            except Exception as exc:  # noqa: BLE001 - candle collection is optional.
+                self.storage.record_data_quality(
+                    timestamp_utc=timestamp_utc,
+                    instrument=metadata.name,
+                    issue_type=f"candles_{timeframe}_unavailable",
+                    severity="warning",
+                    details=mask_token_like_text(str(exc)),
+                )
 
     def _discover_one(self, instrument_name: str) -> InstrumentMetadata | None:
         configured = next(item for item in self.config.instruments if item.name == instrument_name)
@@ -308,12 +412,15 @@ def _local_catalog_item_for_ticker(ticker: str) -> Mapping[str, Any]:
 
 
 def _snapshot_from_orderbook(
-    raw: Mapping[str, Any], metadata: InstrumentMetadata
+    raw: Mapping[str, Any],
+    metadata: InstrumentMetadata,
+    *,
+    timestamp_utc: datetime | None = None,
 ) -> MarketSnapshot:
     bids = tuple(_levels(raw.get("bids", ()), reverse=True))
     asks = tuple(_levels(raw.get("asks", ()), reverse=False))
     last_price = _price(raw.get("lastPrice", raw.get("last_price")))
-    timestamp = datetime.now(UTC)
+    timestamp = timestamp_utc or datetime.now(UTC)
     if not last_price and bids and asks:
         last_price = (bids[0].price + asks[0].price) / Decimal("2")
     return MarketSnapshot(
@@ -327,6 +434,59 @@ def _snapshot_from_orderbook(
         orderbook_missing=not bids or not asks,
         raw=dict(raw),
     )
+
+
+def _candle_requests(config: NeoSwarmScalperConfig) -> tuple[tuple[str, bool, str], ...]:
+    return (
+        ("1m", config.data.collect_candles_1m, "CANDLE_INTERVAL_1_MIN"),
+        ("5m", config.data.collect_candles_5m, "CANDLE_INTERVAL_5_MIN"),
+        ("15m", config.data.collect_candles_15m, "CANDLE_INTERVAL_15_MIN"),
+    )
+
+
+def _trade_from_raw(
+    raw: Mapping[str, Any],
+    fallback_timestamp: datetime,
+) -> dict[str, Any] | None:
+    price = _price(raw.get("price", raw.get("lastPrice", raw.get("last_price"))))
+    if price is None:
+        return None
+    quantity = decimal_or_none(raw.get("quantity", raw.get("qty", raw.get("size", 1))))
+    timestamp = _timestamp(
+        raw.get(
+            "time",
+            raw.get("timestamp", raw.get("exchangeTimestamp", raw.get("exchange_timestamp"))),
+        )
+    )
+    return {
+        "timestamp": timestamp or fallback_timestamp,
+        "price": price,
+        "quantity": quantity or Decimal("1"),
+        "side": _first_str(raw, "side", "direction", "tradeDirection"),
+    }
+
+
+def _candle_from_raw(
+    raw: Mapping[str, Any],
+    fallback_timestamp: datetime,
+) -> dict[str, Any] | None:
+    timestamp = _timestamp(raw.get("time", raw.get("timestamp"))) or fallback_timestamp
+    open_price = _price(raw.get("open", raw.get("o")))
+    high = _price(raw.get("high", raw.get("h")))
+    low = _price(raw.get("low", raw.get("l")))
+    close = _price(raw.get("close", raw.get("c")))
+    volume = decimal_or_none(raw.get("volume", raw.get("v", 0)))
+    if None in {timestamp, open_price, high, low, close, volume}:
+        return None
+    return {
+        "timestamp": timestamp,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "raw": dict(raw),
+    }
 
 
 def _levels(raw_levels: object, *, reverse: bool) -> Iterable[BookLevel]:

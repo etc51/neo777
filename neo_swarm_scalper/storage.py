@@ -120,6 +120,83 @@ class SQLiteJournal:
             self._record_candles(conn, snapshot)
             conn.commit()
 
+    def record_market_trade(
+        self,
+        *,
+        timestamp_utc: datetime,
+        instrument: str,
+        price: Decimal,
+        quantity: Decimal,
+        side: str | None,
+        raw: Mapping[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO market_events(
+                    timestamp_utc, instrument, event_type, last_price, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    instrument,
+                    "trade",
+                    _num(price),
+                    _json({"price": price, "quantity": quantity, "side": side, "raw": raw}),
+                ),
+            )
+            conn.commit()
+
+    def record_candle(
+        self,
+        *,
+        timestamp_utc: datetime,
+        instrument: str,
+        timeframe: str,
+        open_price: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: Decimal,
+        raw: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO candles(
+                    timestamp_utc, instrument, timeframe, open, high, low, close, volume
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    instrument,
+                    timeframe,
+                    _num(open_price),
+                    _num(high),
+                    _num(low),
+                    _num(close),
+                    _num(volume),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO market_events(
+                    timestamp_utc, instrument, event_type, last_price, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    instrument,
+                    f"candle_{timeframe}",
+                    _num(close),
+                    _json(raw or {}),
+                ),
+            )
+            conn.commit()
+
     def record_features(self, features: FeatureSnapshot) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -427,6 +504,46 @@ class SQLiteJournal:
             )
             conn.commit()
 
+    def update_decision_labels(
+        self,
+        *,
+        decision_id: str,
+        labels: Mapping[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE bot_decisions
+                SET future_return_15s = ?,
+                    future_return_30s = ?,
+                    future_return_60s = ?,
+                    future_return_180s = ?,
+                    future_mfe_60s = ?,
+                    future_mae_60s = ?,
+                    tp3_before_sl3 = ?,
+                    tp5_before_sl3 = ?,
+                    tp8_before_sl5 = ?,
+                    best_exit_after_signal = ?,
+                    worst_adverse_after_signal = ?
+                WHERE decision_id = ?
+                """,
+                (
+                    _num(labels.get("future_return_15s")),
+                    _num(labels.get("future_return_30s")),
+                    _num(labels.get("future_return_60s")),
+                    _num(labels.get("future_return_180s")),
+                    _num(labels.get("future_mfe_60s")),
+                    _num(labels.get("future_mae_60s")),
+                    _bool_int(labels.get("tp3_before_sl3")),
+                    _bool_int(labels.get("tp5_before_sl3")),
+                    _bool_int(labels.get("tp8_before_sl5")),
+                    _num(labels.get("best_exit_after_signal")),
+                    _num(labels.get("worst_adverse_after_signal")),
+                    decision_id,
+                ),
+            )
+            conn.commit()
+
     def table_counts(self) -> dict[str, int]:
         tables = (
             "market_events",
@@ -496,6 +613,12 @@ def _num(value: object) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     return float(Decimal(str(value)))
+
+
+def _bool_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return 1 if bool(value) else 0
 
 
 def _levels(levels: Sequence[Any]) -> str:

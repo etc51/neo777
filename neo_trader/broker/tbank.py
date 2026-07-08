@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final, Literal, Protocol, TypeAlias, TypeGuard, cast
@@ -39,6 +40,12 @@ MARKETDATA_GET_TRADING_STATUSES: Final = (
 MARKETDATA_GET_ORDER_BOOK: Final = (
     "tinkoff.public.invest.api.contract.v1.MarketDataService/GetOrderBook"
 )
+MARKETDATA_GET_LAST_PRICES: Final = (
+    "tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastPrices"
+)
+MARKETDATA_GET_CANDLES: Final = (
+    "tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+)
 
 READONLY_METHODS: Final = frozenset(
     {
@@ -47,6 +54,8 @@ READONLY_METHODS: Final = frozenset(
         MARKETDATA_GET_TRADING_STATUS,
         MARKETDATA_GET_TRADING_STATUSES,
         MARKETDATA_GET_ORDER_BOOK,
+        MARKETDATA_GET_LAST_PRICES,
+        MARKETDATA_GET_CANDLES,
     }
 )
 
@@ -437,6 +446,40 @@ class TBankClient:
 
         response = self._post(MARKETDATA_GET_ORDER_BOOK, payload)
         return TBankOrderBookSnapshot.from_payload(response)
+
+    def get_last_prices(self, instrument_ids: Sequence[str]) -> list[dict[str, Any]]:
+        """Return read-only last-price records for the requested instruments."""
+
+        normalized_ids = [
+            _normalize_identifier(instrument_id, field_name="instrument_id")
+            for instrument_id in instrument_ids
+        ]
+        response = self._post(MARKETDATA_GET_LAST_PRICES, {"instrumentId": normalized_ids})
+        return [dict(item) for item in _payload_items(response, "lastPrices", "last_prices")]
+
+    def get_candles(
+        self,
+        instrument_id: str,
+        *,
+        from_time: datetime,
+        to_time: datetime,
+        interval: str,
+    ) -> list[dict[str, Any]]:
+        """Return read-only candles for a FIGI, UID, or ticker_class_code id."""
+
+        response = self._post(
+            MARKETDATA_GET_CANDLES,
+            {
+                "instrumentId": _normalize_identifier(
+                    instrument_id,
+                    field_name="instrument_id",
+                ),
+                "from": from_time.isoformat().replace("+00:00", "Z"),
+                "to": to_time.isoformat().replace("+00:00", "Z"),
+                "interval": interval,
+            },
+        )
+        return [dict(item) for item in _payload_items(response, "candles")]
 
     def _post(self, service_method: str, payload: JsonMapping) -> dict[str, Any]:
         if self.mode is TBankMode.READONLY and service_method not in READONLY_METHODS:

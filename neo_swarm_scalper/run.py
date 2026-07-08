@@ -15,6 +15,7 @@ from neo_swarm_scalper.bots import NeoScalperBot, build_default_bots
 from neo_swarm_scalper.config import DEFAULT_CONFIG_PATH, NeoSwarmScalperConfig, load_config
 from neo_swarm_scalper.curator import NeoSwarmCurator
 from neo_swarm_scalper.feature_engine import NeoFeatureEngine
+from neo_swarm_scalper.labels import update_future_labels
 from neo_swarm_scalper.market_data import NeoMarketDataFeed, ReadOnlyMarketDataProvider
 from neo_swarm_scalper.reports import write_report
 from neo_swarm_scalper.safety import apply_paper_safety_env
@@ -79,7 +80,7 @@ def run_swarm(
     while target_cycles is None or cycles < target_cycles:
         cycles += 1
         timestamp = now()
-        snapshots = feed.poll_once()
+        snapshots = feed.poll_once(timestamp_utc=timestamp)
         features_by_instrument = _features_from_snapshots(engine, storage, snapshots)
         snapshot_by_instrument = {snapshot.instrument: snapshot for snapshot in snapshots}
         _settle_open_positions(
@@ -131,6 +132,7 @@ def run_swarm(
                     details=str(exc),
                 )
         curator.update_bot_parameters(timestamp_utc=timestamp)
+        update_future_labels(storage, as_of=timestamp)
         if (
             config.reports.enabled
             and (timestamp - last_report_at).total_seconds() >= config.reports.interval_sec
@@ -282,6 +284,43 @@ class MockNeoMarketDataProvider:
             "asks": _levels(ask, tick, ask_qty, reverse=False),
             "lastPrice": str((bid + ask) / Decimal("2")),
         }
+
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        is_btc = "4eff" in instrument_id or "BTC" in instrument_id
+        tick = Decimal("0.1") if is_btc else Decimal("0.01")
+        base = Decimal("1000") if is_btc else Decimal("100")
+        drift = Decimal(self._cycle % 9) - Decimal("4")
+        return [
+            {
+                "price": str(base + (drift * tick * Decimal("8")) + tick),
+                "quantity": "1",
+                "side": "BUY" if drift >= 0 else "SELL",
+            }
+        ]
+
+    def get_candles(
+        self,
+        instrument_id: str,
+        *,
+        interval: str,
+        from_time: datetime,
+        to_time: datetime,
+    ) -> Sequence[Mapping[str, Any]]:
+        del interval, from_time, to_time
+        is_btc = "4eff" in instrument_id or "BTC" in instrument_id
+        tick = Decimal("0.1") if is_btc else Decimal("0.01")
+        base = Decimal("1000") if is_btc else Decimal("100")
+        drift = Decimal(self._cycle % 9) - Decimal("4")
+        close = base + (drift * tick * Decimal("8"))
+        return [
+            {
+                "open": str(close - tick),
+                "high": str(close + tick),
+                "low": str(close - (tick * Decimal("2"))),
+                "close": str(close),
+                "volume": "10",
+            }
+        ]
 
 
 def _levels(
