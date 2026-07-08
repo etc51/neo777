@@ -20,6 +20,8 @@ from neo_swarm_scalper.config import NeoSwarmScalperConfig
 from neo_swarm_scalper.storage import SQLiteJournal
 from neo_swarm_scalper.types import FeatureSnapshot, MarketSnapshot, PositionSide
 
+SPREAD_SHOCK_GRACE_CYCLES = 3
+
 
 @dataclass
 class _InstrumentState:
@@ -61,6 +63,7 @@ class _ShadowTrade:
     protected_exit_reason: str | None = None
     reentry_index: int = 0
     consecutive_stop_index: int = 0
+    spread_bad_cycles: int = 0
 
 
 class TailCatcherEngine:
@@ -422,9 +425,14 @@ class TailCatcherEngine:
     ) -> tuple[bool, PositionSide | None, Decimal, str, dict[str, Any]]:
         pressure = Decimal(str(micro["pressure_score"]))
         side = PositionSide.LONG if pressure >= 0 else PositionSide.SHORT
+        spread_entry = _spread_entry_assessment(self.config, micro)
         gates = {
             "session_gate": _session_open(snapshot),
-            "spread_gate": _spread_ok(self.config, micro),
+            "spread_gate": spread_entry["entry_ok"],
+            "spread_status": spread_entry["status"],
+            "spread_no_entry_reason": spread_entry["no_entry_reason"],
+            "spread_ticks": spread_entry["spread_ticks"],
+            "spread_bps": spread_entry["spread_bps"],
             "orderbook_health_gate": not snapshot.orderbook_missing
             and not bool(micro["thin_book_flag"]),
             "microstructure_gate": abs(pressure) >= self.config.tail_catcher.min_pressure_score,
@@ -565,10 +573,9 @@ class TailCatcherEngine:
 
             reason: str | None = None
             raw_exit = exit_price
+            spread_exit = _spread_exit_assessment(self.config, micro)
             if snapshot.stale:
                 reason = "stale_data_close"
-            elif _spread_shock(self.config, micro):
-                reason = "spread_shock"
             elif _stop_hit(trade, exit_price):
                 reason = "protected_stop" if trade.protection_activated else "stop_loss"
             elif trade.protection_activated and self._trailing_exit(
@@ -579,6 +586,48 @@ class TailCatcherEngine:
                 tick,
             ):
                 reason = "trailing_runner"
+            elif _time_exit(trade, timestamp_utc, self.config.scalping.time_stop_sec_max):
+                reason = "time_exit"
+            elif spread_exit["market_bad"]:
+                trade.spread_bad_cycles += 1
+                grace_met = trade.spread_bad_cycles >= SPREAD_SHOCK_GRACE_CYCLES
+                if spread_exit["exit_infeasible"] and grace_met:
+                    reason = "spread_shock"
+                    self._record_trade_event(
+                        trade.trade_id,
+                        timestamp_utc,
+                        "real_spread_shock_exit_confirmed",
+                        exit_price,
+                        {
+                            **spread_exit,
+                            "spread_bad_cycles": trade.spread_bad_cycles,
+                            "grace_cycles_required": SPREAD_SHOCK_GRACE_CYCLES,
+                        },
+                    )
+                else:
+                    self._record_trade_event(
+                        trade.trade_id,
+                        timestamp_utc,
+                        "avoided_spread_shock_exit",
+                        exit_price,
+                        {
+                            **spread_exit,
+                            "spread_bad_cycles": trade.spread_bad_cycles,
+                            "grace_cycles_required": SPREAD_SHOCK_GRACE_CYCLES,
+                            "kept_open": True,
+                        },
+                    )
+            else:
+                trade.spread_bad_cycles = 0
+
+            if spread_exit["market_bad"] and reason is not None and reason != "spread_shock":
+                self._record_trade_event(
+                    trade.trade_id,
+                    timestamp_utc,
+                    "market_bad_spread_warning",
+                    exit_price,
+                    {**spread_exit, "exit_reason": reason},
+                )
 
             if reason is None:
                 self._update_shadow_trade(trade, status="OPEN")
@@ -586,13 +635,13 @@ class TailCatcherEngine:
                 continue
 
             protected_exit_reason = None
-            if (
-                trade.protection_activated
-                and _pnl_abs(trade.side, trade.entry_price, exit_price) < 0
-            ):
+            if reason == "spread_shock" and trade.protection_activated and pnl_abs < 0:
+                exit_price = _protected_exit_price(trade.side, trade.entry_price, raw_exit)
+                protected_exit_reason = "spread_shock"
+            elif trade.protection_activated and pnl_abs < 0:
                 exit_price = _protected_exit_price(trade.side, trade.entry_price, raw_exit)
                 protected_exit_reason = reason
-                reason = "protected_panic_exit" if reason == "spread_shock" else "protected_exit"
+                reason = "protected_exit"
             trade.protected_exit_reason = protected_exit_reason
             self._close_trade(trade, timestamp_utc, exit_price, reason)
 
@@ -1262,21 +1311,62 @@ def _session_open(snapshot: MarketSnapshot) -> bool:
 
 
 def _spread_ok(config: NeoSwarmScalperConfig, micro: dict[str, Any]) -> bool:
-    spread_ticks = _dec_or_none(micro.get("spread_ticks"))
-    spread_bps = Decimal(str(micro["spread_bps"]))
-    if spread_ticks is not None and spread_ticks > config.tail_catcher.spread_max_ticks:
-        return False
-    return spread_bps <= config.tail_catcher.spread_hard_bps
+    return bool(_spread_entry_assessment(config, micro)["entry_ok"])
 
 
-def _spread_shock(config: NeoSwarmScalperConfig, micro: dict[str, Any]) -> bool:
+def _spread_entry_assessment(
+    config: NeoSwarmScalperConfig,
+    micro: dict[str, Any],
+) -> dict[str, Any]:
     spread_ticks = _dec_or_none(micro.get("spread_ticks"))
     spread_bps = Decimal(str(micro["spread_bps"]))
-    return (
-        spread_ticks is not None
-        and spread_ticks > config.tail_catcher.spread_max_ticks
-        or spread_bps > config.tail_catcher.spread_hard_bps
+    tick_blocked = (
+        spread_ticks is not None and spread_ticks > config.tail_catcher.spread_max_ticks
     )
+    bps_blocked = spread_bps > config.tail_catcher.spread_hard_bps
+    reasons = []
+    if tick_blocked:
+        reasons.append("spread_ticks")
+    if bps_blocked:
+        reasons.append("spread_bps")
+    return {
+        "entry_ok": not reasons,
+        "status": "ok" if not reasons else "no_entry",
+        "no_entry_reason": ",".join(reasons),
+        "spread_ticks": spread_ticks,
+        "spread_bps": spread_bps,
+        "spread_max_ticks": config.tail_catcher.spread_max_ticks,
+        "spread_hard_bps": config.tail_catcher.spread_hard_bps,
+    }
+
+
+def _spread_exit_assessment(
+    config: NeoSwarmScalperConfig,
+    micro: dict[str, Any],
+) -> dict[str, Any]:
+    entry = _spread_entry_assessment(config, micro)
+    spread_ticks = _dec_or_none(micro.get("spread_ticks"))
+    spread_bps = Decimal(str(micro["spread_bps"]))
+    tick_extreme = (
+        spread_ticks is not None
+        and spread_ticks >= config.tail_catcher.spread_max_ticks * Decimal("3")
+    )
+    bps_extreme = spread_bps >= config.tail_catcher.spread_hard_bps * Decimal("2")
+    exit_infeasible = bool(
+        bps_extreme or (tick_extreme and spread_bps > config.tail_catcher.spread_hard_bps)
+    )
+    return {
+        **entry,
+        "status": "market_bad" if not entry["entry_ok"] else "ok",
+        "market_bad": not entry["entry_ok"],
+        "exit_infeasible": exit_infeasible,
+        "tick_extreme": tick_extreme,
+        "bps_extreme": bps_extreme,
+    }
+
+
+def _time_exit(trade: _ShadowTrade, timestamp_utc: datetime, max_age_sec: int) -> bool:
+    return (timestamp_utc - trade.entry_time).total_seconds() >= max_age_sec
 
 
 def _imbalance(bid: Decimal, ask: Decimal) -> Decimal:

@@ -103,6 +103,8 @@ def build_report_payload(
         ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
         """
     )
+    shadow_exit_summary = _shadow_exit_summary(storage)
+    stop_comparison = _shadow_stop_comparison(storage)
     total_pnl = sum((Decimal(str(row["net_pnl"])) for row in bot_rows), Decimal("0"))
     best_bot = max(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
     worst_bot = min(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
@@ -160,6 +162,8 @@ def build_report_payload(
         "spread_slippage": [_row_dict(row) for row in spread_rows],
         "shadow_trades": [_row_dict(row) for row in shadow_rows],
         "shadow_experiments": [_row_dict(row) for row in latest_experiments],
+        "shadow_exit_summary": shadow_exit_summary,
+        "shadow_stop_comparison": stop_comparison,
         "next_steps": [
             "Watch data freshness and orderbook_missing warnings.",
             "Compare stop_ticks after at least 30 closed shadow trades per instrument.",
@@ -259,6 +263,39 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"{row['trailing_mode']} | {row['trades']} | {row['open_trades']} | "
             f"{row['closed_trades']} | {row['stops']} | {row['protected']} | "
             f"{row['max_mfe_ticks']} | {row['min_mae_ticks']} |"
+        )
+    exit_summary = payload["shadow_exit_summary"]
+    stop_comparison = payload["shadow_stop_comparison"]
+    lines.extend(
+        [
+            "",
+            "## Shadow Exit Summary",
+            "",
+            f"- stop exits: {exit_summary['stop_exits']}",
+            f"- protection exits: {exit_summary['protection_exits']}",
+            f"- trailing exits: {exit_summary['trailing_exits']}",
+            f"- time exits: {exit_summary['time_exits']}",
+            f"- real spread_shock exits: {exit_summary['real_spread_shock_exits']}",
+            f"- avoided spread_shock exits: {exit_summary['avoided_spread_shock_exits']}",
+            f"- market_bad spread warnings: {exit_summary['market_bad_spread_warnings']}",
+            "",
+            "## Stop Tick Comparison",
+            "",
+            f"- status: {stop_comparison['status']}",
+            f"- reason: {stop_comparison['reason']}",
+            f"- best stop_ticks excluding spread_shock: {stop_comparison['best_stop_ticks']}",
+            "",
+            "| stop_ticks | trades | non_spread_trades | avg_pnl_ticks_non_spread | stops | "
+            "protection | trailing | time | spread_shock |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in stop_comparison["rows"]:
+        lines.append(
+            f"| {row['stop_ticks']} | {row['trades']} | {row['non_spread_trades']} | "
+            f"{row['avg_pnl_ticks_non_spread']} | {row['stop_exits']} | "
+            f"{row['protection_exits']} | {row['trailing_exits']} | {row['time_exits']} | "
+            f"{row['spread_shock_exits']} |"
         )
     lines.extend(
         [
@@ -368,6 +405,119 @@ def _freshness(storage: SQLiteJournal, config: NeoSwarmScalperConfig) -> dict[st
 
 def _row_dict(row: Any) -> dict[str, Any]:
     return dict(row)
+
+
+def _shadow_exit_summary(storage: SQLiteJournal) -> dict[str, Any]:
+    row = storage.fetch_all(
+        """
+        SELECT
+            SUM(CASE WHEN exit_reason IN ('stop_loss', 'protected_stop') THEN 1 ELSE 0 END)
+                AS stop_exits,
+            SUM(CASE WHEN exit_reason = 'protected_exit' THEN 1 ELSE 0 END)
+                AS protection_exits,
+            SUM(CASE WHEN exit_reason = 'trailing_runner' THEN 1 ELSE 0 END)
+                AS trailing_exits,
+            SUM(CASE WHEN exit_reason = 'time_exit' THEN 1 ELSE 0 END)
+                AS time_exits,
+            SUM(CASE WHEN exit_reason = 'spread_shock' THEN 1 ELSE 0 END)
+                AS real_spread_shock_exits
+        FROM shadow_trades
+        WHERE status = 'CLOSED'
+        """
+    )[0]
+    events = storage.fetch_all(
+        """
+        SELECT event_type, COUNT(*) AS count
+        FROM shadow_trade_events
+        WHERE event_type IN ('avoided_spread_shock_exit', 'market_bad_spread_warning')
+        GROUP BY event_type
+        """
+    )
+    event_counts = {str(item["event_type"]): int(item["count"]) for item in events}
+    return {
+        "stop_exits": int(row["stop_exits"] or 0),
+        "protection_exits": int(row["protection_exits"] or 0),
+        "trailing_exits": int(row["trailing_exits"] or 0),
+        "time_exits": int(row["time_exits"] or 0),
+        "real_spread_shock_exits": int(row["real_spread_shock_exits"] or 0),
+        "avoided_spread_shock_exits": event_counts.get("avoided_spread_shock_exit", 0),
+        "market_bad_spread_warnings": event_counts.get("market_bad_spread_warning", 0),
+    }
+
+
+def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
+    rows = storage.fetch_all(
+        """
+        SELECT
+            stop_ticks,
+            COUNT(*) AS trades,
+            SUM(CASE WHEN exit_reason != 'spread_shock' THEN 1 ELSE 0 END)
+                AS non_spread_trades,
+            AVG(
+                CASE
+                    WHEN exit_reason != 'spread_shock'
+                    THEN CASE
+                        WHEN side = 'LONG'
+                        THEN (exit_price - entry_price) / ((entry_price - stop_price) / stop_ticks)
+                        ELSE (entry_price - exit_price) / ((stop_price - entry_price) / stop_ticks)
+                    END
+                    ELSE NULL
+                END
+            ) AS avg_pnl_ticks_non_spread,
+            SUM(CASE WHEN exit_reason IN ('stop_loss', 'protected_stop') THEN 1 ELSE 0 END)
+                AS stop_exits,
+            SUM(CASE WHEN exit_reason = 'protected_exit' THEN 1 ELSE 0 END)
+                AS protection_exits,
+            SUM(CASE WHEN exit_reason = 'trailing_runner' THEN 1 ELSE 0 END)
+                AS trailing_exits,
+            SUM(CASE WHEN exit_reason = 'time_exit' THEN 1 ELSE 0 END)
+                AS time_exits,
+            SUM(CASE WHEN exit_reason = 'spread_shock' THEN 1 ELSE 0 END)
+                AS spread_shock_exits
+        FROM shadow_trades
+        WHERE status = 'CLOSED' AND exit_price IS NOT NULL
+        GROUP BY stop_ticks
+        ORDER BY stop_ticks
+        """
+    )
+    reason_rows = storage.fetch_all(
+        """
+        SELECT DISTINCT exit_reason
+        FROM shadow_trades
+        WHERE status = 'CLOSED' AND exit_reason IS NOT NULL
+        """
+    )
+    result_rows = [_row_dict(row) for row in rows]
+    non_spread_total = sum(int(row["non_spread_trades"] or 0) for row in result_rows)
+    distinct_reasons = {str(row["exit_reason"]) for row in reason_rows}
+    status = "VALID"
+    reason = "non-spread exit sample is available"
+    if not result_rows:
+        status = "INVALID"
+        reason = "no closed shadow trades"
+    elif len(distinct_reasons) <= 1:
+        status = "INVALID"
+        reason = "all stop_ticks closed with one exit_reason"
+    elif non_spread_total == 0:
+        status = "INVALID"
+        reason = "no closed trades after excluding spread_shock"
+    best_stop_ticks: int | None = None
+    if status == "VALID":
+        candidates = [
+            row
+            for row in result_rows
+            if row["avg_pnl_ticks_non_spread"] is not None
+            and int(row["non_spread_trades"] or 0) > 0
+        ]
+        if candidates:
+            best = max(candidates, key=lambda row: float(row["avg_pnl_ticks_non_spread"]))
+            best_stop_ticks = int(best["stop_ticks"])
+    return {
+        "status": status,
+        "reason": reason,
+        "best_stop_ticks": best_stop_ticks,
+        "rows": result_rows,
+    }
 
 
 __all__ = ["build_report_payload", "render_markdown", "write_report"]
