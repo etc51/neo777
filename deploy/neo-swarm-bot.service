@@ -1,5 +1,5 @@
 [Unit]
-Description=neo_swarm_scalper ETH basket paper/live-data bot
+Description=neo_swarm_scalper NEOBITOK/NEOEFIR tail-catcher paper bot
 After=network-online.target
 Wants=network-online.target
 

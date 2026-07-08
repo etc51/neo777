@@ -40,13 +40,13 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    virtual_accounts_count: int = 10
-    total_capital: Decimal = Decimal("300000")
-    reserve_cash: Decimal = Decimal("60000")
-    working_capital: Decimal = Decimal("240000")
-    initial_cash_per_account: Decimal = Decimal("24000")
+    virtual_accounts_count: int = 2
+    total_capital: Decimal = Decimal("500000")
+    reserve_cash: Decimal = Decimal("0")
+    working_capital: Decimal = Decimal("500000")
+    initial_cash_per_account: Decimal = Decimal("250000")
     paper_leverage: Decimal = Decimal("3")
-    leg_notional: Decimal = Decimal("72000")
+    leg_notional: Decimal = Decimal("750000")
     base_lot: int = 1
     max_position_lots_per_bot: int = 1
     allow_long: bool = True
@@ -73,10 +73,6 @@ class BasketStrategyConfig:
     time_stop_min: int = 60
     preferred_spread_slippage_bps_side: Decimal = Decimal("2")
     hard_spread_slippage_bps_side: Decimal = Decimal("3")
-    basket_b_min_delay_min: int = 15
-    basket_b_min_anchor_move_bps: Decimal = Decimal("30")
-    max_legs_per_basket: int = 5
-    max_parallel_baskets: int = 2
 
 
 @dataclass(frozen=True)
@@ -84,7 +80,7 @@ class RiskConfig:
     no_global_stop_on_paper_loss: bool = True
     no_disable_due_to_paper_loss: bool = True
     max_open_positions_per_bot: int = 1
-    max_open_positions_total: int = 10
+    max_open_positions_total: int = 3
     max_trades_per_bot_per_day: int = 1000
     cooldown_after_loss_sec: int = 10
     cooldown_after_win_sec: int = 3
@@ -100,6 +96,29 @@ class ScalpingConfig:
     time_stop_sec_max: int = 180
     spread_max_ticks: Decimal = Decimal("3")
     min_impulse_ticks: Decimal = Decimal("3")
+
+
+@dataclass(frozen=True)
+class TailCatcherConfig:
+    stop_ticks: tuple[int, ...] = (2, 3, 4, 5, 7, 10)
+    protection_trigger_bps: tuple[Decimal, ...] = (
+        Decimal("10"),
+        Decimal("15"),
+        Decimal("20"),
+    )
+    trailing_modes: tuple[str, ...] = ("tight", "normal", "loose", "microstructure_adaptive")
+    default_protection_trigger_bps: Decimal = Decimal("15")
+    default_trailing_mode: str = "microstructure_adaptive"
+    max_reentries_per_direction_per_instrument: int = 5
+    max_consecutive_stops: int = 5
+    cooldown_after_bad_series_sec: int = 300
+    spread_max_ticks: Decimal = Decimal("3")
+    spread_hard_bps: Decimal = Decimal("12")
+    min_pressure_score: Decimal = Decimal("0.08")
+    min_depth_top5: Decimal = Decimal("10")
+    thin_book_depth_top5: Decimal = Decimal("5")
+    protection_activation_pct_hint: Decimal = Decimal("0.0015")
+    big_runner_mfe_bps: Decimal = Decimal("60")
 
 
 @dataclass(frozen=True)
@@ -147,6 +166,7 @@ class NeoSwarmScalperConfig:
     strategy: BasketStrategyConfig
     risk: RiskConfig
     scalping: ScalpingConfig
+    tail_catcher: TailCatcherConfig
     curator: CuratorConfig
     storage: StorageConfig
     reports: ReportsConfig
@@ -161,28 +181,43 @@ class NeoSwarmScalperConfig:
             raise ValueError("paper_trading_enabled must remain true.")
         if self.token_env != "TBANK_TOKEN":
             raise ValueError("token_env must be TBANK_TOKEN.")
-        if len(self.instruments) != 1:
-            raise ValueError("exactly one ETH neo instrument is expected.")
-        if self.enabled_instruments[0].ticker not in {"AUTO_DISCOVER", "ETHUSDperpA"}:
-            raise ValueError("neo_swarm_scalper is ETHUSDperpA only.")
-        if self.simulation.virtual_accounts_count != 10:
-            raise ValueError("virtual_accounts_count must be 10.")
-        if self.simulation.total_capital != Decimal("300000"):
-            raise ValueError("total_capital must be 300000.")
-        if self.simulation.reserve_cash != Decimal("60000"):
-            raise ValueError("reserve_cash must be 60000.")
-        if self.simulation.initial_cash_per_account != Decimal("24000"):
-            raise ValueError("each paper bot must have 24000 equity.")
+        enabled_names = {item.name for item in self.enabled_instruments}
+        if enabled_names != {"neobitcoin", "neoether"}:
+            raise ValueError("neo_swarm_scalper must run only neobitcoin and neoether.")
+        allowed_tickers = {
+            "neobitcoin": {"AUTO_DISCOVER", "BTCUSDperpA"},
+            "neoether": {"AUTO_DISCOVER", "ETHUSDperpA"},
+        }
+        for item in self.enabled_instruments:
+            if item.ticker not in allowed_tickers[item.name]:
+                raise ValueError(f"{item.name} must use its T-Bank neoasset ticker only.")
+        if self.simulation.virtual_accounts_count != 2:
+            raise ValueError("virtual_accounts_count must be 2.")
+        if self.simulation.total_capital != Decimal("500000"):
+            raise ValueError("total_capital must be 500000.")
+        if self.simulation.working_capital != Decimal("500000"):
+            raise ValueError("working_capital must be 500000.")
+        if self.simulation.initial_cash_per_account != Decimal("250000"):
+            raise ValueError("each instrument paper account must reference 250000 equity.")
         if self.simulation.paper_leverage != Decimal("3"):
             raise ValueError("paper leverage must be x3.")
-        if self.simulation.leg_notional != Decimal("72000"):
-            raise ValueError("leg notional must be 72000.")
+        if self.simulation.leg_notional != Decimal("750000"):
+            raise ValueError("max paper notional exposure must be 750000 per instrument.")
         if self.simulation.allow_averaging:
             raise ValueError("allow_averaging must remain false.")
         if self.simulation.allow_flip_without_close:
             raise ValueError("allow_flip_without_close must remain false.")
         if self.risk.max_open_positions_per_bot != 1:
             raise ValueError("max_open_positions_per_bot must be 1.")
+        if self.tail_catcher.stop_ticks != (2, 3, 4, 5, 7, 10):
+            raise ValueError("tail_catcher.stop_ticks must be 2/3/4/5/7/10.")
+        if (
+            self.tail_catcher.default_protection_trigger_bps
+            not in self.tail_catcher.protection_trigger_bps
+        ):
+            raise ValueError("default protection trigger must be part of protection_trigger_bps.")
+        if self.tail_catcher.default_trailing_mode not in self.tail_catcher.trailing_modes:
+            raise ValueError("default trailing mode must be part of trailing_modes.")
 
     @property
     def enabled_instruments(self) -> tuple[InstrumentConfig, ...]:
@@ -208,6 +243,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> NeoSwarmScalperConfig
         strategy=_strategy(_mapping(_required(raw, "strategy"), "strategy")),
         risk=_risk(_mapping(_required(raw, "risk"), "risk")),
         scalping=_scalping(_mapping(_required(raw, "scalping"), "scalping")),
+        tail_catcher=_tail_catcher(_mapping(_required(raw, "tail_catcher"), "tail_catcher")),
         curator=_curator(_mapping(_required(raw, "curator"), "curator")),
         storage=_storage(_mapping(_required(raw, "storage"), "storage")),
         reports=_reports(_mapping(_required(raw, "reports"), "reports")),
@@ -243,17 +279,17 @@ def _data(raw: Mapping[str, Any]) -> DataConfig:
 def _simulation(raw: Mapping[str, Any]) -> SimulationConfig:
     return SimulationConfig(
         virtual_accounts_count=_int(
-            raw.get("virtual_accounts_count", 10), "virtual_accounts_count"
+            raw.get("virtual_accounts_count", 3), "virtual_accounts_count"
         ),
-        total_capital=_decimal(raw.get("total_capital", "300000"), "total_capital"),
-        reserve_cash=_decimal(raw.get("reserve_cash", "60000"), "reserve_cash"),
-        working_capital=_decimal(raw.get("working_capital", "240000"), "working_capital"),
+        total_capital=_decimal(raw.get("total_capital", "500000"), "total_capital"),
+        reserve_cash=_decimal(raw.get("reserve_cash", "0"), "reserve_cash"),
+        working_capital=_decimal(raw.get("working_capital", "500000"), "working_capital"),
         initial_cash_per_account=_decimal(
-            raw.get("initial_cash_per_account", "24000"),
+            raw.get("initial_cash_per_account", "500000"),
             "initial_cash_per_account",
         ),
         paper_leverage=_decimal(raw.get("paper_leverage", "3"), "paper_leverage"),
-        leg_notional=_decimal(raw.get("leg_notional", "72000"), "leg_notional"),
+        leg_notional=_decimal(raw.get("leg_notional", "1500000"), "leg_notional"),
         base_lot=_int(raw.get("base_lot", 1), "base_lot"),
         max_position_lots_per_bot=_int(
             raw.get("max_position_lots_per_bot", 1),
@@ -302,16 +338,6 @@ def _strategy(raw: Mapping[str, Any]) -> BasketStrategyConfig:
             raw.get("hard_spread_slippage_bps_side", "3"),
             "hard_spread_slippage_bps_side",
         ),
-        basket_b_min_delay_min=_int(
-            raw.get("basket_b_min_delay_min", 15),
-            "basket_b_min_delay_min",
-        ),
-        basket_b_min_anchor_move_bps=_decimal(
-            raw.get("basket_b_min_anchor_move_bps", "30"),
-            "basket_b_min_anchor_move_bps",
-        ),
-        max_legs_per_basket=_int(raw.get("max_legs_per_basket", 5), "max_legs_per_basket"),
-        max_parallel_baskets=_int(raw.get("max_parallel_baskets", 2), "max_parallel_baskets"),
     )
 
 
@@ -330,7 +356,7 @@ def _risk(raw: Mapping[str, Any]) -> RiskConfig:
             "max_open_positions_per_bot",
         ),
         max_open_positions_total=_int(
-            raw.get("max_open_positions_total", 10),
+            raw.get("max_open_positions_total", 3),
             "max_open_positions_total",
         ),
         max_trades_per_bot_per_day=_int(
@@ -354,6 +380,74 @@ def _scalping(raw: Mapping[str, Any]) -> ScalpingConfig:
         time_stop_sec_max=_int(raw.get("time_stop_sec_max", 180), "time_stop_sec_max"),
         spread_max_ticks=_decimal(raw.get("spread_max_ticks", "3"), "spread_max_ticks"),
         min_impulse_ticks=_decimal(raw.get("min_impulse_ticks", "3"), "min_impulse_ticks"),
+    )
+
+
+def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
+    return TailCatcherConfig(
+        stop_ticks=tuple(
+            _int(item, "tail_catcher.stop_ticks[]")
+            for item in _sequence(
+                raw.get("stop_ticks", [2, 3, 4, 5, 7, 10]),
+                "tail_catcher.stop_ticks",
+            )
+        ),
+        protection_trigger_bps=tuple(
+            _decimal(item, "tail_catcher.protection_trigger_bps[]")
+            for item in _sequence(
+                raw.get("protection_trigger_bps", [10, 15, 20]),
+                "tail_catcher.protection_trigger_bps",
+            )
+        ),
+        trailing_modes=tuple(
+            _string(item, "tail_catcher.trailing_modes[]")
+            for item in _sequence(
+                raw.get("trailing_modes", ["tight", "normal", "loose", "microstructure_adaptive"]),
+                "tail_catcher.trailing_modes",
+            )
+        ),
+        default_protection_trigger_bps=_decimal(
+            raw.get("default_protection_trigger_bps", "15"),
+            "tail_catcher.default_protection_trigger_bps",
+        ),
+        default_trailing_mode=_string(
+            raw.get("default_trailing_mode", "microstructure_adaptive"),
+            "tail_catcher.default_trailing_mode",
+        ),
+        max_reentries_per_direction_per_instrument=_int(
+            raw.get("max_reentries_per_direction_per_instrument", 5),
+            "tail_catcher.max_reentries_per_direction_per_instrument",
+        ),
+        max_consecutive_stops=_int(
+            raw.get("max_consecutive_stops", 5),
+            "tail_catcher.max_consecutive_stops",
+        ),
+        cooldown_after_bad_series_sec=_int(
+            raw.get("cooldown_after_bad_series_sec", 300),
+            "tail_catcher.cooldown_after_bad_series_sec",
+        ),
+        spread_max_ticks=_decimal(
+            raw.get("spread_max_ticks", "3"),
+            "tail_catcher.spread_max_ticks",
+        ),
+        spread_hard_bps=_decimal(raw.get("spread_hard_bps", "12"), "tail_catcher.spread_hard_bps"),
+        min_pressure_score=_decimal(
+            raw.get("min_pressure_score", "0.08"),
+            "tail_catcher.min_pressure_score",
+        ),
+        min_depth_top5=_decimal(raw.get("min_depth_top5", "10"), "tail_catcher.min_depth_top5"),
+        thin_book_depth_top5=_decimal(
+            raw.get("thin_book_depth_top5", "5"),
+            "tail_catcher.thin_book_depth_top5",
+        ),
+        protection_activation_pct_hint=_decimal(
+            raw.get("protection_activation_pct_hint", "0.0015"),
+            "tail_catcher.protection_activation_pct_hint",
+        ),
+        big_runner_mfe_bps=_decimal(
+            raw.get("big_runner_mfe_bps", "60"),
+            "tail_catcher.big_runner_mfe_bps",
+        ),
     )
 
 
@@ -467,5 +561,6 @@ __all__ = [
     "ScalpingConfig",
     "SimulationConfig",
     "StorageConfig",
+    "TailCatcherConfig",
     "load_config",
 ]

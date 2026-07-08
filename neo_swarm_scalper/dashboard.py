@@ -19,9 +19,9 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
             "connection": {"tbank": "unknown", "stale": True},
             "market": [],
             "bots": [],
-            "positions": [],
             "baskets": [],
             "active_legs": [],
+            "positions": [],
             "trades": [],
             "curator": [],
             "data_quality": [],
@@ -30,6 +30,14 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
             "best_bot": None,
             "worst_bot": None,
             "instrument_comparison": [],
+            "open_shadow_trades": [],
+            "latest_shadow_trades": [],
+            "performance_by_stop_ticks": [],
+            "mfe_mae_distributions": [],
+            "stop_comparison": [],
+            "daily_summary": {},
+            "errors": [],
+            "health": [],
         }
     market = storage.fetch_all(
         """
@@ -86,9 +94,25 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
     bots = _bot_rows(bot_rows, latest_decisions, latest_metrics)
     instrument_comparison = _instrument_comparison(storage, market)
     equity_curve = _equity_curve(storage, bot_rows)
+    latest_microstructure = _latest_by_instrument(
+        storage,
+        """
+        SELECT instrument, timestamp_utc, spread_bps, pressure_score, liquidity_score,
+               thin_book_flag, orderbook_flip_flag
+        FROM microstructure_features
+        """,
+    )
+    latest_volatility = _latest_by_instrument(
+        storage,
+        """
+        SELECT instrument, timestamp_utc, volatility_regime, impulse_score, chop_score,
+               realized_volatility_1m
+        FROM volatility_features
+        """,
+    )
     return {
         "connection": {"tbank": "read-only or unavailable", "stale": False},
-        "market": _market_rows(market, latest_books),
+        "market": _market_rows(market, latest_books, latest_microstructure, latest_volatility),
         "bots": bots,
         "baskets": [
             _row_dict(row)
@@ -123,6 +147,41 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
         "best_bot": _best_or_worst_bot(bots, reverse=True),
         "worst_bot": _best_or_worst_bot(bots, reverse=False),
         "instrument_comparison": instrument_comparison,
+        "open_shadow_trades": [
+            _row_dict(row)
+            for row in storage.fetch_all(
+                """
+                SELECT *
+                FROM shadow_trades
+                WHERE status = 'OPEN'
+                ORDER BY entry_time DESC
+                LIMIT 200
+                """
+            )
+        ],
+        "latest_shadow_trades": [
+            _row_dict(row)
+            for row in storage.fetch_all(
+                """
+                SELECT *
+                FROM shadow_trades
+                ORDER BY entry_time DESC
+                LIMIT 200
+                """
+            )
+        ],
+        "performance_by_stop_ticks": _performance_by_stop_ticks(storage),
+        "mfe_mae_distributions": _mfe_mae_distribution(storage),
+        "stop_comparison": _stop_comparison(storage),
+        "daily_summary": _daily_summary(storage),
+        "errors": [
+            _row_dict(row)
+            for row in storage.fetch_all("SELECT * FROM errors ORDER BY id DESC LIMIT 100")
+        ],
+        "health": [
+            _row_dict(row)
+            for row in storage.fetch_all("SELECT * FROM system_health ORDER BY id DESC LIMIT 50")
+        ],
     }
 
 
@@ -147,18 +206,30 @@ def main(argv: list[str] | None = None) -> int:
     st.metric("Swarm equity", state["swarm_equity"])
     st.subheader("Market")
     st.dataframe(state["market"], use_container_width=True)
-    st.subheader("10 Bots")
+    st.subheader("Component Accounts")
     st.dataframe(state["bots"], use_container_width=True)
-    st.subheader("Baskets A/B")
-    st.dataframe(state["baskets"], use_container_width=True)
-    st.subheader("Active Legs")
-    st.dataframe(state["active_legs"], use_container_width=True)
+    st.subheader("Open Shadow Trades")
+    st.dataframe(state["open_shadow_trades"], use_container_width=True)
+    st.subheader("Performance by Stop Ticks")
+    st.dataframe(state["performance_by_stop_ticks"], use_container_width=True)
+    st.subheader("Stop Comparison")
+    st.dataframe(state["stop_comparison"], use_container_width=True)
+    st.subheader("MFE/MAE Distributions")
+    st.dataframe(state["mfe_mae_distributions"], use_container_width=True)
+    st.subheader("Daily Summary")
+    st.json(state["daily_summary"])
     st.subheader("Last 50 Trades")
     st.dataframe(state["trades"], use_container_width=True)
+    st.subheader("Latest Shadow Trades")
+    st.dataframe(state["latest_shadow_trades"], use_container_width=True)
     st.subheader("Curator Decisions")
     st.dataframe(state["curator"], use_container_width=True)
     st.subheader("Data Quality")
     st.dataframe(state["data_quality"], use_container_width=True)
+    st.subheader("Errors")
+    st.dataframe(state["errors"], use_container_width=True)
+    st.subheader("Health")
+    st.dataframe(state["health"], use_container_width=True)
     return 0
 
 
@@ -168,11 +239,18 @@ def _streamlit() -> Any:
     return st
 
 
-def _market_rows(market: list[Any], books: list[Any]) -> list[dict[str, Any]]:
+def _market_rows(
+    market: list[Any],
+    books: list[Any],
+    microstructure: dict[str, Any],
+    volatility: dict[str, Any],
+) -> list[dict[str, Any]]:
     by_book = {row["instrument"]: row for row in books}
     rows: list[dict[str, Any]] = []
     for row in market:
         book = by_book.get(row["instrument"])
+        micro = microstructure.get(row["instrument"], {})
+        vol = volatility.get(row["instrument"], {})
         rows.append(
             {
                 "instrument": row["instrument"],
@@ -181,6 +259,14 @@ def _market_rows(market: list[Any], books: list[Any]) -> list[dict[str, Any]]:
                 "best_bid": None if book is None else book["best_bid"],
                 "best_ask": None if book is None else book["best_ask"],
                 "spread_ticks": None if book is None else book["spread_ticks"],
+                "spread_bps": micro.get("spread_bps"),
+                "pressure_score": micro.get("pressure_score"),
+                "liquidity_score": micro.get("liquidity_score"),
+                "thin_book": micro.get("thin_book_flag"),
+                "orderbook_flip": micro.get("orderbook_flip_flag"),
+                "volatility_regime": vol.get("volatility_regime"),
+                "impulse_score": vol.get("impulse_score"),
+                "chop_score": vol.get("chop_score"),
             }
         )
     return rows
@@ -247,6 +333,90 @@ def _instrument_comparison(storage: SQLiteJournal, market: list[Any]) -> list[di
             }
         )
     return result
+
+
+def _latest_by_instrument(storage: SQLiteJournal, base_query: str) -> dict[str, dict[str, Any]]:
+    rows = storage.fetch_all(f"{base_query} ORDER BY timestamp_utc")
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        latest[row["instrument"]] = _row_dict(row)
+    return latest
+
+
+def _performance_by_stop_ticks(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT stop_ticks,
+               COUNT(*) AS trades,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_trades,
+               SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_trades,
+               SUM(CASE WHEN exit_reason IN ('stop_loss', 'protected_stop') THEN 1 ELSE 0 END)
+                   AS stops,
+               AVG(mfe_ticks) AS avg_mfe_ticks,
+               AVG(mae_ticks) AS avg_mae_ticks
+        FROM shadow_trades
+        GROUP BY stop_ticks
+        ORDER BY stop_ticks
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _mfe_mae_distribution(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument, stop_ticks,
+               MIN(mfe_ticks) AS min_mfe,
+               AVG(mfe_ticks) AS avg_mfe,
+               MAX(mfe_ticks) AS max_mfe,
+               MIN(mae_ticks) AS min_mae,
+               AVG(mae_ticks) AS avg_mae,
+               MAX(mae_ticks) AS max_mae
+        FROM shadow_trades
+        GROUP BY instrument, stop_ticks
+        ORDER BY instrument, stop_ticks
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _stop_comparison(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument, stop_ticks, protection_trigger_bps, trailing_mode, trades_count,
+               stops_count, winrate, expectancy, profit_factor, p90_mfe, p95_mfe,
+               big_runner_count
+        FROM shadow_stop_experiments
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM shadow_stop_experiments
+            GROUP BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        )
+        ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _daily_summary(storage: SQLiteJournal) -> dict[str, Any]:
+    rows = storage.fetch_all(
+        """
+        SELECT COUNT(*) AS shadow_trades,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_shadow_trades,
+               SUM(CASE WHEN protection_activated = 1 THEN 1 ELSE 0 END) AS protected_trades,
+               SUM(CASE WHEN exit_reason IN ('trailing_runner', 'protected_exit') THEN 1 ELSE 0 END)
+                   AS trailed_or_protected_exits,
+               MAX(mfe_ticks) AS max_mfe_ticks,
+               MIN(mae_ticks) AS min_mae_ticks
+        FROM shadow_trades
+        """
+    )
+    counts = SQLiteJournal(storage.path).table_counts()
+    summary = _row_dict(rows[0]) if rows else {}
+    summary["counts"] = counts
+    summary["real_orders_disabled"] = True
+    summary["token_masked"] = True
+    return summary
 
 
 def _equity_curve(storage: SQLiteJournal, bot_rows: list[Any]) -> list[dict[str, Any]]:

@@ -34,6 +34,7 @@ EXCLUDED_DIR_NAMES: Final = {
     "__pycache__",
     "build",
     "dist",
+    "reports",
     "review_bundle",
 }
 EXCLUDED_FILE_NAMES: Final = {
@@ -93,6 +94,7 @@ def main() -> int:
         check_feature_store_exists,
         check_research_backtest_runner_exists,
         check_strategy_validation_exists,
+        check_robustness_sprint_exists,
         check_research_config_exists,
         check_auto_from_data_supported,
         check_research_only_strategy_not_live_imported,
@@ -963,6 +965,44 @@ def check_strategy_validation_exists() -> AuditResult:
     )
 
 
+def check_robustness_sprint_exists() -> AuditResult:
+    module = ROOT / "neo_trader" / "research" / "robustness.py"
+    script = ROOT / "scripts" / "run_robustness_sprint.py"
+    config = ROOT / "configs" / "active_universe_top3.yaml"
+    if not module.exists() or not script.exists() or not config.exists():
+        return AuditResult(
+            "robustness sprint exists",
+            False,
+            "missing robustness.py, run_robustness_sprint.py, or active_universe_top3.yaml",
+        )
+    source = module.read_text(encoding="utf-8")
+    script_source = script.read_text(encoding="utf-8")
+    required = (
+        "build_robustness_report",
+        "robustness_sprint_",
+        "walk_forward",
+        "slippage_x2",
+        "slippage_x3",
+        "remove_best_instrument",
+        "active_universe_next.yaml",
+        "run_data_recorder.py",
+        "analyze_recording_quality.py",
+        "build_feature_store.py",
+        "run_research_backtest.py",
+    )
+    combined = source + "\n" + script_source
+    missing = [snippet for snippet in required if snippet not in combined]
+    return AuditResult(
+        name="robustness sprint exists",
+        passed=not missing,
+        detail=(
+            "top-3 cycle runner and aggregate robustness reports found"
+            if not missing
+            else "missing: " + ", ".join(missing)
+        ),
+    )
+
+
 def check_research_config_exists() -> AuditResult:
     path = ROOT / "configs" / "research.yaml"
     if not path.exists():
@@ -1213,6 +1253,10 @@ def _iter_text_files() -> Iterable[Path]:
 
 def _looks_like_placeholder(value: str) -> bool:
     normalized = value.strip().lower()
+    if "{" in normalized or "}" in normalized:
+        return True
+    if "put-token-in-server-secret-env" in normalized:
+        return True
     return normalized in {
         "changeme",
         "example",
@@ -1233,8 +1277,10 @@ def _research_boundary_paths() -> tuple[Path, ...]:
         ROOT / "scripts" / "build_feature_store.py",
         ROOT / "scripts" / "discover_neoassets.py",
         ROOT / "scripts" / "run_research_backtest.py",
+        ROOT / "scripts" / "run_robustness_sprint.py",
         ROOT / "scripts" / "validate_strategy.py",
         ROOT / "neo_trader" / "research" / "neoassets.py",
+        ROOT / "neo_trader" / "research" / "robustness.py",
         ROOT / "neo_trader" / "research" / "strategy_validation.py",
         ROOT / "neo_trader" / "research" / "universe_selector.py",
         ROOT / "neo_trader" / "research" / "feature_store.py",

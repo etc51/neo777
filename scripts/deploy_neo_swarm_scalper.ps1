@@ -74,17 +74,20 @@ elif [ ! -f /etc/neo-trader/neo-swarm-scalper.env ]; then
   sudo install -m 600 -o root -g root "$RemoteDir/deploy/neo-swarm-scalper.env.example" /etc/neo-trader/neo-swarm-scalper.env
 fi
 sudo sed -i 's/\r$//' /etc/neo-trader/neo-swarm-scalper.env
-sudo cp "$RemoteDir/deploy/neo-swarm-scalper.service" /etc/systemd/system/neo-swarm-scalper.service
-sudo cp "$RemoteDir/deploy/neo-swarm-scalper-dashboard.service" /etc/systemd/system/neo-swarm-scalper-dashboard.service
-sudo sed -i "s#/opt/neo_trader#$RemoteDir#g; s#User=neo-trader#User=$ServiceUser#g; s#Group=neo-trader#Group=$ServiceUser#g" /etc/systemd/system/neo-swarm-scalper.service /etc/systemd/system/neo-swarm-scalper-dashboard.service
-sudo sed -i "s#--server.port 8025#--server.port $DashboardPort#g" /etc/systemd/system/neo-swarm-scalper-dashboard.service
+sudo cp "$RemoteDir/deploy/neo-swarm-bot.service" /etc/systemd/system/neo-swarm-bot.service
+sudo cp "$RemoteDir/deploy/neo-swarm-dashboard.service" /etc/systemd/system/neo-swarm-dashboard.service
+sudo sed -i "s#/opt/neo_trader#$RemoteDir#g; s#User=neo-trader#User=$ServiceUser#g; s#Group=neo-trader#Group=$ServiceUser#g" /etc/systemd/system/neo-swarm-bot.service /etc/systemd/system/neo-swarm-dashboard.service
+sudo sed -i "s#--server.port 8025#--server.port $DashboardPort#g" /etc/systemd/system/neo-swarm-dashboard.service
 sudo chown -R "${ServiceUser}:${ServiceUser}" "$RemoteDir"
+sudo systemctl stop neo-swarm-dashboard.service || true
+sudo pkill -u "$ServiceUser" -f "neo_swarm_scalper/dashboard.py.*$DashboardPort" || true
 sudo systemctl daemon-reload
-sudo systemctl enable --now neo-swarm-scalper.service
-sudo systemctl enable --now neo-swarm-scalper-dashboard.service
-sudo systemctl restart neo-swarm-scalper.service neo-swarm-scalper-dashboard.service
-sudo systemctl --no-pager --lines=20 status neo-swarm-scalper.service || true
-sudo systemctl --no-pager --lines=20 status neo-swarm-scalper-dashboard.service || true
+sudo systemctl enable neo-swarm-bot.service neo-swarm-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl restart neo-swarm-bot.service
+sudo systemctl start neo-swarm-dashboard.service
+sudo systemctl --no-pager --lines=20 status neo-swarm-bot.service || true
+sudo systemctl --no-pager --lines=20 status neo-swarm-dashboard.service || true
 "@
 
 $remoteArgs = @()
@@ -94,4 +97,4 @@ Invoke-CheckedWithInput -InputText $remoteScript -FilePath "ssh" -Arguments $rem
 Remove-Item -LiteralPath $archive -Force
 
 Write-Output "Dashboard: http://${HostName}:$DashboardPort/"
-Write-Output "Services: neo-swarm-scalper.service, neo-swarm-scalper-dashboard.service"
+Write-Output "Services: neo-swarm-bot.service, neo-swarm-dashboard.service"

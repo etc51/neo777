@@ -194,6 +194,11 @@ class NeoMarketDataFeed:
                     )
                 self._record_optional_market_events(metadata, snapshot.timestamp_utc)
             except Exception as exc:  # noqa: BLE001 - feed must keep the other instrument alive.
+                fallback = self._fallback_snapshot(metadata, timestamp_utc or datetime.now(UTC))
+                if fallback is not None:
+                    snapshots.append(fallback)
+                    self.storage.record_market_snapshot(fallback)
+                    self._record_optional_market_events(metadata, fallback.timestamp_utc)
                 self.storage.record_data_quality(
                     timestamp_utc=datetime.now(UTC),
                     instrument=metadata.name,
@@ -202,6 +207,43 @@ class NeoMarketDataFeed:
                     details=mask_token_like_text(str(exc)),
                 )
         return tuple(snapshots)
+
+    def _fallback_snapshot(
+        self,
+        metadata: InstrumentMetadata,
+        timestamp_utc: datetime,
+    ) -> MarketSnapshot | None:
+        provider = self._provider
+        if provider is None:
+            return None
+        price: Decimal | None = None
+        try:
+            for raw in provider.get_recent_trades(metadata.instrument_id):
+                event = _trade_from_raw(raw, timestamp_utc)
+                if event is not None:
+                    price = event["price"]
+                    break
+        except Exception as exc:  # noqa: BLE001 - fallback best effort only.
+            self.storage.record_data_quality(
+                timestamp_utc=timestamp_utc,
+                instrument=metadata.name,
+                issue_type="fallback_last_price_unavailable",
+                severity="warning",
+                details=mask_token_like_text(str(exc)),
+            )
+        if price is None:
+            return None
+        return MarketSnapshot(
+            timestamp_utc=timestamp_utc,
+            instrument=metadata.name,
+            metadata=metadata,
+            last_price=price,
+            bid_levels=(),
+            ask_levels=(),
+            orderbook_missing=True,
+            stale=False,
+            raw={"fallback": "last_price_after_orderbook_error"},
+        )
 
     def _record_optional_market_events(
         self,
@@ -340,9 +382,23 @@ def _with_status(
 
 def _queries_for(instrument_name: str) -> tuple[str, ...]:
     if instrument_name == "neobitcoin":
-        return ("BTCUSDperpA", "Neo Bitcoin", "Необиткоин", "bitcoin", "neo bitcoin")
+        return (
+            "BTCUSDperpA",
+            "NEOBITOK",
+            "Neo Bitcoin",
+            "Необиткоин",
+            "bitcoin",
+            "neo bitcoin",
+        )
     if instrument_name == "neoether":
-        return ("ETHUSDperpA", "Neo Ethereum", "Неоэфир", "ethereum", "neo ethereum")
+        return (
+            "ETHUSDperpA",
+            "NEOEFIR",
+            "Neo Ethereum",
+            "Неоэфир",
+            "ethereum",
+            "neo ethereum",
+        )
     return (instrument_name,)
 
 

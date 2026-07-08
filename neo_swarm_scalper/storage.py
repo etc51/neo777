@@ -146,6 +146,20 @@ class SQLiteJournal:
                     _json({"price": price, "quantity": quantity, "side": side, "raw": raw}),
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO raw_trades(timestamp_utc, instrument, price, quantity, side, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    instrument,
+                    _num(price),
+                    _num(quantity),
+                    side,
+                    _json(raw),
+                ),
+            )
             conn.commit()
 
     def record_candle(
@@ -650,11 +664,23 @@ class SQLiteJournal:
 
     def table_counts(self) -> dict[str, int]:
         tables = (
+            "instruments",
             "market_events",
+            "raw_orderbook_snapshots",
+            "raw_trades",
+            "raw_quotes",
             "orderbook_snapshots",
             "candles",
             "candles_5m",
             "features",
+            "microstructure_features",
+            "volatility_features",
+            "money_flow_features",
+            "shadow_signals",
+            "shadow_trades",
+            "shadow_trade_events",
+            "shadow_stop_experiments",
+            "mfe_mae_tracking",
             "baskets",
             "basket_legs",
             "bot_decisions",
@@ -663,7 +689,9 @@ class SQLiteJournal:
             "simulated_fills",
             "positions",
             "trades",
+            "system_health",
             "data_quality",
+            "errors",
         )
         with self.connect() as conn:
             return {
@@ -771,12 +799,65 @@ def _migrate_account_column(conn: sqlite3.Connection) -> None:
 
 
 SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS instruments (
+    name TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    figi TEXT,
+    class_code TEXT,
+    uid TEXT,
+    lot INTEGER,
+    tick_size REAL,
+    trading_status TEXT,
+    currency TEXT,
+    exchange_code TEXT,
+    instrument_type TEXT,
+    raw_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc TEXT NOT NULL,
     instrument TEXT NOT NULL,
     event_type TEXT NOT NULL,
     last_price REAL,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_orderbook_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    best_bid REAL,
+    best_ask REAL,
+    spread_bps REAL,
+    depth_bid_3 REAL,
+    depth_ask_3 REAL,
+    bids_json TEXT NOT NULL,
+    asks_json TEXT NOT NULL,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    price REAL,
+    quantity REAL,
+    side TEXT,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    mid REAL,
+    spread_abs REAL,
+    spread_bps REAL,
     raw_json TEXT NOT NULL
 );
 
@@ -821,6 +902,76 @@ CREATE TABLE IF NOT EXISTS features (
     feature_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS microstructure_features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    mid REAL,
+    spread_abs REAL,
+    spread_ticks REAL,
+    spread_bps REAL,
+    top_bid_qty REAL,
+    top_ask_qty REAL,
+    depth_bid_3 REAL,
+    depth_bid_5 REAL,
+    depth_bid_10 REAL,
+    depth_ask_3 REAL,
+    depth_ask_5 REAL,
+    depth_ask_10 REAL,
+    orderbook_imbalance_3 REAL,
+    orderbook_imbalance_5 REAL,
+    orderbook_imbalance_10 REAL,
+    microprice REAL,
+    microprice_deviation REAL,
+    pressure_score REAL,
+    liquidity_score REAL,
+    book_slope REAL,
+    wall_detect_bid INTEGER,
+    wall_detect_ask INTEGER,
+    spread_expansion_flag INTEGER,
+    spread_compression_flag INTEGER,
+    quote_stability REAL,
+    orderbook_flip_flag INTEGER,
+    stale_orderbook_flag INTEGER,
+    thin_book_flag INTEGER,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS volatility_features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    realized_volatility_10s REAL,
+    realized_volatility_30s REAL,
+    realized_volatility_1m REAL,
+    realized_volatility_3m REAL,
+    realized_volatility_5m REAL,
+    realized_volatility_15m REAL,
+    atr_range REAL,
+    tick_velocity REAL,
+    price_velocity REAL,
+    acceleration REAL,
+    range_position REAL,
+    breakout_flag INTEGER,
+    range_flag INTEGER,
+    impulse_score REAL,
+    chop_score REAL,
+    volatility_regime TEXT NOT NULL,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS money_flow_features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    mfi REAL,
+    money_flow_direction TEXT NOT NULL,
+    volume_proxy REAL,
+    raw_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS virtual_accounts (
     {ACCT_COL} TEXT PRIMARY KEY,
     bot_id TEXT NOT NULL,
@@ -836,6 +987,105 @@ CREATE TABLE IF NOT EXISTS virtual_accounts (
     entry_time TEXT,
     last_update_time TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_signals (
+    signal_id TEXT PRIMARY KEY,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    gate_status_json TEXT NOT NULL,
+    features_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_trades (
+    trade_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    stop_ticks INTEGER NOT NULL,
+    protection_trigger_bps REAL NOT NULL,
+    trailing_mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    entry_time TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    theoretical_bid REAL,
+    theoretical_ask REAL,
+    stop_price REAL NOT NULL,
+    exit_time TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+    best_price_after_entry REAL,
+    worst_price_after_entry REAL,
+    mfe_abs REAL NOT NULL DEFAULT 0,
+    mfe_pct REAL NOT NULL DEFAULT 0,
+    mfe_ticks REAL NOT NULL DEFAULT 0,
+    mae_abs REAL NOT NULL DEFAULT 0,
+    mae_pct REAL NOT NULL DEFAULT 0,
+    mae_ticks REAL NOT NULL DEFAULT 0,
+    time_to_mfe_sec REAL,
+    time_to_mae_sec REAL,
+    max_runup_before_exit REAL NOT NULL DEFAULT 0,
+    max_drawdown_before_exit REAL NOT NULL DEFAULT 0,
+    protection_activated INTEGER NOT NULL DEFAULT 0,
+    protection_price REAL,
+    protected_exit_reason TEXT,
+    reentry_index INTEGER NOT NULL DEFAULT 0,
+    consecutive_stop_index INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS shadow_trade_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    price REAL,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_stop_experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    stop_ticks INTEGER NOT NULL,
+    protection_trigger_bps REAL NOT NULL,
+    trailing_mode TEXT NOT NULL,
+    trades_count INTEGER NOT NULL,
+    stops_count INTEGER NOT NULL,
+    reentries_count INTEGER NOT NULL,
+    winrate REAL NOT NULL,
+    avg_loss_ticks REAL NOT NULL,
+    avg_win_ticks REAL NOT NULL,
+    expectancy REAL NOT NULL,
+    profit_factor REAL NOT NULL,
+    median_mfe REAL NOT NULL,
+    median_mae REAL NOT NULL,
+    p90_mfe REAL NOT NULL,
+    p95_mfe REAL NOT NULL,
+    max_consecutive_stops INTEGER NOT NULL,
+    time_in_trade_avg REAL NOT NULL,
+    stop_efficiency REAL NOT NULL,
+    protection_reached_rate REAL NOT NULL,
+    protection_saved_count INTEGER NOT NULL,
+    big_runner_count INTEGER NOT NULL,
+    best_context_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mfe_mae_tracking (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    current_price REAL NOT NULL,
+    mfe_abs REAL NOT NULL,
+    mfe_pct REAL NOT NULL,
+    mfe_ticks REAL NOT NULL,
+    mae_abs REAL NOT NULL,
+    mae_pct REAL NOT NULL,
+    mae_ticks REAL NOT NULL,
+    time_to_mfe_sec REAL,
+    time_to_mae_sec REAL
 );
 
 CREATE TABLE IF NOT EXISTS baskets (
@@ -990,6 +1240,25 @@ CREATE TABLE IF NOT EXISTS system_events (
     timestamp_utc TEXT NOT NULL,
     level TEXT NOT NULL,
     component TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_health (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    component TEXT NOT NULL,
+    status TEXT NOT NULL,
+    heartbeat TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    component TEXT NOT NULL,
+    instrument TEXT,
+    error_type TEXT NOT NULL,
     message TEXT NOT NULL,
     details_json TEXT NOT NULL
 );

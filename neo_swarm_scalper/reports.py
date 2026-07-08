@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from neo_swarm_scalper.bots import ACTIVE_BOT_IDS
 from neo_swarm_scalper.config import NeoSwarmScalperConfig
 from neo_swarm_scalper.storage import SQLiteJournal
 
@@ -72,6 +73,36 @@ def build_report_payload(
         LIMIT 5
         """
     )
+    shadow_rows = storage.fetch_all(
+        """
+        SELECT instrument, stop_ticks, protection_trigger_bps, trailing_mode,
+               COUNT(*) AS trades,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_trades,
+               SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_trades,
+               SUM(CASE WHEN exit_reason IN ('stop_loss', 'protected_stop') THEN 1 ELSE 0 END)
+                   AS stops,
+               SUM(CASE WHEN protection_activated = 1 THEN 1 ELSE 0 END) AS protected,
+               MAX(mfe_ticks) AS max_mfe_ticks,
+               MIN(mae_ticks) AS min_mae_ticks
+        FROM shadow_trades
+        GROUP BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        """
+    )
+    latest_experiments = storage.fetch_all(
+        """
+        SELECT instrument, stop_ticks, protection_trigger_bps, trailing_mode, trades_count,
+               stops_count, winrate, expectancy, profit_factor, median_mfe, median_mae,
+               p90_mfe, p95_mfe, big_runner_count
+        FROM shadow_stop_experiments
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM shadow_stop_experiments
+            GROUP BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        )
+        ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        """
+    )
     total_pnl = sum((Decimal(str(row["net_pnl"])) for row in bot_rows), Decimal("0"))
     best_bot = max(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
     worst_bot = min(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
@@ -88,7 +119,30 @@ def build_report_payload(
         "reserve_rub": str(config.simulation.reserve_cash),
         "working_capital_rub": str(config.simulation.working_capital),
         "bots_count": config.simulation.virtual_accounts_count,
-        "max_baskets": config.strategy.max_parallel_baskets,
+        "active_bots": list(ACTIVE_BOT_IDS),
+        "stop_ticks": list(config.tail_catcher.stop_ticks),
+        "protection_trigger_bps": [
+            str(item) for item in config.tail_catcher.protection_trigger_bps
+        ],
+        "trailing_modes": list(config.tail_catcher.trailing_modes),
+        "writes": [
+            "instruments",
+            "raw_orderbook_snapshots",
+            "raw_trades",
+            "raw_quotes",
+            "candles",
+            "microstructure_features",
+            "volatility_features",
+            "money_flow_features",
+            "shadow_signals",
+            "shadow_trades",
+            "shadow_trade_events",
+            "mfe_mae_tracking",
+            "shadow_stop_experiments",
+            "curator_decisions",
+            "system_health",
+            "errors",
+        ],
         "instruments": [
             {"name": item.name, "display_name": item.display_name}
             for item in config.enabled_instruments
@@ -104,10 +158,12 @@ def build_report_payload(
         "data_quality": [_row_dict(row) for row in data_quality_rows],
         "baskets": [_row_dict(row) for row in basket_rows],
         "spread_slippage": [_row_dict(row) for row in spread_rows],
+        "shadow_trades": [_row_dict(row) for row in shadow_rows],
+        "shadow_experiments": [_row_dict(row) for row in latest_experiments],
         "next_steps": [
             "Watch data freshness and orderbook_missing warnings.",
-            "Compare expectancy after at least 30 closed trades per bot.",
-            "Review spread and slippage before increasing bot weights.",
+            "Compare stop_ticks after at least 30 closed shadow trades per instrument.",
+            "Review spread, protection saves, and MFE pullbacks before changing defaults.",
         ],
     }
 
@@ -156,7 +212,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- reserve: {payload['reserve_rub']} RUB",
         f"- working capital: {payload['working_capital_rub']} RUB",
         f"- bots: {payload['bots_count']}",
-        f"- max baskets: {payload['max_baskets']}",
+        f"- active bots: {', '.join(payload['active_bots'])}",
+        f"- stop ticks: {', '.join(str(item) for item in payload['stop_ticks'])}",
+        f"- protection triggers bps: {', '.join(payload['protection_trigger_bps'])}",
+        f"- trailing modes: {', '.join(payload['trailing_modes'])}",
         f"- final report: {payload['final']}",
         "",
         "## Instruments",
@@ -178,6 +237,48 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"- total paper PnL: {payload['total_paper_pnl']}",
             f"- simulated orders: {counts['simulated_orders']}",
             f"- simulated fills: {counts['simulated_fills']}",
+            "",
+            "## Bot Writes",
+            "",
+        ]
+    )
+    lines.extend(f"- {item}" for item in payload["writes"])
+    lines.extend(
+        [
+            "",
+            "## Shadow Trades",
+            "",
+            "| instrument | stop_ticks | protection_bps | trailing | trades | open | "
+            "closed | stops | protected | max_mfe_ticks | min_mae_ticks |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in payload["shadow_trades"]:
+        lines.append(
+            f"| {row['instrument']} | {row['stop_ticks']} | {row['protection_trigger_bps']} | "
+            f"{row['trailing_mode']} | {row['trades']} | {row['open_trades']} | "
+            f"{row['closed_trades']} | {row['stops']} | {row['protected']} | "
+            f"{row['max_mfe_ticks']} | {row['min_mae_ticks']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Stop Experiments",
+            "",
+            "| instrument | stop_ticks | protection_bps | trailing | trades | stops | "
+            "winrate | expectancy | profit_factor | p90_mfe | p95_mfe | big_runners |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in payload["shadow_experiments"]:
+        lines.append(
+            f"| {row['instrument']} | {row['stop_ticks']} | {row['protection_trigger_bps']} | "
+            f"{row['trailing_mode']} | {row['trades_count']} | {row['stops_count']} | "
+            f"{row['winrate']} | {row['expectancy']} | {row['profit_factor']} | "
+            f"{row['p90_mfe']} | {row['p95_mfe']} | {row['big_runner_count']} |"
+        )
+    lines.extend(
+        [
             "",
             "## Baskets",
             "",

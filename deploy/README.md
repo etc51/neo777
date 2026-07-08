@@ -3,6 +3,20 @@
 This deploy scaffold runs the swarm as a 24/7 live-data paper/read-only Linux service.
 It does not enable live trading.
 
+## Neo Tail-Catcher Services
+
+`neo_swarm_scalper` runs the NEOBITOK/NEOEFIR tail-catcher in paper/shadow mode.
+Use `scripts/deploy_neo_swarm_scalper.ps1` from Windows to install:
+
+- `neo-swarm-bot.service`
+- `neo-swarm-dashboard.service`
+
+The server env file is `/etc/neo-trader/neo-swarm-scalper.env`; set
+`TBANK_TOKEN` there and keep all safety flags false/read-only. The bot writes
+SQLite data to `/opt/neo_trader/data/neo_swarm_scalper.sqlite` and reports to
+`/opt/neo_trader/reports/neo_swarm_scalper`. The dashboard listens on port
+`8025`.
+
 ## Services
 
 - `neo-universal-swarm.service` polls T-Bank read-only order books, runs the

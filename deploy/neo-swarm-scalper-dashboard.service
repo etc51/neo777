@@ -1,5 +1,5 @@
 [Unit]
-Description=neo_swarm_scalper Streamlit dashboard
+Description=neo_swarm_scalper NEOBITOK/NEOEFIR Streamlit dashboard
 After=network-online.target neo-swarm-scalper.service
 Wants=network-online.target
 
@@ -9,7 +9,10 @@ User=neo-trader
 Group=neo-trader
 WorkingDirectory=/opt/neo_trader
 EnvironmentFile=/etc/neo-trader/neo-swarm-scalper.env
-ExecStart=/opt/neo_trader/.venv/bin/streamlit run src/neo_swarm_scalper/dashboard.py --server.port 8025 --server.address 0.0.0.0 --server.headless true -- --db data/neo_swarm_scalper.sqlite
+Environment=REAL_TRADING_ENABLED=false
+Environment=ALLOW_REAL_ORDERS=false
+Environment=PAPER_LIVE_DATA_ONLY=true
+ExecStart=/opt/neo_trader/.venv/bin/streamlit run neo_swarm_scalper/dashboard.py --server.port 8025 --server.address 0.0.0.0 --server.headless true -- --db data/neo_swarm_scalper.sqlite
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

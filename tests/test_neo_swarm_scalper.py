@@ -1,18 +1,35 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
-from neo_swarm_scalper.basket import BasketEngine, execution_cost_bps, fill_price
-from neo_swarm_scalper.bots import build_default_bots
+import pytest
+
+from neo_swarm_scalper.bots import ACTIVE_BOT_IDS, build_default_bots
 from neo_swarm_scalper.config import load_config
 from neo_swarm_scalper.dashboard import load_dashboard_state
 from neo_swarm_scalper.reports import write_report
 from neo_swarm_scalper.run import MockNeoMarketDataProvider, run_swarm
 from neo_swarm_scalper.safety import apply_paper_safety_env, mask_token_like_text
 from neo_swarm_scalper.storage import SQLiteJournal
-from neo_swarm_scalper.types import BookLevel, InstrumentMetadata, MarketSnapshot, Side
+
+
+@pytest.fixture(scope="module")
+def smoke_storage(tmp_path_factory: pytest.TempPathFactory) -> SQLiteJournal:
+    tmp_path = tmp_path_factory.mktemp("neo_tail_catcher")
+    result = run_swarm(
+        load_config(),
+        max_cycles=4,
+        poll_interval_sec=0,
+        provider=MockNeoMarketDataProvider(),
+        db_path=tmp_path / "neo_swarm_scalper.sqlite",
+        reports_dir=tmp_path / "reports",
+        sleep=lambda _: None,
+    )
+    return SQLiteJournal(result.db_path)
 
 
 def test_no_real_orders_called() -> None:
@@ -23,12 +40,16 @@ def test_no_real_orders_called() -> None:
         assert token not in source
 
 
-def test_token_not_logged(capsys, tmp_path: Path, monkeypatch) -> None:
+def test_token_not_logged(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     secret = "t." + ("x" * 80)
     monkeypatch.setenv("TBANK_TOKEN", secret)
     result = run_swarm(
         load_config(),
-        max_cycles=2,
+        max_cycles=1,
         poll_interval_sec=0,
         provider=MockNeoMarketDataProvider(),
         db_path=tmp_path / "s.sqlite",
@@ -46,188 +67,187 @@ def test_env_not_committed_and_safety_flags() -> None:
     flags = apply_paper_safety_env()
     gitignore = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
     assert ".env" in gitignore
+    assert "data/*.sqlite" in gitignore
+    assert "reports/" in gitignore
     assert flags["REAL_TRADING_ENABLED"] == "false"
     assert flags["ALLOW_REAL_ORDERS"] == "false"
     assert flags["PAPER_LIVE_DATA_ONLY"] == "true"
 
 
-def test_10_bots_created() -> None:
+def test_config_matches_tail_catcher_tz() -> None:
+    config = load_config()
+    assert {item.name for item in config.enabled_instruments} == {"neobitcoin", "neoether"}
+    assert config.tail_catcher.stop_ticks == (2, 3, 4, 5, 7, 10)
+    assert config.tail_catcher.default_protection_trigger_bps == Decimal("15")
+    assert config.real_orders_enabled is False
+    assert config.paper_trading_enabled is True
+
+
+def test_component_accounts_created() -> None:
     bots = build_default_bots(load_config())
-    assert len(bots) == 10
-    assert all(bot.allowed_instruments == ("neoether",) for bot in bots)
+    assert tuple(bot.bot_id for bot in bots) == ACTIVE_BOT_IDS
+    assert len(bots) == 2
+    assert {bot.allowed_instruments[0] for bot in bots} == {"neobitcoin", "neoether"}
 
 
-def test_2_baskets_created(tmp_path: Path) -> None:
-    storage = _run(tmp_path, cycles=20)
-    counts = storage.table_counts()
-    assert counts["baskets"] >= 2
-
-
-def test_basket_entry_rule() -> None:
-    config = load_config()
-    engine = BasketEngine(config)
-    assert engine.can_enter(_candles(range_bps=Decimal("130")), _snapshot())
-    assert not engine.can_enter(_candles(range_bps=Decimal("100")), _snapshot())
-
-
-def test_rescue_short_rule() -> None:
-    config = load_config()
-    engine = BasketEngine(config)
-    basket = engine.open_basket(
-        name="A",
-        bot_ids=tuple(f"bot_{i:02d}" for i in range(1, 6)),
-        account_refs=tuple(f"sim_{i:02d}" for i in range(1, 6)),
-        snapshot=_snapshot(mid=Decimal("100")),
-        now=_now(),
+def test_runtime_writes_required_tables(smoke_storage: SQLiteJournal) -> None:
+    counts = smoke_storage.table_counts()
+    required = (
+        "instruments",
+        "raw_orderbook_snapshots",
+        "raw_trades",
+        "raw_quotes",
+        "microstructure_features",
+        "volatility_features",
+        "money_flow_features",
+        "shadow_signals",
+        "shadow_trades",
+        "shadow_trade_events",
+        "mfe_mae_tracking",
+        "shadow_stop_experiments",
+        "system_health",
     )
-    leg = engine.maybe_rescue(basket, _snapshot(mid=Decimal("100.71")), _now())
-    assert leg is not None
-    assert leg.side.value == "SHORT"
+    for table in required:
+        assert counts[table] > 0, table
+    instruments = {
+        row["name"] for row in smoke_storage.fetch_all("SELECT name FROM instruments ORDER BY name")
+    }
+    assert instruments == {"neobitcoin", "neoether"}
 
 
-def test_rescue_long_rule() -> None:
-    config = load_config()
-    engine = BasketEngine(config)
-    basket = engine.open_basket(
-        name="A",
-        bot_ids=tuple(f"bot_{i:02d}" for i in range(1, 6)),
-        account_refs=tuple(f"sim_{i:02d}" for i in range(1, 6)),
-        snapshot=_snapshot(mid=Decimal("100")),
-        now=_now(),
-    )
-    leg = engine.maybe_rescue(
-        basket,
-        _snapshot(bid=Decimal("99.29"), ask=Decimal("99.29")),
-        _now(),
-    )
-    assert leg is not None
-    assert leg.side.value == "LONG"
-
-
-def test_basket_take_60_bps() -> None:
-    basket, engine = _basket_for_exit()
-    basket.legs = basket.legs[:1]
-    assert engine.close_reason(basket, _snapshot(mid=Decimal("101.0")), _now()) == "TAKE_60_BPS"
-
-
-def test_basket_stop_minus_250_bps() -> None:
-    basket, engine = _basket_for_exit()
-    basket.legs = basket.legs[:1]
-    assert (
-        engine.close_reason(basket, _snapshot(mid=Decimal("97.0")), _now())
-        == "STOP_MINUS_250_BPS"
-    )
-
-
-def test_time_stop_60_min() -> None:
-    basket, engine = _basket_for_exit()
-    assert (
-        engine.close_reason(
-            basket,
-            _snapshot(mid=Decimal("100")),
-            _now() + timedelta(minutes=60),
+def test_shadow_stop_matrix(smoke_storage: SQLiteJournal) -> None:
+    stop_ticks = {
+        row["stop_ticks"]
+        for row in smoke_storage.fetch_all("SELECT DISTINCT stop_ticks FROM shadow_trades")
+    }
+    triggers = {
+        Decimal(str(row["protection_trigger_bps"]))
+        for row in smoke_storage.fetch_all(
+            "SELECT DISTINCT protection_trigger_bps FROM shadow_trades"
         )
-        == "TIME_STOP_60_MIN"
+    }
+    trailing = {
+        row["trailing_mode"]
+        for row in smoke_storage.fetch_all("SELECT DISTINCT trailing_mode FROM shadow_trades")
+    }
+    assert stop_ticks == {2, 3, 4, 5, 7, 10}
+    assert triggers == {Decimal("10.0"), Decimal("15.0"), Decimal("20.0")}
+    assert trailing == {"tight", "normal", "loose", "microstructure_adaptive"}
+
+
+def test_paper_fill_uses_bid_ask(smoke_storage: SQLiteJournal) -> None:
+    row = smoke_storage.fetch_all(
+        """
+        SELECT st.entry_price, st.theoretical_ask, i.tick_size
+        FROM shadow_trades st
+        JOIN instruments i ON i.name = st.instrument
+        WHERE st.side = 'LONG'
+        LIMIT 1
+        """
+    )[0]
+    assert float(row["entry_price"]) == pytest.approx(
+        float(Decimal(str(row["theoretical_ask"])) + Decimal(str(row["tick_size"])))
     )
 
 
-def test_spread_hard_block() -> None:
-    config = load_config()
-    wide = _snapshot(bid=Decimal("99"), ask=Decimal("101"))
-    assert execution_cost_bps(wide, config) > Decimal("3")
-    assert not BasketEngine(config).can_enter(_candles(range_bps=Decimal("130")), wide)
+def test_protection_and_trailing(smoke_storage: SQLiteJournal) -> None:
+    protected_count = smoke_storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM shadow_trades WHERE protection_activated = 1"
+    )[0]["count"]
+    trailing_count = smoke_storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM shadow_trade_events WHERE event_type = 'trailing_runner'"
+    )[0]["count"]
+    assert protected_count > 0
+    assert trailing_count > 0
+    rows = smoke_storage.fetch_all(
+        """
+        SELECT side, entry_price, exit_price
+        FROM shadow_trades
+        WHERE exit_reason IN ('protected_exit', 'protected_panic_exit')
+        """
+    )
+    for row in rows:
+        if row["side"] == "LONG":
+            assert Decimal(str(row["exit_price"])) >= Decimal(str(row["entry_price"]))
+        else:
+            assert Decimal(str(row["exit_price"])) <= Decimal(str(row["entry_price"]))
 
 
-def test_paper_fill_uses_bid_ask() -> None:
-    config = load_config()
-    snap = _snapshot(bid=Decimal("100"), ask=Decimal("101"))
-    assert fill_price(snap, Side.BUY, config) == Decimal("101.01")
-    assert fill_price(snap, Side.SELL, config) == Decimal("99.99")
+def test_reentry_after_stop(tmp_path: Path) -> None:
+    result = run_swarm(
+        load_config(),
+        max_cycles=2,
+        poll_interval_sec=0,
+        provider=StopThenRecoverProvider(),
+        db_path=tmp_path / "reentry.sqlite",
+        reports_dir=tmp_path / "reports",
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
+    max_reentry = storage.fetch_all("SELECT MAX(reentry_index) AS max_reentry FROM shadow_trades")[
+        0
+    ]["max_reentry"]
+    stop_count = storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM shadow_trades WHERE exit_reason = 'stop_loss'"
+    )[0]["count"]
+    assert stop_count > 0
+    assert max_reentry > 0
 
 
-def test_dashboard_import(tmp_path: Path) -> None:
-    storage = _run(tmp_path, cycles=6)
-    state = load_dashboard_state(storage.path)
-    assert len(state["bots"]) == 10
-    assert "baskets" in state
-    assert "active_legs" in state
+def test_dashboard_import(smoke_storage: SQLiteJournal) -> None:
+    state = load_dashboard_state(smoke_storage.path)
+    assert {row["bot_id"] for row in state["bots"]} == set(ACTIVE_BOT_IDS)
     assert state["market"]
+    assert state["open_shadow_trades"] or state["latest_shadow_trades"]
+    assert state["performance_by_stop_ticks"]
+    assert state["stop_comparison"]
+    assert state["daily_summary"]["real_orders_disabled"] is True
 
 
-def test_report_created(tmp_path: Path) -> None:
-    storage = _run(tmp_path, cycles=6)
+def test_report_created(smoke_storage: SQLiteJournal, tmp_path: Path) -> None:
     path = write_report(
-        storage=storage,
+        storage=smoke_storage,
         config=load_config(),
-        runtime_start=_now(),
+        runtime_start=datetime(2026, 7, 8, tzinfo=UTC),
         reports_dir=tmp_path / "reports",
     )
     text = path.read_text(encoding="utf-8")
     assert path.exists()
     assert "real orders disabled: True" in text
     assert "token masked: True" in text
-    assert "capital: 300000 RUB" in text
+    assert "stop ticks: 2, 3, 4, 5, 7, 10" in text
+    assert "raw_orderbook_snapshots" in text
+    assert "shadow_trades" in text
 
 
-def _run(tmp_path: Path, *, cycles: int) -> SQLiteJournal:
-    result = run_swarm(
-        load_config(),
-        max_cycles=cycles,
-        poll_interval_sec=0,
-        provider=MockNeoMarketDataProvider(),
-        db_path=tmp_path / "neo_swarm_scalper.sqlite",
-        reports_dir=tmp_path / "reports",
-        sleep=lambda _: None,
-    )
-    return SQLiteJournal(result.db_path)
+class StopThenRecoverProvider(MockNeoMarketDataProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._per_instrument_counter: dict[str, int] = {}
 
+    def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
+        count = self._per_instrument_counter.get(instrument_id, 0) + 1
+        self._per_instrument_counter[instrument_id] = count
+        is_btc = "4eff" in instrument_id or "BTC" in instrument_id.upper()
+        base = Decimal("1000") if is_btc else Decimal("100")
+        tick = Decimal("0.1") if is_btc else Decimal("0.01")
+        mid = base if count == 1 else base - (tick * Decimal("12"))
+        bid = mid - tick
+        ask = mid + tick
+        return {
+            "instrumentUid": instrument_id,
+            "depth": depth,
+            "bids": [
+                {"price": str(bid - Decimal(i) * tick), "quantity": 220 + i * 5}
+                for i in range(min(depth, 10))
+            ],
+            "asks": [
+                {"price": str(ask + Decimal(i) * tick), "quantity": 40 + i * 5}
+                for i in range(min(depth, 10))
+            ],
+            "lastPrice": str(mid),
+        }
 
-def _basket_for_exit():
-    config = load_config()
-    engine = BasketEngine(config)
-    basket = engine.open_basket(
-        name="A",
-        bot_ids=tuple(f"bot_{i:02d}" for i in range(1, 6)),
-        account_refs=tuple(f"sim_{i:02d}" for i in range(1, 6)),
-        snapshot=_snapshot(mid=Decimal("100")),
-        now=_now(),
-    )
-    return basket, engine
-
-
-def _candles(*, range_bps: Decimal) -> list[dict[str, Decimal]]:
-    low = Decimal("100")
-    high = low * (Decimal("1") + (range_bps / Decimal("10000")))
-    return [
-        {"open": low, "high": high, "low": low, "close": low, "volume": Decimal("1")}
-        for _ in range(5)
-    ]
-
-
-def _snapshot(
-    *,
-    mid: Decimal = Decimal("100"),
-    bid: Decimal | None = None,
-    ask: Decimal | None = None,
-) -> MarketSnapshot:
-    bid = bid if bid is not None else mid - Decimal("0.01")
-    ask = ask if ask is not None else mid + Decimal("0.01")
-    return MarketSnapshot(
-        timestamp_utc=_now(),
-        instrument="neoether",
-        metadata=InstrumentMetadata(
-            name="neoether",
-            display_name="Neoether",
-            ticker="ETHUSDperpA",
-            figi="ETHUSDPERP00",
-            class_code="SPBDMFUT",
-            min_price_increment=Decimal("0.01"),
-        ),
-        last_price=(bid + ask) / Decimal("2"),
-        bid_levels=(BookLevel(price=bid, quantity=Decimal("10")),),
-        ask_levels=(BookLevel(price=ask, quantity=Decimal("10")),),
-    )
-
-
-def _now() -> datetime:
-    return datetime(2026, 7, 8, tzinfo=UTC)
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        del instrument_id
+        return [{"price": "100", "quantity": "1", "side": "BUY"}]
