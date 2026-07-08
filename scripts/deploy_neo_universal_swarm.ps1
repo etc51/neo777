@@ -27,6 +27,20 @@ function Invoke-Checked {
     }
 }
 
+function Invoke-CheckedWithInput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InputText,
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $InputText | & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed: $FilePath $($Arguments -join ' ')"
+    }
+}
+
 $sshTarget = "$User@$HostName"
 $sshArgs = @()
 if ($SshKey) {
@@ -59,19 +73,27 @@ if [ -f /tmp/neo-universal-swarm.env ]; then
 elif [ ! -f /etc/neo-trader/neo-universal-swarm.env ]; then
   sudo install -m 600 -o root -g root "$RemoteDir/deploy/neo-universal-swarm.env.example" /etc/neo-trader/neo-universal-swarm.env
 fi
+sudo sed -i 's/\r$//' /etc/neo-trader/neo-universal-swarm.env
+if ! sudo grep -q '^SSL_CERT_FILE=' /etc/neo-trader/neo-universal-swarm.env && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+  echo 'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt' | sudo tee -a /etc/neo-trader/neo-universal-swarm.env >/dev/null
+fi
 sudo cp "$RemoteDir/deploy/neo-universal-swarm.service" /etc/systemd/system/neo-universal-swarm.service
 sudo cp "$RemoteDir/deploy/neo-universal-swarm-dashboard.service" /etc/systemd/system/neo-universal-swarm-dashboard.service
 sudo sed -i "s#/opt/neo_trader#$RemoteDir#g; s#User=neo-trader#User=$ServiceUser#g; s#Group=neo-trader#Group=$ServiceUser#g" /etc/systemd/system/neo-universal-swarm.service /etc/systemd/system/neo-universal-swarm-dashboard.service
 sudo sed -i "s#--port 8765#--port $DashboardPort#g" /etc/systemd/system/neo-universal-swarm-dashboard.service
-sudo chown -R "$ServiceUser:$ServiceUser" "$RemoteDir"
+sudo chown -R "${ServiceUser}:${ServiceUser}" "$RemoteDir"
 sudo systemctl daemon-reload
 sudo systemctl enable --now neo-universal-swarm.service
 sudo systemctl enable --now neo-universal-swarm-dashboard.service
+sudo systemctl restart neo-universal-swarm.service neo-universal-swarm-dashboard.service
 sudo systemctl --no-pager --lines=20 status neo-universal-swarm.service || true
 sudo systemctl --no-pager --lines=20 status neo-universal-swarm-dashboard.service || true
 "@
 
-Invoke-Checked ssh @sshArgs $sshTarget $remoteScript
+$remoteArgs = @()
+$remoteArgs += $sshArgs
+$remoteArgs += @($sshTarget, "bash", "-s")
+Invoke-CheckedWithInput -InputText $remoteScript -FilePath "ssh" -Arguments $remoteArgs
 Remove-Item -LiteralPath $archive -Force
 
 Write-Output "Dashboard: http://${HostName}:$DashboardPort/"

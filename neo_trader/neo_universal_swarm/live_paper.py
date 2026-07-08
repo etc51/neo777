@@ -568,22 +568,21 @@ def run_live_paper_swarm(
                 metrics = _metrics(labels, curator)
                 recorder.record_metrics(cycle=cycle_number, metrics=metrics, curator=curator)
                 recorder.record_bot_states(cycle=cycle_number, curator=curator)
-                if latest_snapshots:
-                    _write_live_dashboard_state(
-                        resolved_config.dashboard_state_path,
-                        curator=curator,
-                        latest_snapshots=tuple(
-                            latest_snapshots[instrument]
-                            for instrument in sorted(latest_snapshots, key=lambda item: item.value)
-                        ),
-                        metrics=metrics,
-                        updated_at=_as_utc(now()),
-                        learning_state=learning_state,
-                        predictions={
-                            instrument.value: prediction
-                            for instrument, prediction in predictions.items()
-                        },
-                    )
+                _write_live_dashboard_state(
+                    resolved_config.dashboard_state_path,
+                    curator=curator,
+                    latest_snapshots=tuple(
+                        latest_snapshots[instrument]
+                        for instrument in sorted(latest_snapshots, key=lambda item: item.value)
+                    ),
+                    metrics=metrics,
+                    updated_at=_as_utc(now()),
+                    learning_state=learning_state,
+                    predictions={
+                        instrument.value: prediction
+                        for instrument, prediction in predictions.items()
+                    },
+                )
                 _write_online_learning_state(learning_state_path, learning_state)
                 _write_summary_json(
                     resolved_config.reports_dir / "live_paper_summary.json",

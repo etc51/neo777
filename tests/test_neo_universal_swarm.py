@@ -429,6 +429,39 @@ def test_live_paper_records_invalid_empty_orderbook_and_continues(
     assert "EMPTY_ORDERBOOK" in orderbooks
 
 
+def test_live_paper_writes_dashboard_when_all_orderbooks_invalid(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("NEO_TRADER_LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_MODE", "readonly")
+    monkeypatch.setenv("NEO_TRADER_TRADING_MODE", "readonly")
+    provider = _FakeOrderBookProvider((_empty_tbank_book(),))
+
+    cycles = run_live_paper_swarm(
+        LivePaperSwarmConfig(
+            poll_interval_seconds=0.01,
+            reports_dir=tmp_path / "reports",
+            dashboard_state_path=tmp_path / "dashboard.json",
+            heartbeat_path=tmp_path / "heartbeat.txt",
+            instruments=(SwarmInstrument.NEOBITOK,),
+            max_cycles=1,
+        ),
+        provider=provider,
+        sleep=lambda _: None,
+        clock=lambda: datetime(2026, 7, 7, 8, 0, tzinfo=UTC),
+    )
+
+    assert cycles[-1].status == "OK"
+    assert cycles[-1].snapshots == 0
+    dashboard = json.loads((tmp_path / "dashboard.json").read_text(encoding="utf-8"))
+    assert dashboard["runtime_mode"] == "live-paper"
+    assert dashboard["paper_enabled"] is True
+    assert dashboard["live_enabled"] is False
+    assert dashboard["swarm"]["latest_market"] == []
+
+
 def test_live_paper_replays_pair_labels_into_online_learning_state(
     tmp_path: Path,
     monkeypatch,
