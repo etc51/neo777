@@ -1,0 +1,89 @@
+mode: paper_live_data
+real_orders_enabled: false
+paper_trading_enabled: true
+token_env: TBANK_TOKEN
+
+instruments:
+  - name: neobitcoin
+    display_name: Необиткоин
+    ticker: AUTO_DISCOVER
+    figi: AUTO_DISCOVER
+    class_code: AUTO_DISCOVER
+    enabled: true
+  - name: neoether
+    display_name: Неоэфир
+    ticker: AUTO_DISCOVER
+    figi: AUTO_DISCOVER
+    class_code: AUTO_DISCOVER
+    enabled: true
+
+data:
+  use_real_market_data: true
+  orderbook_depth: 20
+  collect_trades: true
+  collect_orderbook: true
+  collect_candles_1m: true
+  collect_candles_5m: true
+  collect_candles_15m: true
+  reconnect: true
+  stale_data_sec: 10
+
+simulation:
+  virtual_accounts_count: 10
+  initial_cash_per_account: 100000
+  base_lot: 1
+  max_position_lots_per_bot: 1
+  allow_long: true
+  allow_short: true
+  allow_averaging: false
+  allow_flip_without_close: false
+  commission_bps: 0
+  use_spread_cost: true
+  use_slippage_cost: true
+  fallback_slippage_ticks: 1
+  max_trade_lifetime_sec: 300
+  close_all_before_session_end: true
+
+risk:
+  no_global_stop_on_paper_loss: true
+  no_disable_due_to_paper_loss: true
+  max_open_positions_per_bot: 1
+  max_open_positions_total: 10
+  max_trades_per_bot_per_day: 1000
+  cooldown_after_loss_sec: 10
+  cooldown_after_win_sec: 3
+
+scalping:
+  take_profit_ticks_min: 3
+  take_profit_ticks_max: 8
+  stop_loss_ticks_min: 2
+  stop_loss_ticks_max: 6
+  time_stop_sec_min: 30
+  time_stop_sec_max: 180
+  spread_max_ticks: 3
+  min_impulse_ticks: 3
+
+curator:
+  enabled: true
+  update_interval_sec: 1
+  scoring_window_trades: 30
+  min_trades_before_weight_change: 10
+  min_weight: 0.05
+  max_weight: 1.00
+  adaptive_tp_sl: true
+  adaptive_cooldown: true
+  adaptive_bot_enable: true
+  shadow_mode_for_bad_bots: true
+
+storage:
+  sqlite_path: data/neo_swarm_scalper.sqlite
+  wal_mode: true
+
+reports:
+  enabled: true
+  interval_sec: 300
+  markdown_dir: reports/neo_swarm_scalper
+
+dashboard:
+  enabled: true
+  port: 8025
