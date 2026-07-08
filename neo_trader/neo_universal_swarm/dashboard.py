@@ -246,6 +246,7 @@ def _metrics_payload(metrics: SwarmMetrics) -> dict[str, object]:
         "pnl_by_regime": _decimal_dict(metrics.pnl_by_regime),
         "rejected_by_model": metrics.rejected_by_model,
         "rejected_by_spread": metrics.rejected_by_spread,
+        "rejected_by_spread_entry_gate": metrics.rejected_by_spread_entry_gate,
         "rejected_by_stale_book": metrics.rejected_by_stale_book,
         "rejected_by_chop": metrics.rejected_by_chop,
         "rejected_by_latency": metrics.rejected_by_latency,

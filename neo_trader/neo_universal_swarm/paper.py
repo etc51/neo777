@@ -205,6 +205,10 @@ def _simulate_once(
         bot_to_account=curator.bot_to_account,
         rejected_by_model=curator.rejections.get(RejectionReason.MODEL, 0),
         rejected_by_spread=curator.rejections.get(RejectionReason.SPREAD, 0),
+        rejected_by_spread_entry_gate=curator.rejections.get(
+            RejectionReason.SPREAD_ENTRY_GATE,
+            0,
+        ),
         rejected_by_stale_book=curator.rejections.get(RejectionReason.STALE_BOOK, 0),
         rejected_by_chop=curator.rejections.get(RejectionReason.CHOP, 0),
         rejected_by_latency=curator.rejections.get(RejectionReason.LATENCY, 0),
@@ -488,6 +492,7 @@ def _metrics_json(metrics: SwarmMetrics) -> dict[str, object]:
         "pnl_by_regime": {key: str(value) for key, value in metrics.pnl_by_regime.items()},
         "rejected_by_model": metrics.rejected_by_model,
         "rejected_by_spread": metrics.rejected_by_spread,
+        "rejected_by_spread_entry_gate": metrics.rejected_by_spread_entry_gate,
         "rejected_by_stale_book": metrics.rejected_by_stale_book,
         "rejected_by_chop": metrics.rejected_by_chop,
         "rejected_by_latency": metrics.rejected_by_latency,

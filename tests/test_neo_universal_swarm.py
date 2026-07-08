@@ -28,6 +28,7 @@ from neo_trader.neo_universal_swarm import (
     run_paper_simulation,
 )
 from neo_trader.neo_universal_swarm.dashboard import build_swarm_dashboard_state
+from neo_trader.neo_universal_swarm.types import RejectionReason
 
 
 def test_accounts_config_loads_ten_paper_only_bots() -> None:
@@ -124,7 +125,7 @@ def test_pair_ev_model_gates_edge_and_rejects_chop() -> None:
 def test_online_learning_allocates_challengers_from_start() -> None:
     state = OnlineLearningState()
 
-    modes = [state.choose_mode(SwarmInstrument.NEOBITOK) for _ in range(20)]
+    modes = [state.choose_mode(SwarmInstrument.NEOBITOK) for _ in range(100)]
 
     assert ExperimentalMode.BASELINE in modes
     assert ExperimentalMode.PERSISTENT_IMBALANCE in modes
@@ -155,9 +156,45 @@ def test_online_learning_reweights_best_and_worst_challengers_after_labels() -> 
 
     allocations = state.instruments[SwarmInstrument.NEOBITOK].allocations
     assert allocations[ExperimentalMode.BASELINE] == Decimal("0.70")
-    assert allocations[ExperimentalMode.PERSISTENT_IMBALANCE] == Decimal("0.20")
-    assert allocations[ExperimentalMode.TICK_VELOCITY] == Decimal("0.05")
+    assert allocations[ExperimentalMode.TRADE_AGGRESSION] == Decimal("0.20")
+    assert allocations[ExperimentalMode.PERSISTENT_IMBALANCE] == Decimal("0.03")
+    assert allocations[ExperimentalMode.TICK_VELOCITY] == Decimal("0.03")
+    assert allocations[ExperimentalMode.WIDE_TRAILING] == Decimal("0.04")
     assert sum(allocations.values(), Decimal("0")) == Decimal("1.00")
+
+
+def test_online_learning_guards_runner_side_none_without_disabling_mode() -> None:
+    state = OnlineLearningState()
+
+    for index in range(4):
+        state.update_label(
+            instrument=SwarmInstrument.NEOBITOK,
+            mode=ExperimentalMode.WIDE_TRAILING,
+            label=_runner_side_none_label(pair_id=f"PAIR_NONE_{index}"),
+        )
+
+    instrument_state = state.instruments[SwarmInstrument.NEOBITOK]
+    effective = instrument_state.to_payload()["effective_mode_allocation"]
+    assert effective[ExperimentalMode.WIDE_TRAILING.value] == "0.01"
+    assert instrument_state.performances[
+        ExperimentalMode.WIDE_TRAILING
+    ].runner_side_none_rate == Decimal("1")
+
+
+def test_pair_ev_model_rejects_strict_entry_spread_gate() -> None:
+    model = PairEVModel(PairEVModelConfig(min_required_ev_ticks=Decimal("0")))
+
+    prediction = model.predict(
+        _snapshot(
+            direction=LegSide.LONG,
+            bid_qty="220",
+            ask_qty="45",
+            ask_offset=Decimal("1.1"),
+        )
+    )
+
+    assert prediction.trade_allowed is False
+    assert prediction.rejection_reason is RejectionReason.SPREAD_ENTRY_GATE
 
 
 def test_curator_assigns_two_free_bots_and_settles_pair() -> None:
@@ -429,6 +466,45 @@ def test_live_paper_records_invalid_empty_orderbook_and_continues(
     assert "EMPTY_ORDERBOOK" in orderbooks
 
 
+def test_live_paper_delays_wide_spread_exit_and_logs_avoidance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("NEO_TRADER_LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_MODE", "readonly")
+    monkeypatch.setenv("NEO_TRADER_TRADING_MODE", "readonly")
+    provider = _FakeOrderBookProvider(
+        (
+            _tbank_book("100", "100.4"),
+            _tbank_book("99", "103"),
+            _tbank_book("101", "101.4"),
+            _tbank_book("104", "104.4"),
+            _tbank_book("103", "103.4"),
+        )
+    )
+
+    cycles = run_live_paper_swarm(
+        LivePaperSwarmConfig(
+            poll_interval_seconds=0.01,
+            reports_dir=tmp_path / "reports",
+            dashboard_state_path=tmp_path / "dashboard.json",
+            heartbeat_path=tmp_path / "heartbeat.txt",
+            instruments=(SwarmInstrument.NEOBITOK,),
+            max_cycles=5,
+        ),
+        provider=provider,
+        sleep=lambda _: None,
+        clock=_advancing_clock(),
+    )
+
+    assert cycles[-1].status == "OK"
+    events = (tmp_path / "reports" / "pair_events.jsonl").read_text(encoding="utf-8")
+    labels = (tmp_path / "reports" / "pair_labels.jsonl").read_text(encoding="utf-8")
+    assert "AVOIDED_WIDE_SPREAD_EXIT" in events
+    assert "WIDE_SPREAD" not in labels
+
+
 def test_live_paper_writes_dashboard_when_all_orderbooks_invalid(
     tmp_path: Path,
     monkeypatch,
@@ -531,6 +607,36 @@ def _pair_label(*, pair_id: str, pnl_ticks: Decimal, fakeout: bool) -> PairLabel
     )
 
 
+def _runner_side_none_label(*, pair_id: str) -> PairLabel:
+    now = datetime.now(UTC)
+    return PairLabel(
+        pair_id=pair_id,
+        instrument=SwarmInstrument.NEOBITOK,
+        entry_timestamp=now - timedelta(minutes=1),
+        exit_timestamp=now,
+        stop_loss_ticks=2,
+        loser_side=None,
+        loser_loss_ticks=Decimal("0"),
+        runner_side=None,
+        runner_mfe_ticks=Decimal("0"),
+        runner_mae_ticks=Decimal("-3"),
+        runner_exit_ticks=Decimal("-3"),
+        pair_total_pnl_ticks=Decimal("-3"),
+        pair_total_pnl_rub=Decimal("-3"),
+        exit_reason=PairExitReason.WIDE_SPREAD,
+        max_adverse_excursion=Decimal("-3"),
+        max_favorable_excursion=Decimal("0"),
+        fakeout_flag=True,
+        runner_success_flag=False,
+        entry_spread_cost_ticks=Decimal("1"),
+        avg_slippage_ticks=Decimal("0"),
+        latency_ms=100,
+        regime=ExperimentalMode.WIDE_TRAILING.value,
+        long_bot_id="BOT_01",
+        short_bot_id="BOT_02",
+    )
+
+
 def _pair_label_record(*, label: PairLabel, mode: ExperimentalMode) -> dict[str, object]:
     return {
         "cycle": 1,
@@ -570,6 +676,7 @@ def _snapshot(
     bid_qty: str,
     ask_qty: str,
     base_bid: Decimal = Decimal("100"),
+    ask_offset: Decimal = Decimal("1"),
     timestamp: datetime | None = None,
 ) -> BookSnapshot:
     tick_velocity = Decimal("0.75") if direction is LegSide.LONG else Decimal("-0.75")
@@ -582,9 +689,9 @@ def _snapshot(
             [base_bid - Decimal("2"), "60"],
         ],
         asks=[
-            [base_bid + Decimal("1"), ask_qty],
-            [base_bid + Decimal("2"), "40"],
-            [base_bid + Decimal("3"), "30"],
+            [base_bid + ask_offset, ask_qty],
+            [base_bid + ask_offset + Decimal("1"), "40"],
+            [base_bid + ask_offset + Decimal("2"), "30"],
         ],
         tick_size=Decimal("1"),
         last_price=base_bid + Decimal("0.5"),
@@ -636,6 +743,17 @@ def _tbank_book(best_bid: str, best_ask: str) -> TBankOrderBookSnapshot:
         limit_down=None,
         raw={},
     )
+
+
+def _advancing_clock():
+    current_time = datetime(2026, 7, 7, 8, 0, tzinfo=UTC)
+
+    def clock() -> datetime:
+        nonlocal current_time
+        current_time += timedelta(milliseconds=100)
+        return current_time
+
+    return clock
 
 
 def _empty_tbank_book() -> TBankOrderBookSnapshot:

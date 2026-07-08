@@ -73,6 +73,7 @@ class RejectionReason(StrEnum):
 
     MODEL = "MODEL"
     SPREAD = "SPREAD"
+    SPREAD_ENTRY_GATE = "SPREAD_ENTRY_GATE"
     STALE_BOOK = "STALE_BOOK"
     CHOP = "CHOP"
     LATENCY = "LATENCY"
@@ -339,6 +340,9 @@ class PairLabel:
     regime: str
     long_bot_id: str | None = None
     short_bot_id: str | None = None
+    avoided_wide_spread_exits: int = 0
+    missed_runner_profit_ticks: Decimal = Decimal("0")
+    trail_lock_4_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -366,6 +370,7 @@ class SwarmMetrics:
     pnl_by_regime: dict[str, Decimal] = field(default_factory=dict)
     rejected_by_model: int = 0
     rejected_by_spread: int = 0
+    rejected_by_spread_entry_gate: int = 0
     rejected_by_stale_book: int = 0
     rejected_by_chop: int = 0
     rejected_by_latency: int = 0

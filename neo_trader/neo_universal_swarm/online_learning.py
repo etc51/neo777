@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
-from neo_trader.neo_universal_swarm.types import PairLabel, SwarmInstrument, decimal_ratio
+from neo_trader.neo_universal_swarm.types import (
+    PairExitReason,
+    PairLabel,
+    SwarmInstrument,
+    decimal_ratio,
+)
 
 
 class ExperimentalMode(StrEnum):
@@ -25,11 +31,16 @@ CHALLENGER_MODES: tuple[ExperimentalMode, ...] = (
     ExperimentalMode.TRADE_AGGRESSION,
     ExperimentalMode.WIDE_TRAILING,
 )
-INITIAL_CHALLENGER: ExperimentalMode = ExperimentalMode.PERSISTENT_IMBALANCE
-BASELINE_ALLOCATION: Decimal = Decimal("0.70")
-BEST_CHALLENGER_ALLOCATION: Decimal = Decimal("0.20")
-EXPLORATION_ALLOCATION: Decimal = Decimal("0.10")
-WORST_MODE_ALLOCATION: Decimal = Decimal("0.05")
+DEFAULT_MODE_ALLOCATIONS: dict[ExperimentalMode, Decimal] = {
+    ExperimentalMode.BASELINE: Decimal("0.70"),
+    ExperimentalMode.TRADE_AGGRESSION: Decimal("0.20"),
+    ExperimentalMode.PERSISTENT_IMBALANCE: Decimal("0.03"),
+    ExperimentalMode.TICK_VELOCITY: Decimal("0.03"),
+    ExperimentalMode.WIDE_TRAILING: Decimal("0.04"),
+}
+MIN_COOLDOWN_ALLOCATION: Decimal = Decimal("0.01")
+RUNNER_SIDE_NONE_COOLDOWN_AFTER: int = 3
+RUNNER_SIDE_NONE_COOLDOWN: timedelta = timedelta(minutes=10)
 
 
 @dataclass
@@ -40,6 +51,10 @@ class ModePerformance:
     total_pnl_ticks: Decimal = Decimal("0")
     fakeouts: int = 0
     runner_reached_breakeven: int = 0
+    runner_side_none: int = 0
+    consecutive_runner_side_none: int = 0
+    wide_spread_closed_pairs: int = 0
+    wide_spread_loss_ticks: Decimal = Decimal("0")
     total_runner_mfe_ticks: Decimal = Decimal("0")
     total_runner_mae_ticks: Decimal = Decimal("0")
 
@@ -50,6 +65,15 @@ class ModePerformance:
             self.fakeouts += 1
         if label.runner_success_flag or label.runner_mfe_ticks >= Decimal(label.stop_loss_ticks):
             self.runner_reached_breakeven += 1
+        if label.runner_side is None:
+            self.runner_side_none += 1
+            self.consecutive_runner_side_none += 1
+        else:
+            self.consecutive_runner_side_none = 0
+        if label.exit_reason is PairExitReason.WIDE_SPREAD:
+            self.wide_spread_closed_pairs += 1
+            if label.pair_total_pnl_ticks < 0:
+                self.wide_spread_loss_ticks += abs(label.pair_total_pnl_ticks)
         self.total_runner_mfe_ticks += label.runner_mfe_ticks
         self.total_runner_mae_ticks += label.runner_mae_ticks
 
@@ -77,6 +101,14 @@ class ModePerformance:
     def avg_runner_mae_ticks(self) -> Decimal:
         return decimal_ratio(self.total_runner_mae_ticks, Decimal(self.closed_pairs))
 
+    @property
+    def runner_side_none_rate(self) -> Decimal:
+        return decimal_ratio(Decimal(self.runner_side_none), Decimal(self.closed_pairs))
+
+    @property
+    def wide_spread_loss_per_trade(self) -> Decimal:
+        return decimal_ratio(self.wide_spread_loss_ticks, Decimal(self.wide_spread_closed_pairs))
+
     def to_payload(self) -> dict[str, object]:
         return {
             "closed_pairs": self.closed_pairs,
@@ -85,10 +117,16 @@ class ModePerformance:
             "avg_pair_pnl": str(self.avg_pair_pnl_ticks),
             "fakeout_rate": str(self.fakeout_rate),
             "runner_to_breakeven_rate": str(self.runner_to_breakeven_rate),
+            "runner_side_none_rate": str(self.runner_side_none_rate),
+            "wide_spread_loss_per_trade": str(self.wide_spread_loss_per_trade),
             "avg_runner_mfe": str(self.avg_runner_mfe_ticks),
             "avg_runner_mae": str(self.avg_runner_mae_ticks),
             "fakeouts": self.fakeouts,
             "runner_reached_breakeven": self.runner_reached_breakeven,
+            "runner_side_none": self.runner_side_none,
+            "consecutive_runner_side_none": self.consecutive_runner_side_none,
+            "wide_spread_closed_pairs": self.wide_spread_closed_pairs,
+            "wide_spread_loss_ticks": str(self.wide_spread_loss_ticks),
         }
 
 
@@ -100,11 +138,12 @@ class InstrumentLearningState:
     allocations: dict[ExperimentalMode, Decimal] = field(default_factory=dict)
     performances: dict[ExperimentalMode, ModePerformance] = field(default_factory=dict)
     active_mode: ExperimentalMode = ExperimentalMode.BASELINE
-    best_challenger: ExperimentalMode = INITIAL_CHALLENGER
+    best_challenger: ExperimentalMode = ExperimentalMode.TRADE_AGGRESSION
     worst_mode: ExperimentalMode = ExperimentalMode.WIDE_TRAILING
     assigned_pairs: int = 0
     closed_pairs: int = 0
     last_recalibrated_at_pairs: int = 0
+    cooldown_until_by_mode: dict[ExperimentalMode, datetime] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.allocations:
@@ -124,8 +163,9 @@ class InstrumentLearningState:
             "10000"
         )
         running = Decimal("0")
+        effective_allocations = self._effective_allocations(datetime.now(UTC))
         for mode in ExperimentalMode:
-            running += self.allocations.get(mode, Decimal("0"))
+            running += effective_allocations.get(mode, Decimal("0"))
             if bucket < running:
                 self.active_mode = mode
                 return mode
@@ -136,6 +176,7 @@ class InstrumentLearningState:
         self.closed_pairs += 1
         self.assigned_pairs = max(self.assigned_pairs, self.closed_pairs)
         self.performances[mode].update(label)
+        self._update_runner_side_none_guard(mode=mode, label=label)
         self._recalculate_allocations()
         if self.closed_pairs % 50 == 0:
             self.last_recalibrated_at_pairs = self.closed_pairs
@@ -154,29 +195,44 @@ class InstrumentLearningState:
                 key=lambda mode: self.performances[mode].ev_ticks,
             )
         else:
-            self.best_challenger = INITIAL_CHALLENGER
+            self.best_challenger = ExperimentalMode.TRADE_AGGRESSION
             self.worst_mode = ExperimentalMode.WIDE_TRAILING
 
-        allocations = {mode: Decimal("0") for mode in ExperimentalMode}
-        allocations[ExperimentalMode.BASELINE] = BASELINE_ALLOCATION
-        allocations[self.best_challenger] = BEST_CHALLENGER_ALLOCATION
-        exploration_modes = [mode for mode in CHALLENGER_MODES if mode != self.best_challenger]
-        if not exploration_modes:
-            self.allocations = allocations
-            return
+        self.allocations = _normalize_allocations(dict(DEFAULT_MODE_ALLOCATIONS))
 
-        if self.worst_mode in exploration_modes and len(exploration_modes) > 1:
-            allocations[self.worst_mode] = WORST_MODE_ALLOCATION
-            remaining = EXPLORATION_ALLOCATION - WORST_MODE_ALLOCATION
-            other_modes = [mode for mode in exploration_modes if mode != self.worst_mode]
-            per_mode = decimal_ratio(remaining, Decimal(len(other_modes)))
-            for mode in other_modes:
-                allocations[mode] = per_mode
-        else:
-            per_mode = decimal_ratio(EXPLORATION_ALLOCATION, Decimal(len(exploration_modes)))
-            for mode in exploration_modes:
-                allocations[mode] = per_mode
-        self.allocations = allocations
+    def _update_runner_side_none_guard(
+        self,
+        *,
+        mode: ExperimentalMode,
+        label: PairLabel,
+    ) -> None:
+        performance = self.performances[mode]
+        if (
+            label.runner_side is None
+            and performance.consecutive_runner_side_none > RUNNER_SIDE_NONE_COOLDOWN_AFTER
+        ):
+            self.cooldown_until_by_mode[mode] = label.exit_timestamp + RUNNER_SIDE_NONE_COOLDOWN
+
+    def _effective_allocations(self, now: datetime) -> dict[ExperimentalMode, Decimal]:
+        allocations = dict(self.allocations)
+        reduced_total = Decimal("0")
+        for mode, cooldown_until in tuple(self.cooldown_until_by_mode.items()):
+            if cooldown_until <= now:
+                self.cooldown_until_by_mode.pop(mode, None)
+                continue
+            current = allocations.get(mode, Decimal("0"))
+            if current > MIN_COOLDOWN_ALLOCATION:
+                reduced_total += current - MIN_COOLDOWN_ALLOCATION
+                allocations[mode] = MIN_COOLDOWN_ALLOCATION
+        if reduced_total:
+            preferred_modes = (
+                ExperimentalMode.BASELINE,
+                ExperimentalMode.TRADE_AGGRESSION,
+            )
+            per_mode = decimal_ratio(reduced_total, Decimal(len(preferred_modes)))
+            for mode in preferred_modes:
+                allocations[mode] = allocations.get(mode, Decimal("0")) + per_mode
+        return _normalize_allocations(allocations)
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -191,6 +247,19 @@ class InstrumentLearningState:
                 mode.value: str(self.allocations.get(mode, Decimal("0")))
                 for mode in ExperimentalMode
             },
+            "effective_mode_allocation": {
+                mode.value: str(
+                    self._effective_allocations(datetime.now(UTC)).get(mode, Decimal("0"))
+                )
+                for mode in ExperimentalMode
+            },
+            "cooldown_until_by_mode": {
+                mode.value: timestamp.isoformat()
+                for mode, timestamp in sorted(
+                    self.cooldown_until_by_mode.items(),
+                    key=lambda item: item[0].value,
+                )
+            },
             "ev_by_mode": {
                 mode.value: str(self.performances[mode].ev_ticks) for mode in ExperimentalMode
             },
@@ -200,6 +269,14 @@ class InstrumentLearningState:
             },
             "runner_to_breakeven_by_mode": {
                 mode.value: str(self.performances[mode].runner_to_breakeven_rate)
+                for mode in ExperimentalMode
+            },
+            "runner_side_none_rate_by_mode": {
+                mode.value: str(self.performances[mode].runner_side_none_rate)
+                for mode in ExperimentalMode
+            },
+            "wide_spread_loss_per_trade_by_mode": {
+                mode.value: str(self.performances[mode].wide_spread_loss_per_trade)
                 for mode in ExperimentalMode
             },
             "avg_runner_mfe_by_mode": {
@@ -266,6 +343,10 @@ class OnlineLearningState:
                 }
                 for instrument, state in self.instruments.items()
             },
+            "instrument_allocation": {
+                SwarmInstrument.NEOBITOK.value: "0.85",
+                SwarmInstrument.NEOEFIR.value: "0.15",
+            },
             "ev_by_mode": {
                 instrument.value: {
                     mode.value: str(state.performances[mode].ev_ticks)
@@ -291,6 +372,20 @@ class OnlineLearningState:
                 }
                 for instrument, state in self.instruments.items()
             },
+            "runner_side_none_rate_by_mode": {
+                instrument.value: {
+                    mode.value: str(state.performances[mode].runner_side_none_rate)
+                    for mode in ExperimentalMode
+                }
+                for instrument, state in self.instruments.items()
+            },
+            "wide_spread_loss_per_trade_by_mode": {
+                instrument.value: {
+                    mode.value: str(state.performances[mode].wide_spread_loss_per_trade)
+                    for mode in ExperimentalMode
+                }
+                for instrument, state in self.instruments.items()
+            },
             "avg_runner_mfe_by_mode": {
                 instrument.value: {
                     mode.value: str(state.performances[mode].avg_runner_mfe_ticks)
@@ -306,17 +401,14 @@ class OnlineLearningState:
                 for instrument, state in self.instruments.items()
             },
             "bot_utilization": dict(sorted(self.bot_assignment_counts.items())),
+            "fakeout_model": _online_model_payload(self, "fakeout_rate"),
+            "runner_mfe_model": _online_model_payload(self, "avg_runner_mfe_ticks"),
+            "wide_spread_risk_model": _online_model_payload(self, "wide_spread_loss_per_trade"),
         }
 
 
 def _initial_allocations() -> dict[ExperimentalMode, Decimal]:
-    return {
-        ExperimentalMode.BASELINE: BASELINE_ALLOCATION,
-        ExperimentalMode.PERSISTENT_IMBALANCE: BEST_CHALLENGER_ALLOCATION,
-        ExperimentalMode.TICK_VELOCITY: Decimal("0.03333333333333333333333333333"),
-        ExperimentalMode.TRADE_AGGRESSION: Decimal("0.03333333333333333333333333333"),
-        ExperimentalMode.WIDE_TRAILING: Decimal("0.03333333333333333333333333334"),
-    }
+    return dict(DEFAULT_MODE_ALLOCATIONS)
 
 
 def _instrument_ev(state: InstrumentLearningState) -> Decimal:
@@ -326,6 +418,31 @@ def _instrument_ev(state: InstrumentLearningState) -> Decimal:
     )
     closed_pairs = sum(performance.closed_pairs for performance in state.performances.values())
     return decimal_ratio(total_pnl, Decimal(closed_pairs))
+
+
+def _normalize_allocations(
+    allocations: dict[ExperimentalMode, Decimal],
+) -> dict[ExperimentalMode, Decimal]:
+    total = sum(allocations.values(), Decimal("0"))
+    if total == 0:
+        return dict(DEFAULT_MODE_ALLOCATIONS)
+    return {
+        mode: decimal_ratio(allocations.get(mode, Decimal("0")), total)
+        for mode in ExperimentalMode
+    }
+
+
+def _online_model_payload(
+    state: OnlineLearningState,
+    metric_name: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for instrument, instrument_state in state.instruments.items():
+        payload[instrument.value] = {
+            mode.value: str(getattr(instrument_state.performances[mode], metric_name))
+            for mode in ExperimentalMode
+        }
+    return payload
 
 
 __all__ = [

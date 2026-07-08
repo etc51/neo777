@@ -12,7 +12,7 @@ import os
 import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -56,6 +56,14 @@ from neo_trader.runtime import get_runtime_commit_hash
 
 ClockFunc = Callable[[], datetime]
 SleepFunc = Callable[[float], None]
+WIDE_SPREAD_PANIC_WAIT_CYCLES = 2
+TRAIL_LOCK_4_TICKS = Decimal("4")
+TRAIL_LOCK_6_TICKS = Decimal("6")
+TRAIL_LOCK_MIN_PNL_TICKS = Decimal("1")
+INSTRUMENT_ENTRY_ALLOCATION: dict[SwarmInstrument, Decimal] = {
+    SwarmInstrument.NEOBITOK: Decimal("0.85"),
+    SwarmInstrument.NEOEFIR: Decimal("0.15"),
+}
 
 
 class OrderBookProvider(Protocol):
@@ -138,6 +146,12 @@ class _LivePairState:
     max_adverse_excursion: Decimal = Decimal("0")
     max_favorable_excursion: Decimal = Decimal("0")
     latest_snapshot: BookSnapshot | None = None
+    wide_spread_panic_cycles: int = 0
+    avoided_wide_spread_exits: int = 0
+    trail_lock_4_active: bool = False
+    missed_runner_profit_ticks: Decimal = Decimal("0")
+    logged_avoided_wide_spread_exits: int = 0
+    logged_missed_runner_profit_ticks: Decimal = Decimal("0")
 
 
 class _LivePaperRecorder:
@@ -246,6 +260,27 @@ class _LivePaperRecorder:
         }
         self._append("live_paper_pair_updates.jsonl", payload)
         self._append("pair_events.jsonl", payload)
+
+    def record_control_event(
+        self,
+        *,
+        cycle: int,
+        event_type: str,
+        state: _LivePairState,
+        snapshot: BookSnapshot,
+        payload: Mapping[str, object],
+    ) -> None:
+        event = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "event_type": event_type,
+            "mode": state.mode.value,
+            "pair_id": state.pair.pair_id,
+            "instrument": state.pair.instrument.value,
+            "state": _live_pair_state_payload(state, snapshot),
+            "payload": dict(payload),
+        }
+        self._append("pair_events.jsonl", event)
 
     def record_pair_label(
         self,
@@ -487,6 +522,12 @@ def run_live_paper_swarm(
                         if state.pair.instrument is not snapshot.instrument:
                             continue
                         label = _update_live_pair(state, snapshot, config=resolved_config)
+                        _record_live_pair_control_events(
+                            recorder=recorder,
+                            cycle=cycle_number,
+                            state=state,
+                            snapshot=snapshot,
+                        )
                         recorder.record_pair_update(
                             cycle=cycle_number,
                             state=state,
@@ -521,6 +562,11 @@ def run_live_paper_swarm(
                         mode=mode,
                         base_config=base_model_config,
                     )
+                    prediction = _apply_online_entry_gates(
+                        prediction,
+                        snapshot=snapshot,
+                        mode=mode,
+                    )
                     predictions[snapshot.instrument] = prediction
                     if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
                         recorder.record_prediction(
@@ -529,6 +575,19 @@ def run_live_paper_swarm(
                             mode=mode,
                             prediction=prediction,
                             skipped_reason="ACTIVE_PAIR_EXISTS",
+                        )
+                        continue
+                    if not _instrument_entry_allowed(
+                        snapshots=snapshots,
+                        instrument=snapshot.instrument,
+                        cycle=cycle_number,
+                    ):
+                        recorder.record_prediction(
+                            cycle=cycle_number,
+                            snapshot=snapshot,
+                            mode=mode,
+                            prediction=prediction,
+                            skipped_reason="INSTRUMENT_ALLOCATION",
                         )
                         continue
                     active_pair = curator.maybe_open_pair(snapshot, prediction=prediction)
@@ -753,6 +812,61 @@ def _predict_for_mode(
     return PairEVModel(_model_config_for_mode(base_config, mode)).predict(snapshot)
 
 
+def _apply_online_entry_gates(
+    prediction: PairEVPrediction,
+    *,
+    snapshot: BookSnapshot,
+    mode: ExperimentalMode,
+) -> PairEVPrediction:
+    if not prediction.trade_allowed:
+        return prediction
+    required_runner_mfe = (
+        Decimal(prediction.best_stop_loss_ticks) + snapshot.spread_ticks + Decimal("1")
+    )
+    if prediction.expected_runner_mfe_ticks >= required_runner_mfe:
+        return prediction
+    if _is_exploration_mode(mode):
+        return replace(
+            prediction,
+            reason_codes=prediction.reason_codes + ("RUNNER_GATE_EXPLORATION",),
+        )
+    return replace(
+        prediction,
+        trade_allowed=False,
+        rejection_reason=RejectionReason.MODEL,
+        reason_codes=prediction.reason_codes
+        + (
+            "RUNNER_GATE_REJECT",
+            f"EXPECTED_MFE_LT_{required_runner_mfe}",
+        ),
+    )
+
+
+def _is_exploration_mode(mode: ExperimentalMode) -> bool:
+    return mode in {
+        ExperimentalMode.PERSISTENT_IMBALANCE,
+        ExperimentalMode.TICK_VELOCITY,
+        ExperimentalMode.WIDE_TRAILING,
+    }
+
+
+def _instrument_entry_allowed(
+    *,
+    snapshots: Sequence[BookSnapshot],
+    instrument: SwarmInstrument,
+    cycle: int,
+) -> bool:
+    instruments = {snapshot.instrument for snapshot in snapshots}
+    if len(instruments) <= 1:
+        return True
+    if instrument not in INSTRUMENT_ENTRY_ALLOCATION:
+        return True
+    bucket = Decimal((cycle * 7919) % 100) / Decimal("100")
+    if instrument is SwarmInstrument.NEOBITOK:
+        return bucket < INSTRUMENT_ENTRY_ALLOCATION[SwarmInstrument.NEOBITOK]
+    return bucket >= INSTRUMENT_ENTRY_ALLOCATION[SwarmInstrument.NEOBITOK]
+
+
 def _model_config_for_mode(
     base_config: PairEVModelConfig,
     mode: ExperimentalMode,
@@ -852,16 +966,22 @@ def _update_live_pair(
     config: LivePaperSwarmConfig,
 ) -> PairLabel | None:
     state.latest_snapshot = snapshot
-    risk_reason = _risk_exit_reason(snapshot)
+    raw_risk_reason = _risk_exit_reason(snapshot)
     age_seconds = (_as_utc(snapshot.timestamp) - state.entry.timestamp).total_seconds()
-    if age_seconds >= config.max_pair_age_seconds:
-        risk_reason = PairExitReason.END_OF_REPLAY
 
     long_pnl = _long_exit_ticks(state, snapshot)
     short_pnl = _short_exit_ticks(state, snapshot)
     pair_total = long_pnl + short_pnl
     state.max_favorable_excursion = max(state.max_favorable_excursion, pair_total)
     state.max_adverse_excursion = min(state.max_adverse_excursion, pair_total)
+    risk_reason = _delayed_risk_exit_reason(
+        state,
+        snapshot,
+        raw_risk_reason=raw_risk_reason,
+        pair_total=pair_total,
+    )
+    if age_seconds >= config.max_pair_age_seconds:
+        risk_reason = PairExitReason.END_OF_REPLAY
 
     if risk_reason is not None and state.runner_side is None:
         return _label(
@@ -916,6 +1036,8 @@ def _update_live_pair(
     runner_pnl = _runner_exit_ticks(state, snapshot)
     state.runner_mfe_ticks = max(state.runner_mfe_ticks, runner_pnl)
     state.runner_mae_ticks = min(state.runner_mae_ticks, runner_pnl)
+    if state.runner_mfe_ticks >= TRAIL_LOCK_4_TICKS:
+        state.trail_lock_4_active = True
     pair_total = runner_pnl - state.loser_loss_ticks
     state.max_favorable_excursion = max(state.max_favorable_excursion, pair_total)
     state.max_adverse_excursion = min(state.max_adverse_excursion, pair_total)
@@ -927,6 +1049,14 @@ def _update_live_pair(
         exit_reason = PairExitReason.BREAKEVEN
         runner_pnl = Decimal("0")
         pair_total = -state.loser_loss_ticks
+    if (
+        exit_reason is None
+        and state.trail_lock_4_active
+        and state.runner_mfe_ticks >= TRAIL_LOCK_6_TICKS
+        and runner_pnl < TRAIL_LOCK_MIN_PNL_TICKS
+    ):
+        exit_reason = PairExitReason.TRAILING_STOP
+        state.missed_runner_profit_ticks += max(state.runner_mfe_ticks - runner_pnl, Decimal("0"))
     if exit_reason is None and state.runner_mfe_ticks - runner_pnl >= _trailing_retrace_ticks(
         state.mode
     ):
@@ -995,6 +1125,9 @@ def _label(
         regime=state.mode.value,
         long_bot_id=state.pair.long_bot_id,
         short_bot_id=state.pair.short_bot_id,
+        avoided_wide_spread_exits=state.avoided_wide_spread_exits,
+        missed_runner_profit_ticks=state.missed_runner_profit_ticks,
+        trail_lock_4_active=state.trail_lock_4_active,
     )
 
 
@@ -1124,6 +1257,10 @@ def _live_pair_state_payload(
         "runner_mfe_ticks": _none_if_uninitialized(state.runner_mfe_ticks, Decimal("-999999")),
         "runner_mae_ticks": _none_if_uninitialized(state.runner_mae_ticks, Decimal("999999")),
         "breakeven_active": state.breakeven_active,
+        "wide_spread_panic_cycles": state.wide_spread_panic_cycles,
+        "avoided_wide_spread_exits": state.avoided_wide_spread_exits,
+        "trail_lock_4_active": state.trail_lock_4_active,
+        "missed_runner_profit_ticks": state.missed_runner_profit_ticks,
         "max_adverse_excursion": state.max_adverse_excursion,
         "max_favorable_excursion": state.max_favorable_excursion,
         "risk_exit_reason": None if risk_exit_reason is None else risk_exit_reason.value,
@@ -1165,6 +1302,9 @@ def _label_payload(label: PairLabel) -> dict[str, object]:
         "regime": label.regime,
         "long_bot_id": label.long_bot_id,
         "short_bot_id": label.short_bot_id,
+        "avoided_wide_spread_exits": label.avoided_wide_spread_exits,
+        "missed_runner_profit_ticks": label.missed_runner_profit_ticks,
+        "trail_lock_4_active": label.trail_lock_4_active,
     }
 
 
@@ -1193,6 +1333,7 @@ def _metrics_payload(metrics: SwarmMetrics) -> dict[str, object]:
         "pnl_by_regime": metrics.pnl_by_regime,
         "rejected_by_model": metrics.rejected_by_model,
         "rejected_by_spread": metrics.rejected_by_spread,
+        "rejected_by_spread_entry_gate": metrics.rejected_by_spread_entry_gate,
         "rejected_by_stale_book": metrics.rejected_by_stale_book,
         "rejected_by_chop": metrics.rejected_by_chop,
         "rejected_by_latency": metrics.rejected_by_latency,
@@ -1209,6 +1350,10 @@ def _metrics(labels: Sequence[PairLabel], curator: CuratorBot) -> SwarmMetrics:
         bot_to_account=curator.bot_to_account,
         rejected_by_model=curator.rejections.get(RejectionReason.MODEL, 0),
         rejected_by_spread=curator.rejections.get(RejectionReason.SPREAD, 0),
+        rejected_by_spread_entry_gate=curator.rejections.get(
+            RejectionReason.SPREAD_ENTRY_GATE,
+            0,
+        ),
         rejected_by_stale_book=curator.rejections.get(RejectionReason.STALE_BOOK, 0),
         rejected_by_chop=curator.rejections.get(RejectionReason.CHOP, 0),
         rejected_by_latency=curator.rejections.get(RejectionReason.LATENCY, 0),
@@ -1220,6 +1365,74 @@ def _has_active_pair_for_instrument(
     instrument: SwarmInstrument,
 ) -> bool:
     return any(state.pair.instrument is instrument for state in live_pairs.values())
+
+
+def _delayed_risk_exit_reason(
+    state: _LivePairState,
+    snapshot: BookSnapshot,
+    *,
+    raw_risk_reason: PairExitReason | None,
+    pair_total: Decimal,
+) -> PairExitReason | None:
+    if raw_risk_reason is not PairExitReason.WIDE_SPREAD:
+        if state.wide_spread_panic_cycles:
+            state.avoided_wide_spread_exits += 1
+        state.wide_spread_panic_cycles = 0
+        return raw_risk_reason
+
+    state.wide_spread_panic_cycles += 1
+    if state.wide_spread_panic_cycles < WIDE_SPREAD_PANIC_WAIT_CYCLES:
+        return None
+    if _price_against_position(state, snapshot, pair_total=pair_total):
+        return PairExitReason.WIDE_SPREAD
+    return None
+
+
+def _price_against_position(
+    state: _LivePairState,
+    snapshot: BookSnapshot,
+    *,
+    pair_total: Decimal,
+) -> bool:
+    if state.runner_side is None:
+        return pair_total < 0
+    return _runner_exit_ticks(state, snapshot) < 0
+
+
+def _record_live_pair_control_events(
+    *,
+    recorder: _LivePaperRecorder,
+    cycle: int,
+    state: _LivePairState,
+    snapshot: BookSnapshot,
+) -> None:
+    if state.avoided_wide_spread_exits > state.logged_avoided_wide_spread_exits:
+        recorder.record_control_event(
+            cycle=cycle,
+            event_type="AVOIDED_WIDE_SPREAD_EXIT",
+            state=state,
+            snapshot=snapshot,
+            payload={
+                "avoided_wide_spread_exit": True,
+                "avoided_wide_spread_exits": state.avoided_wide_spread_exits,
+                "spread_ticks": snapshot.spread_ticks,
+            },
+        )
+        state.logged_avoided_wide_spread_exits = state.avoided_wide_spread_exits
+    if state.missed_runner_profit_ticks > state.logged_missed_runner_profit_ticks:
+        recorder.record_control_event(
+            cycle=cycle,
+            event_type="MISSED_RUNNER_PROFIT",
+            state=state,
+            snapshot=snapshot,
+            payload={
+                "missed_runner_profit": True,
+                "missed_runner_profit_ticks": state.missed_runner_profit_ticks,
+                "runner_mfe_ticks": state.runner_mfe_ticks,
+                "runner_pnl_ticks": _runner_exit_ticks(state, snapshot),
+            },
+        )
+        state.logged_missed_runner_profit_ticks = state.missed_runner_profit_ticks
 
 
 def _risk_exit_reason(snapshot: BookSnapshot) -> PairExitReason | None:
@@ -1424,6 +1637,16 @@ def _label_from_record(payload: Mapping[str, object]) -> PairLabel:
         regime=str(payload.get("mode") or payload.get("regime") or "replayed"),
         long_bot_id=_record_optional_str(payload.get("long_bot_id")),
         short_bot_id=_record_optional_str(payload.get("short_bot_id")),
+        avoided_wide_spread_exits=_record_int(
+            payload,
+            "avoided_wide_spread_exits",
+            default=0,
+        ),
+        missed_runner_profit_ticks=_record_decimal(
+            payload,
+            "missed_runner_profit_ticks",
+        ),
+        trail_lock_4_active=_record_bool(payload.get("trail_lock_4_active")),
     )
 
 

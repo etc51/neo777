@@ -186,6 +186,8 @@ class PairEVModel:
         )
 
     def _hard_rejection(self, snapshot: BookSnapshot) -> RejectionReason | None:
+        if snapshot.spread_ticks > _entry_spread_limit(snapshot.instrument):
+            return RejectionReason.SPREAD_ENTRY_GATE
         if snapshot.spread_ticks > self.config.max_spread_ticks:
             return RejectionReason.SPREAD
         if snapshot.latency_ms > self.config.max_latency_ms:
@@ -244,6 +246,14 @@ class PairEVModel:
 
 def _clamp(value: Decimal, minimum: Decimal, maximum: Decimal) -> Decimal:
     return max(minimum, min(maximum, value))
+
+
+def _entry_spread_limit(instrument: SwarmInstrument) -> Decimal:
+    if instrument is SwarmInstrument.NEOBITOK:
+        return Decimal("1.0")
+    if instrument is SwarmInstrument.NEOEFIR:
+        return Decimal("0.4")
+    return Decimal("1.0")
 
 
 def realized_pair_profit_probability(labels_profit: int, total_labels: int) -> Decimal:
