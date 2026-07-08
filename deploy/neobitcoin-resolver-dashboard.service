@@ -1,0 +1,21 @@
+[Unit]
+Description=Dual-Bot Neobitcoin Resolver dashboard
+After=network-online.target neobitcoin-resolver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-trader
+Group=neo-trader
+WorkingDirectory=/opt/neo_trader
+EnvironmentFile=/etc/neo-trader/neobitcoin-resolver.env
+ExecStart=/opt/neo_trader/.venv/bin/python scripts/run_neobitcoin_resolver_dashboard.py --host 0.0.0.0 --port 8036 --state data/monitoring/neobitcoin_resolver_dashboard_state.json
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -20,6 +20,8 @@ data/monitoring/neo_universal_swarm_dashboard_state.json
 data/monitoring/neo_universal_swarm_heartbeat.txt
 data/monitoring/neo_universal_swarm_daemon.pid
 data/monitoring/neo_universal_swarm_dashboard.pid
+data/monitoring/neobitcoin_resolver_dashboard_state.json
+data/monitoring/neobitcoin_resolver_heartbeat.txt
 review_bundle/
 neo_trader_review_bundle.zip
 neo_trader_review_bundle.sha256

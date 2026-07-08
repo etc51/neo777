@@ -1,0 +1,21 @@
+[Unit]
+Description=Dual-Bot Neobitcoin Resolver paper/live-data daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-trader
+Group=neo-trader
+WorkingDirectory=/opt/neo_trader
+EnvironmentFile=/etc/neo-trader/neobitcoin-resolver.env
+ExecStart=/opt/neo_trader/.venv/bin/python scripts/run_neobitcoin_resolver.py --poll-interval-seconds 5
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
