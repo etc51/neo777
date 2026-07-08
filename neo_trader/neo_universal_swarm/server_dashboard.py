@@ -33,6 +33,13 @@ def render_swarm_dashboard_html(state: JsonMapping) -> str:
     swarm = _mapping(state.get("swarm"))
     curator = _mapping(swarm.get("curator"))
     metrics = _mapping(swarm.get("metrics"))
+    active_mode = _mapping(swarm.get("active_mode"))
+    mode_allocation = _mapping(swarm.get("mode_allocation"))
+    ev_by_mode = _mapping(swarm.get("ev_by_mode"))
+    ev_by_instrument = _mapping(swarm.get("ev_by_instrument"))
+    fakeout_rate_by_mode = _mapping(swarm.get("fakeout_rate_by_mode"))
+    runner_to_breakeven_by_mode = _mapping(swarm.get("runner_to_breakeven_by_mode"))
+    bot_utilization = _mapping(swarm.get("bot_utilization"))
     readiness = _mapping(swarm.get("readiness"))
     latest_market = _sequence(swarm.get("latest_market"))
     bots = _sequence(swarm.get("bots"))
@@ -123,6 +130,21 @@ def render_swarm_dashboard_html(state: JsonMapping) -> str:
     {_metric("Max drawdown", metrics.get("max_drawdown", "0"))}
     {_metric("Fakeout rate", metrics.get("fakeout_rate", "0"))}
   </div>
+  <h2>Online Learning</h2>
+  <div class="grid">
+    {_metric("Active mode", _compact_json(active_mode))}
+    {_metric("EV by instrument", _compact_json(ev_by_instrument))}
+  </div>
+  <h2>Mode Allocation</h2>
+  {render_key_value_table(mode_allocation)}
+  <h2>EV By Mode</h2>
+  {render_key_value_table(ev_by_mode)}
+  <h2>Fakeout Rate By Mode</h2>
+  {render_key_value_table(fakeout_rate_by_mode)}
+  <h2>Runner To Breakeven By Mode</h2>
+  {render_key_value_table(runner_to_breakeven_by_mode)}
+  <h2>Bot Utilization</h2>
+  {render_key_value_table(bot_utilization)}
   <h2>Readiness</h2>
   {render_key_value_table(readiness)}
   <h2>Market</h2>
@@ -243,6 +265,12 @@ def _sequence(value: object) -> tuple[object, ...]:
 
 
 def _text(value: object) -> str:
+    return str(value)
+
+
+def _compact_json(value: object) -> str:
+    if isinstance(value, Mapping):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
 
 

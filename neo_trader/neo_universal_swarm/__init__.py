@@ -25,6 +25,12 @@ from neo_trader.neo_universal_swarm.live_paper import (
     run_live_paper_swarm,
 )
 from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVModelConfig, PairEVPrediction
+from neo_trader.neo_universal_swarm.online_learning import (
+    ExperimentalMode,
+    InstrumentLearningState,
+    ModePerformance,
+    OnlineLearningState,
+)
 from neo_trader.neo_universal_swarm.paper import (
     PaperSimulationArtifacts,
     PaperSimulationResult,
@@ -62,9 +68,13 @@ __all__ = [
     "CuratorConfig",
     "HedgePairSimulationConfig",
     "HedgePairSimulator",
+    "ExperimentalMode",
+    "InstrumentLearningState",
     "LegSide",
     "LivePaperSwarmConfig",
     "LivePaperSwarmCycle",
+    "ModePerformance",
+    "OnlineLearningState",
     "PairEVModel",
     "PairEVModelConfig",
     "PairEVPrediction",

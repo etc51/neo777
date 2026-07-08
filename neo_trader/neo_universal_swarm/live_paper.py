@@ -33,6 +33,10 @@ from neo_trader.neo_universal_swarm.model import (
     PairEVModelConfig,
     PairEVPrediction,
 )
+from neo_trader.neo_universal_swarm.online_learning import (
+    ExperimentalMode,
+    OnlineLearningState,
+)
 from neo_trader.neo_universal_swarm.simulator import (
     HedgePairSimulationConfig,
     aggregate_pair_metrics,
@@ -80,6 +84,7 @@ class LivePaperSwarmConfig:
     reports_dir: Path = Path("data/reports/neo_universal_swarm_live_paper")
     dashboard_state_path: Path = Path("data/monitoring/neo_universal_swarm_dashboard_state.json")
     heartbeat_path: Path = Path("data/monitoring/neo_universal_swarm_heartbeat.txt")
+    online_learning_state_path: Path | None = None
     instruments: tuple[SwarmInstrument, ...] = tuple(SwarmInstrument)
     max_cycles: int | None = None
 
@@ -118,6 +123,7 @@ class LivePaperSwarmCycle:
 @dataclass
 class _LivePairState:
     pair: ActivePair
+    mode: ExperimentalMode
     entry: BookSnapshot
     long_entry: Decimal
     short_entry: Decimal
@@ -141,40 +147,65 @@ class _LivePaperRecorder:
         self.reports_dir = Path(reports_dir)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self._pair_labels_csv_path = self.reports_dir / "live_paper_pair_labels.csv"
+        self._ensure_jsonl_files()
         self._ensure_pair_labels_csv()
 
     def record_orderbook(self, *, cycle: int, snapshot: BookSnapshot) -> None:
-        self._append(
-            "live_paper_orderbooks.jsonl",
-            {
-                "cycle": cycle,
-                "recorded_at": datetime.now(UTC),
-                "snapshot": _snapshot_payload(snapshot),
-            },
-        )
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "valid": True,
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        self._append("live_paper_orderbooks.jsonl", payload)
+        self._append("orderbook_snapshots.jsonl", payload)
+
+    def record_invalid_orderbook(
+        self,
+        *,
+        cycle: int,
+        instrument: SwarmInstrument,
+        instrument_uid: str,
+        reason: str,
+        bids: int,
+        asks: int,
+    ) -> None:
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "valid": False,
+            "instrument": instrument.value,
+            "instrument_uid": instrument_uid,
+            "reason": reason,
+            "bids": bids,
+            "asks": asks,
+        }
+        self._append("live_paper_orderbooks.jsonl", payload)
+        self._append("orderbook_snapshots.jsonl", payload)
 
     def record_prediction(
         self,
         *,
         cycle: int,
         snapshot: BookSnapshot,
+        mode: ExperimentalMode,
         prediction: PairEVPrediction,
         opened_pair_id: str | None = None,
         skipped_reason: str | None = None,
     ) -> None:
-        self._append(
-            "live_paper_predictions.jsonl",
-            {
-                "cycle": cycle,
-                "recorded_at": datetime.now(UTC),
-                "instrument": snapshot.instrument.value,
-                "timestamp": snapshot.timestamp,
-                "opened_pair_id": opened_pair_id,
-                "skipped_reason": skipped_reason,
-                "prediction": _prediction_payload(prediction),
-                "snapshot": _snapshot_payload(snapshot),
-            },
-        )
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "instrument": snapshot.instrument.value,
+            "timestamp": snapshot.timestamp,
+            "mode": mode.value,
+            "opened_pair_id": opened_pair_id,
+            "skipped_reason": skipped_reason,
+            "prediction": _prediction_payload(prediction),
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        self._append("live_paper_predictions.jsonl", payload)
+        self._append("model_predictions.jsonl", payload)
 
     def record_pair_opened(
         self,
@@ -183,16 +214,17 @@ class _LivePaperRecorder:
         state: _LivePairState,
         snapshot: BookSnapshot,
     ) -> None:
-        self._append(
-            "live_paper_pair_opened.jsonl",
-            {
-                "cycle": cycle,
-                "recorded_at": datetime.now(UTC),
-                "pair": _active_pair_payload(state.pair),
-                "entry": _live_pair_state_payload(state, snapshot),
-                "snapshot": _snapshot_payload(snapshot),
-            },
-        )
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "event_type": "PAIR_OPENED",
+            "mode": state.mode.value,
+            "pair": _active_pair_payload(state.pair),
+            "entry": _live_pair_state_payload(state, snapshot),
+            "snapshot": _snapshot_payload(snapshot),
+        }
+        self._append("live_paper_pair_opened.jsonl", payload)
+        self._append("pair_events.jsonl", payload)
 
     def record_pair_update(
         self,
@@ -202,25 +234,42 @@ class _LivePaperRecorder:
         snapshot: BookSnapshot,
         label: PairLabel | None,
     ) -> None:
-        self._append(
-            "live_paper_pair_updates.jsonl",
-            {
-                "cycle": cycle,
-                "recorded_at": datetime.now(UTC),
-                "pair": _active_pair_payload(state.pair),
-                "state": _live_pair_state_payload(state, snapshot),
-                "snapshot": _snapshot_payload(snapshot),
-                "closed_label": None if label is None else _label_payload(label),
-            },
-        )
-
-    def record_pair_label(self, *, cycle: int, label: PairLabel) -> None:
         payload = {
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
+            "event_type": "PAIR_UPDATE" if label is None else "PAIR_CLOSED",
+            "mode": state.mode.value,
+            "pair": _active_pair_payload(state.pair),
+            "state": _live_pair_state_payload(state, snapshot),
+            "snapshot": _snapshot_payload(snapshot),
+            "closed_label": None if label is None else _label_payload(label),
+        }
+        self._append("live_paper_pair_updates.jsonl", payload)
+        self._append("pair_events.jsonl", payload)
+
+    def record_pair_label(
+        self,
+        *,
+        cycle: int,
+        mode: ExperimentalMode,
+        label: PairLabel,
+    ) -> None:
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "mode": mode.value,
             "label": _label_payload(label),
         }
         self._append("live_paper_pair_labels.jsonl", payload)
+        self._append(
+            "pair_labels.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                **_label_payload(label),
+                "mode": mode.value,
+            },
+        )
         self._append_pair_label_csv(cycle=cycle, label=label)
 
     def record_bot_states(self, *, cycle: int, curator: CuratorBot) -> None:
@@ -298,6 +347,20 @@ class _LivePaperRecorder:
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(_json_safe_mapping(payload), ensure_ascii=False, sort_keys=True))
             file.write("\n")
+
+    def _ensure_jsonl_files(self) -> None:
+        for filename in (
+            "live_paper_orderbooks.jsonl",
+            "orderbook_snapshots.jsonl",
+            "live_paper_predictions.jsonl",
+            "model_predictions.jsonl",
+            "live_paper_pair_opened.jsonl",
+            "live_paper_pair_updates.jsonl",
+            "live_paper_pair_labels.jsonl",
+            "pair_events.jsonl",
+            "pair_labels.jsonl",
+        ):
+            (self.reports_dir / filename).touch(exist_ok=True)
 
     def _ensure_pair_labels_csv(self) -> None:
         if self._pair_labels_csv_path.exists():
@@ -382,16 +445,20 @@ def run_live_paper_swarm(
     now = clock or (lambda: datetime.now(UTC))
     accounts = load_accounts_config(resolved_config.accounts_path)
     catalog = load_swarm_instrument_catalog()
-    model = PairEVModel(
-        PairEVModelConfig(
-            min_required_ev_ticks=resolved_config.min_required_ev_ticks,
-            slippage_stress_ticks=resolved_config.slippage_stress_ticks,
-        )
+    base_model_config = PairEVModelConfig(
+        min_required_ev_ticks=resolved_config.min_required_ev_ticks,
+        slippage_stress_ticks=resolved_config.slippage_stress_ticks,
     )
+    model = PairEVModel(base_model_config)
     curator = CuratorBot(accounts=accounts, model=model)
     client = provider or TBankClient()
     owns_client = provider is None
     recorder = _LivePaperRecorder(resolved_config.reports_dir)
+    learning_state_path = (
+        resolved_config.online_learning_state_path
+        or resolved_config.reports_dir / "online_learning_state.json"
+    )
+    learning_state = _load_online_learning_state(resolved_config.reports_dir)
     latest_snapshots: dict[SwarmInstrument, BookSnapshot] = {}
     live_pairs: dict[str, _LivePairState] = {}
     labels: list[PairLabel] = []
@@ -410,6 +477,8 @@ def run_live_paper_swarm(
                     previous=latest_snapshots,
                     depth=resolved_config.orderbook_depth,
                     clock=now,
+                    recorder=recorder,
+                    cycle=cycle_number,
                 )
                 for snapshot in snapshots:
                     latest_snapshots[snapshot.instrument] = snapshot
@@ -426,26 +495,43 @@ def run_live_paper_swarm(
                         )
                         if label is None:
                             continue
+                        learning_state.update_label(
+                            instrument=label.instrument,
+                            mode=state.mode,
+                            label=label,
+                        )
                         curator.settle_pair(label)
                         labels.append(label)
-                        recorder.record_pair_label(cycle=cycle_number, label=label)
+                        recorder.record_pair_label(
+                            cycle=cycle_number,
+                            mode=state.mode,
+                            label=label,
+                        )
                         live_pairs.pop(label.pair_id, None)
 
                 curator.release_cooldowns()
-                predictions = {
-                    snapshot.instrument: model.predict(snapshot) for snapshot in snapshots
-                }
+                predictions: dict[SwarmInstrument, PairEVPrediction] = {}
                 for snapshot in snapshots:
-                    prediction = predictions[snapshot.instrument]
+                    if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
+                        mode = learning_state.instruments[snapshot.instrument].active_mode
+                    else:
+                        mode = learning_state.choose_mode(snapshot.instrument)
+                    prediction = _predict_for_mode(
+                        snapshot,
+                        mode=mode,
+                        base_config=base_model_config,
+                    )
+                    predictions[snapshot.instrument] = prediction
                     if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
                         recorder.record_prediction(
                             cycle=cycle_number,
                             snapshot=snapshot,
+                            mode=mode,
                             prediction=prediction,
                             skipped_reason="ACTIVE_PAIR_EXISTS",
                         )
                         continue
-                    active_pair = curator.maybe_open_pair(snapshot)
+                    active_pair = curator.maybe_open_pair(snapshot, prediction=prediction)
                     skipped_reason = None
                     if active_pair is None:
                         skipped_reason = (
@@ -456,6 +542,7 @@ def run_live_paper_swarm(
                     recorder.record_prediction(
                         cycle=cycle_number,
                         snapshot=snapshot,
+                        mode=mode,
                         prediction=prediction,
                         opened_pair_id=None if active_pair is None else active_pair.pair_id,
                         skipped_reason=skipped_reason,
@@ -463,10 +550,15 @@ def run_live_paper_swarm(
                     if active_pair is not None:
                         state = _new_live_pair_state(
                             active_pair,
+                            mode,
                             snapshot,
                             slippage_stress_ticks=resolved_config.slippage_stress_ticks,
                         )
                         live_pairs[active_pair.pair_id] = state
+                        learning_state.record_assignment(
+                            active_pair.long_bot_id,
+                            active_pair.short_bot_id,
+                        )
                         recorder.record_pair_opened(
                             cycle=cycle_number,
                             state=state,
@@ -486,13 +578,20 @@ def run_live_paper_swarm(
                         ),
                         metrics=metrics,
                         updated_at=_as_utc(now()),
+                        learning_state=learning_state,
+                        predictions={
+                            instrument.value: prediction
+                            for instrument, prediction in predictions.items()
+                        },
                     )
+                _write_online_learning_state(learning_state_path, learning_state)
                 _write_summary_json(
                     resolved_config.reports_dir / "live_paper_summary.json",
                     cycle=cycle_number,
                     metrics=metrics,
                     active_pairs=live_pairs,
                     latest_snapshots=latest_snapshots,
+                    learning_state=learning_state,
                 )
                 cycle = LivePaperSwarmCycle(
                     cycle=cycle_number,
@@ -602,15 +701,38 @@ def _poll_orderbooks(
     previous: Mapping[SwarmInstrument, BookSnapshot],
     depth: int,
     clock: ClockFunc,
+    recorder: _LivePaperRecorder,
+    cycle: int,
 ) -> tuple[BookSnapshot, ...]:
     metadata = catalog.by_instrument()
     snapshots: list[BookSnapshot] = []
     for instrument in instruments:
         item = metadata[instrument]
         request_started_at = _as_utc(clock())
-        orderbook = provider.get_orderbook_snapshot(item.uid, depth=depth)
+        try:
+            orderbook = provider.get_orderbook_snapshot(item.uid, depth=depth)
+        except Exception as exc:
+            recorder.record_invalid_orderbook(
+                cycle=cycle,
+                instrument=instrument,
+                instrument_uid=item.uid,
+                reason=f"{type(exc).__name__}: {exc}",
+                bids=0,
+                asks=0,
+            )
+            continue
         received_at = _as_utc(clock())
         latency_ms = int(max((received_at - request_started_at).total_seconds() * 1000, 0))
+        if not orderbook.bids or not orderbook.asks:
+            recorder.record_invalid_orderbook(
+                cycle=cycle,
+                instrument=instrument,
+                instrument_uid=item.uid,
+                reason="EMPTY_ORDERBOOK",
+                bids=len(orderbook.bids),
+                asks=len(orderbook.asks),
+            )
+            continue
         snapshots.append(
             orderbook_snapshot_to_book_snapshot(
                 orderbook,
@@ -623,8 +745,75 @@ def _poll_orderbooks(
     return tuple(snapshots)
 
 
+def _predict_for_mode(
+    snapshot: BookSnapshot,
+    *,
+    mode: ExperimentalMode,
+    base_config: PairEVModelConfig,
+) -> PairEVPrediction:
+    return PairEVModel(_model_config_for_mode(base_config, mode)).predict(snapshot)
+
+
+def _model_config_for_mode(
+    base_config: PairEVModelConfig,
+    mode: ExperimentalMode,
+) -> PairEVModelConfig:
+    if mode is ExperimentalMode.PERSISTENT_IMBALANCE:
+        return PairEVModelConfig(
+            min_required_ev_ticks=base_config.min_required_ev_ticks,
+            max_spread_ticks=base_config.max_spread_ticks,
+            max_latency_ms=base_config.max_latency_ms,
+            min_abs_imbalance_3=Decimal("0.12"),
+            min_abs_microprice_edge_ticks=Decimal("0.03"),
+            chop_velocity_ticks_per_second=base_config.chop_velocity_ticks_per_second,
+            slippage_stress_ticks=base_config.slippage_stress_ticks,
+            execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
+        )
+    if mode is ExperimentalMode.TICK_VELOCITY:
+        return PairEVModelConfig(
+            min_required_ev_ticks=base_config.min_required_ev_ticks,
+            max_spread_ticks=base_config.max_spread_ticks,
+            max_latency_ms=base_config.max_latency_ms,
+            min_abs_imbalance_3=Decimal("0.06"),
+            min_abs_microprice_edge_ticks=base_config.min_abs_microprice_edge_ticks,
+            chop_velocity_ticks_per_second=Decimal("0.005"),
+            slippage_stress_ticks=base_config.slippage_stress_ticks,
+            execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
+        )
+    if mode is ExperimentalMode.TRADE_AGGRESSION:
+        return PairEVModelConfig(
+            min_required_ev_ticks=base_config.min_required_ev_ticks,
+            max_spread_ticks=base_config.max_spread_ticks,
+            max_latency_ms=base_config.max_latency_ms,
+            min_abs_imbalance_3=Decimal("0.08"),
+            min_abs_microprice_edge_ticks=Decimal("0.04"),
+            chop_velocity_ticks_per_second=base_config.chop_velocity_ticks_per_second,
+            slippage_stress_ticks=base_config.slippage_stress_ticks,
+            execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
+        )
+    if mode is ExperimentalMode.WIDE_TRAILING:
+        return PairEVModelConfig(
+            min_required_ev_ticks=base_config.min_required_ev_ticks,
+            max_spread_ticks=Decimal("3"),
+            max_latency_ms=base_config.max_latency_ms,
+            min_abs_imbalance_3=base_config.min_abs_imbalance_3,
+            min_abs_microprice_edge_ticks=base_config.min_abs_microprice_edge_ticks,
+            chop_velocity_ticks_per_second=base_config.chop_velocity_ticks_per_second,
+            slippage_stress_ticks=base_config.slippage_stress_ticks,
+            execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
+        )
+    return base_config
+
+
+def _trailing_retrace_ticks(mode: ExperimentalMode) -> Decimal:
+    if mode is ExperimentalMode.WIDE_TRAILING:
+        return Decimal("3")
+    return Decimal("2")
+
+
 def _new_live_pair_state(
     pair: ActivePair,
+    mode: ExperimentalMode,
     entry: BookSnapshot,
     *,
     slippage_stress_ticks: Decimal,
@@ -632,6 +821,7 @@ def _new_live_pair_state(
     slippage = entry.slippage_ticks + slippage_stress_ticks
     return _LivePairState(
         pair=pair,
+        mode=mode,
         entry=entry,
         long_entry=entry.best_ask + (slippage * entry.tick_size),
         short_entry=entry.best_bid - (slippage * entry.tick_size),
@@ -738,7 +928,9 @@ def _update_live_pair(
         exit_reason = PairExitReason.BREAKEVEN
         runner_pnl = Decimal("0")
         pair_total = -state.loser_loss_ticks
-    if exit_reason is None and state.runner_mfe_ticks - runner_pnl >= Decimal("2"):
+    if exit_reason is None and state.runner_mfe_ticks - runner_pnl >= _trailing_retrace_ticks(
+        state.mode
+    ):
         exit_reason = PairExitReason.TRAILING_STOP
     if exit_reason is None and _microstructure_trailing_exit(snapshot, state.runner_side):
         exit_reason = PairExitReason.TRAILING_STOP
@@ -801,7 +993,7 @@ def _label(
         entry_spread_cost_ticks=state.entry.spread_ticks,
         avg_slippage_ticks=state.slippage,
         latency_ms=snapshot.latency_ms,
-        regime="live_paper",
+        regime=state.mode.value,
         long_bot_id=state.pair.long_bot_id,
         short_bot_id=state.pair.short_bot_id,
     )
@@ -909,6 +1101,7 @@ def _live_pair_state_payload(
     return {
         "pair_id": state.pair.pair_id,
         "instrument": state.pair.instrument.value,
+        "mode": state.mode.value,
         "entry_timestamp": state.entry.timestamp,
         "current_timestamp": snapshot.timestamp,
         "age_seconds": (_as_utc(snapshot.timestamp) - state.entry.timestamp).total_seconds(),
@@ -923,6 +1116,7 @@ def _live_pair_state_payload(
         "pair_total_pnl_ticks": pair_total,
         "stop_loss_ticks": state.stop,
         "breakeven_ticks": state.pair.breakeven_ticks,
+        "trailing_retrace_ticks": _trailing_retrace_ticks(state.mode),
         "slippage_ticks": state.slippage,
         "loser_side": None if state.loser_side is None else state.loser_side.value,
         "runner_side": None if state.runner_side is None else state.runner_side.value,
@@ -945,6 +1139,7 @@ def _label_payload(label: PairLabel) -> dict[str, object]:
     return {
         "pair_id": label.pair_id,
         "instrument": label.instrument.value,
+        "mode": label.regime,
         "entry_timestamp": label.entry_timestamp,
         "exit_timestamp": label.exit_timestamp,
         "stop_loss_ticks": label.stop_loss_ticks,
@@ -953,7 +1148,11 @@ def _label_payload(label: PairLabel) -> dict[str, object]:
         "runner_side": None if label.runner_side is None else label.runner_side.value,
         "runner_mfe_ticks": label.runner_mfe_ticks,
         "runner_mae_ticks": label.runner_mae_ticks,
+        "runner_reached_breakeven": (
+            label.runner_success_flag or label.runner_mfe_ticks >= Decimal(label.stop_loss_ticks)
+        ),
         "runner_exit_ticks": label.runner_exit_ticks,
+        "pair_pnl_ticks": label.pair_total_pnl_ticks,
         "pair_total_pnl_ticks": label.pair_total_pnl_ticks,
         "pair_total_pnl_rub": label.pair_total_pnl_rub,
         "exit_reason": label.exit_reason.value,
@@ -1077,21 +1276,40 @@ def _write_live_dashboard_state(
     latest_snapshots: Sequence[BookSnapshot],
     metrics: SwarmMetrics,
     updated_at: datetime,
+    learning_state: OnlineLearningState,
+    predictions: Mapping[str, PairEVPrediction],
 ) -> Path:
     payload = build_swarm_dashboard_state(
         curator=curator,
         latest_snapshots=latest_snapshots,
         metrics=metrics,
+        predictions=predictions,
         updated_at=updated_at,
         commit_hash=get_runtime_commit_hash(),
     )
     payload["runtime_mode"] = "live-paper"
     payload["market_data_source"] = "tbank-readonly-rest"
+    payload["paper_enabled"] = True
+    payload["live_enabled"] = False
+    learning_payload = learning_state.to_payload()
+    payload["online_learning"] = learning_payload
     swarm = payload.get("swarm")
     if isinstance(swarm, dict):
+        swarm["paper_enabled"] = True
+        swarm["live_enabled"] = False
         curator_payload = swarm.get("curator")
         if isinstance(curator_payload, dict):
             curator_payload["status"] = "LIVE_PAPER_COORDINATOR"
+        swarm["online_learning"] = learning_payload
+        swarm["active_mode"] = learning_payload["active_mode"]
+        swarm["mode_allocation"] = learning_payload["mode_allocation"]
+        swarm["ev_by_mode"] = learning_payload["ev_by_mode"]
+        swarm["ev_by_instrument"] = learning_payload["ev_by_instrument"]
+        swarm["fakeout_rate_by_mode"] = learning_payload["fakeout_rate_by_mode"]
+        swarm["runner_to_breakeven_by_mode"] = learning_payload[
+            "runner_to_breakeven_by_mode"
+        ]
+        swarm["bot_utilization"] = _bot_utilization_payload(curator, learning_state)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
@@ -1113,6 +1331,7 @@ def _write_summary_json(
     metrics: SwarmMetrics,
     active_pairs: Mapping[str, _LivePairState],
     latest_snapshots: Mapping[SwarmInstrument, BookSnapshot],
+    learning_state: OnlineLearningState,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1120,6 +1339,7 @@ def _write_summary_json(
         "cycle": cycle,
         "runtime_mode": "live-paper",
         "market_data_source": "tbank-readonly-rest",
+        "online_learning": learning_state.to_payload(),
         "active_pairs": len(active_pairs),
         "closed_pairs": metrics.total_pairs,
         "total_pnl_ticks": str(sum(metrics.pnl_by_bot.values(), Decimal("0"))),
@@ -1138,6 +1358,161 @@ def _write_summary_json(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _load_online_learning_state(reports_dir: Path) -> OnlineLearningState:
+    state = OnlineLearningState()
+    labels_path = reports_dir / "pair_labels.jsonl"
+    if not labels_path.exists():
+        return state
+
+    with labels_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            raw_line = line.strip()
+            if not raw_line:
+                continue
+            try:
+                record = json.loads(raw_line)
+                if not isinstance(record, dict):
+                    continue
+                label_payload = record.get("label")
+                if not isinstance(label_payload, dict):
+                    label_payload = record
+                mode_value = (
+                    record.get("mode")
+                    or label_payload.get("mode")
+                    or label_payload.get("regime")
+                )
+                mode = ExperimentalMode(str(mode_value))
+                label = _label_from_record(label_payload)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            state.update_label(instrument=label.instrument, mode=mode, label=label)
+            if label.long_bot_id is not None and label.short_bot_id is not None:
+                state.record_assignment(label.long_bot_id, label.short_bot_id)
+    return state
+
+
+def _label_from_record(payload: Mapping[str, object]) -> PairLabel:
+    return PairLabel(
+        pair_id=str(payload["pair_id"]),
+        instrument=SwarmInstrument(str(payload["instrument"])),
+        entry_timestamp=_record_datetime(payload, "entry_timestamp"),
+        exit_timestamp=_record_datetime(payload, "exit_timestamp"),
+        stop_loss_ticks=_record_int(payload, "stop_loss_ticks", default=2),
+        loser_side=_record_side(payload.get("loser_side")),
+        loser_loss_ticks=_record_decimal(payload, "loser_loss_ticks"),
+        runner_side=_record_side(payload.get("runner_side")),
+        runner_mfe_ticks=_record_decimal(payload, "runner_mfe_ticks"),
+        runner_mae_ticks=_record_decimal(payload, "runner_mae_ticks"),
+        runner_exit_ticks=_record_decimal(payload, "runner_exit_ticks"),
+        pair_total_pnl_ticks=_record_decimal(
+            payload,
+            "pair_total_pnl_ticks",
+            fallback_key="pair_pnl_ticks",
+        ),
+        pair_total_pnl_rub=_record_decimal(payload, "pair_total_pnl_rub"),
+        exit_reason=PairExitReason(str(payload["exit_reason"])),
+        max_adverse_excursion=_record_decimal(payload, "max_adverse_excursion"),
+        max_favorable_excursion=_record_decimal(payload, "max_favorable_excursion"),
+        fakeout_flag=_record_bool(payload.get("fakeout_flag")),
+        runner_success_flag=_record_bool(
+            payload.get("runner_success_flag", payload.get("runner_reached_breakeven"))
+        ),
+        entry_spread_cost_ticks=_record_decimal(payload, "entry_spread_cost_ticks"),
+        avg_slippage_ticks=_record_decimal(payload, "avg_slippage_ticks"),
+        latency_ms=_record_int(payload, "latency_ms", default=0),
+        regime=str(payload.get("mode") or payload.get("regime") or "replayed"),
+        long_bot_id=_record_optional_str(payload.get("long_bot_id")),
+        short_bot_id=_record_optional_str(payload.get("short_bot_id")),
+    )
+
+
+def _record_decimal(
+    payload: Mapping[str, object],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> Decimal:
+    value = payload.get(key)
+    if value is None and fallback_key is not None:
+        value = payload.get(fallback_key)
+    if value is None:
+        return Decimal("0")
+    return Decimal(str(value))
+
+
+def _record_int(payload: Mapping[str, object], key: str, *, default: int) -> int:
+    value = payload.get(key)
+    if value is None:
+        return default
+    return int(str(value))
+
+
+def _record_datetime(payload: Mapping[str, object], key: str) -> datetime:
+    value = payload[key]
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    return _as_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+
+
+def _record_side(value: object) -> LegSide | None:
+    if value is None:
+        return None
+    return LegSide(str(value))
+
+
+def _record_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _record_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _write_online_learning_state(
+    path: Path,
+    learning_state: OnlineLearningState,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps(
+                _json_safe_mapping(learning_state.to_payload()),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _bot_utilization_payload(
+    curator: CuratorBot,
+    learning_state: OnlineLearningState,
+) -> dict[str, object]:
+    return {
+        bot_id: {
+            "state": bot.state.value,
+            "assigned_pair_id": bot.assigned_pair_id,
+            "assignment_count": learning_state.bot_assignment_counts.get(bot_id, 0),
+            "realized_pnl_ticks": str(bot.realized_pnl_ticks),
+            "paper_enabled": bot.config.paper_enabled,
+            "live_enabled": bot.config.live_enabled,
+        }
+        for bot_id, bot in curator.bots.items()
+    }
 
 
 def _write_heartbeat(path: Path, cycle: LivePaperSwarmCycle) -> None:

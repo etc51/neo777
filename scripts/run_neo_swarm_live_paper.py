@@ -44,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("data/monitoring/neo_universal_swarm_heartbeat.txt"),
     )
     parser.add_argument(
+        "--online-learning-state",
+        type=Path,
+        default=None,
+        help="Online learning JSON state. Defaults to reports-dir/online_learning_state.json.",
+    )
+    parser.add_argument(
         "--instrument",
         action="append",
         choices=[instrument.value for instrument in SwarmInstrument],
@@ -68,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             reports_dir=args.reports_dir,
             dashboard_state_path=args.dashboard_state,
             heartbeat_path=args.heartbeat,
+            online_learning_state_path=args.online_learning_state,
             instruments=instruments,
             max_cycles=args.max_cycles,
         )

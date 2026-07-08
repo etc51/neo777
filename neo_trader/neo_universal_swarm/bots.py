@@ -102,6 +102,7 @@ class CuratorBot:
     closed_pairs: list[PairLabel] = field(default_factory=list)
     rejections: dict[RejectionReason, int] = field(default_factory=dict)
     _pair_sequence: int = 0
+    _bot_rotation_index: int = 0
 
     def __post_init__(self) -> None:
         self.bots = {
@@ -118,7 +119,12 @@ class CuratorBot:
         return sum((bot.realized_pnl_ticks for bot in self.bots.values()), Decimal("0"))
 
     def free_bots(self) -> tuple[UniversalAccountBot, ...]:
-        return tuple(bot for bot in self.bots.values() if bot.is_free)
+        bots = tuple(self.bots.values())
+        if not bots:
+            return ()
+        offset = self._bot_rotation_index % len(bots)
+        rotated = bots[offset:] + bots[:offset]
+        return tuple(bot for bot in rotated if bot.is_free)
 
     def evaluate_entry(self, snapshot: BookSnapshot) -> PairEVPrediction:
         """Evaluate the model and record the decision event."""
@@ -142,12 +148,17 @@ class CuratorBot:
             )
         return prediction
 
-    def maybe_open_pair(self, snapshot: BookSnapshot) -> ActivePair | None:
+    def maybe_open_pair(
+        self,
+        snapshot: BookSnapshot,
+        *,
+        prediction: PairEVPrediction | None = None,
+    ) -> ActivePair | None:
         """Open a pair only if the model gate passes and two bots are free."""
 
-        prediction = self.evaluate_entry(snapshot)
-        if not prediction.trade_allowed:
-            self._reject(prediction.rejection_reason or RejectionReason.MODEL)
+        resolved_prediction = prediction or self.evaluate_entry(snapshot)
+        if not resolved_prediction.trade_allowed:
+            self._reject(resolved_prediction.rejection_reason or RejectionReason.MODEL)
             return None
 
         free_bots = self.free_bots()
@@ -159,6 +170,9 @@ class CuratorBot:
         pair_id = f"PAIR_{self._pair_sequence:06d}"
         command_id = f"CURATOR_OPEN_{pair_id}"
         long_bot, short_bot = free_bots[0], free_bots[1]
+        self._bot_rotation_index = (
+            self._bot_index(short_bot.bot_id) + 1
+        ) % max(len(self.bots), 1)
         long_bot.assign_leg(command_id=command_id, pair_id=pair_id, side=LegSide.LONG)
         short_bot.assign_leg(command_id=command_id, pair_id=pair_id, side=LegSide.SHORT)
         active_pair = ActivePair(
@@ -167,10 +181,10 @@ class CuratorBot:
             long_bot_id=long_bot.bot_id,
             short_bot_id=short_bot.bot_id,
             opened_at=snapshot.timestamp,
-            stop_loss_ticks=prediction.best_stop_loss_ticks,
-            breakeven_ticks=prediction.best_stop_loss_ticks,
-            model_ev_ticks=prediction.pair_ev_ticks,
-            entry_reason_codes=prediction.reason_codes,
+            stop_loss_ticks=resolved_prediction.best_stop_loss_ticks,
+            breakeven_ticks=resolved_prediction.best_stop_loss_ticks,
+            model_ev_ticks=resolved_prediction.pair_ev_ticks,
+            entry_reason_codes=resolved_prediction.reason_codes,
         )
         self.active_pairs[pair_id] = active_pair
         if self.event_store is not None:
@@ -182,10 +196,10 @@ class CuratorBot:
                     "pair_id": pair_id,
                     "long_bot_id": long_bot.bot_id,
                     "short_bot_id": short_bot.bot_id,
-                    "model_ev_ticks": str(prediction.pair_ev_ticks),
-                    "stop_loss_ticks": prediction.best_stop_loss_ticks,
-                    "breakeven_ticks": prediction.best_stop_loss_ticks,
-                    "entry_reason_codes": list(prediction.reason_codes),
+                    "model_ev_ticks": str(resolved_prediction.pair_ev_ticks),
+                    "stop_loss_ticks": resolved_prediction.best_stop_loss_ticks,
+                    "breakeven_ticks": resolved_prediction.best_stop_loss_ticks,
+                    "entry_reason_codes": list(resolved_prediction.reason_codes),
                 },
             )
         return active_pair
@@ -241,6 +255,12 @@ class CuratorBot:
 
     def _reject(self, reason: RejectionReason) -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + 1
+
+    def _bot_index(self, bot_id: str) -> int:
+        for index, current_bot_id in enumerate(self.bots):
+            if current_bot_id == bot_id:
+                return index
+        return 0
 
 
 def _split_label_pnl(label: PairLabel) -> tuple[Decimal, Decimal]:
