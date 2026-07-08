@@ -20,6 +20,8 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
             "market": [],
             "bots": [],
             "positions": [],
+            "baskets": [],
+            "active_legs": [],
             "trades": [],
             "curator": [],
             "data_quality": [],
@@ -49,7 +51,7 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
         f"""
         SELECT va.bot_id, va.{ACCT_COL}, va.cash, va.equity, va.realized_pnl,
                va.unrealized_pnl, va.open_position_side, va.open_position_instrument,
-               va.open_position_qty,
+               va.open_position_qty, va.updated_at,
                COALESCE(t.trades, 0) AS trades,
                COALESCE(t.net_pnl, 0) AS net_pnl
         FROM virtual_accounts va
@@ -88,6 +90,16 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
         "connection": {"tbank": "read-only or unavailable", "stale": False},
         "market": _market_rows(market, latest_books),
         "bots": bots,
+        "baskets": [
+            _row_dict(row)
+            for row in storage.fetch_all("SELECT * FROM baskets ORDER BY opened_at DESC LIMIT 20")
+        ],
+        "active_legs": [
+            _row_dict(row)
+            for row in storage.fetch_all(
+                "SELECT * FROM basket_legs WHERE status = 'OPEN' ORDER BY entry_time"
+            )
+        ],
         "positions": [
             _row_dict(row)
             for row in storage.fetch_all("SELECT * FROM positions WHERE status = 'OPEN'")
@@ -137,12 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     st.dataframe(state["market"], use_container_width=True)
     st.subheader("10 Bots")
     st.dataframe(state["bots"], use_container_width=True)
-    st.subheader("Instrument Comparison")
-    st.dataframe(state["instrument_comparison"], use_container_width=True)
-    st.subheader("Equity Curve")
-    st.dataframe(state["equity_curve"], use_container_width=True)
-    st.subheader("Open Positions")
-    st.dataframe(state["positions"], use_container_width=True)
+    st.subheader("Baskets A/B")
+    st.dataframe(state["baskets"], use_container_width=True)
+    st.subheader("Active Legs")
+    st.dataframe(state["active_legs"], use_container_width=True)
     st.subheader("Last 50 Trades")
     st.dataframe(state["trades"], use_container_width=True)
     st.subheader("Curator Decisions")

@@ -12,103 +12,25 @@ from neo_swarm_scalper.types import BotAction, BotDecision, BotParams, FeatureSn
 
 
 def build_default_bots(config: NeoSwarmScalperConfig) -> list[BotParams]:
-    """Create the required ten paper bots and one account per bot."""
+    """Create the required ten paper bots and one 24k account per bot."""
 
-    return [
-        _bot(
-            "bot_01_neobtc_long_impulse",
-            "sim_01",
-            ("neobitcoin",),
-            (PositionSide.LONG,),
-            3,
-            2,
-            45,
-            3,
-        ),
-        _bot(
-            "bot_02_neobtc_short_impulse",
-            "sim_02",
-            ("neobitcoin",),
-            (PositionSide.SHORT,),
-            3,
-            2,
-            45,
-            3,
-        ),
-        _bot(
-            "bot_03_neoeth_long_impulse", "sim_03", ("neoether",), (PositionSide.LONG,), 3, 2, 45, 3
-        ),
-        _bot(
-            "bot_04_neoeth_short_impulse",
-            "sim_04",
-            ("neoether",),
-            (PositionSide.SHORT,),
-            3,
-            2,
-            45,
-            3,
-        ),
-        _bot(
-            "bot_05_orderbook_pressure_long",
-            "sim_05",
-            ("neobitcoin", "neoether"),
-            (PositionSide.LONG,),
-            4,
-            3,
-            60,
-            5,
-        ),
-        _bot(
-            "bot_06_orderbook_pressure_short",
-            "sim_06",
-            ("neobitcoin", "neoether"),
-            (PositionSide.SHORT,),
-            4,
-            3,
-            60,
-            5,
-        ),
-        _bot(
-            "bot_07_vwap_reversion",
-            "sim_07",
-            ("neobitcoin", "neoether"),
-            (PositionSide.LONG, PositionSide.SHORT),
-            5,
-            3,
-            90,
-            8,
-        ),
-        _bot(
-            "bot_08_breakout_trap",
-            "sim_08",
-            ("neobitcoin", "neoether"),
-            (PositionSide.LONG, PositionSide.SHORT),
-            4,
-            2,
-            60,
-            8,
-        ),
-        _bot(
-            "bot_09_range_scalper",
-            "sim_09",
-            ("neobitcoin", "neoether"),
-            (PositionSide.LONG, PositionSide.SHORT),
-            3,
-            2,
-            75,
-            10,
-        ),
-        _bot(
-            "bot_10_adaptive_challenger",
-            "sim_10",
-            ("neobitcoin", "neoether"),
-            (PositionSide.LONG, PositionSide.SHORT),
-            6,
-            4,
-            120,
-            6,
-        ),
-    ]
+    del config
+    bots: list[BotParams] = []
+    for index in range(1, 11):
+        basket = "A" if index <= 5 else "B"
+        bots.append(
+            _bot(
+                f"bot_{index:02d}_basket_{basket.lower()}",
+                f"sim_{index:02d}",
+                ("neoether",),
+                (PositionSide.LONG, PositionSide.SHORT),
+                0,
+                0,
+                3600,
+                0,
+            )
+        )
+    return bots
 
 
 class NeoScalperBot:
@@ -193,10 +115,8 @@ class NeoScalperBot:
             return _impulse(
                 allowed.get("neoether"), PositionSide.LONG, self.config.scalping.min_impulse_ticks
             )
-        if bot_id == "bot_04_neoeth_short_impulse":
-            return _impulse(
-                allowed.get("neoether"), PositionSide.SHORT, self.config.scalping.min_impulse_ticks
-            )
+        if bot_id in {"bot_04_neoeth_short_impulse", "bot_04_basket_a"}:
+            return _eth_impulse_short(allowed.get("neoether"), self.config)
         if bot_id == "bot_05_orderbook_pressure_long":
             return _orderbook_pressure(allowed.values(), PositionSide.LONG)
         if bot_id == "bot_06_orderbook_pressure_short":
@@ -276,6 +196,60 @@ def _impulse(
     if side is PositionSide.SHORT and down >= min_impulse_ticks:
         return (features.instrument, side, min(Decimal("1"), down / Decimal("8")), "down impulse")
     return None
+
+
+def _eth_impulse_short(
+    features: FeatureSnapshot | None,
+    config: NeoSwarmScalperConfig,
+) -> tuple[str, PositionSide, Decimal, str] | None:
+    if features is None:
+        return None
+    if _blocked_by_quality(features):
+        return None
+    regime = str(features.values.get("regime") or features.values.get("market_regime") or "")
+    if regime in {"chaos", "chaotic", "low_liquidity"}:
+        return None
+    if _truthy(features.values.get("pre_midnight_block")):
+        return None
+
+    price = _first_decimal(features, "last_price", "mid_price", "best_bid")
+    rolling_low = _first_decimal(features, "rolling_low", "rolling_low_5m", "rolling_low_15m")
+    if price is None or rolling_low is None or price >= rolling_low:
+        return None
+
+    return_3m = _d(features, "return_3m")
+    return_5m = _d(features, "return_5m")
+    if return_3m >= 0 and return_5m >= 0:
+        return None
+
+    down = _d(features, "impulse_score_down") or _d(features, "impulse_down_score")
+    if down < config.scalping.min_impulse_ticks:
+        return None
+
+    trend_score = _d(features, "trend_score")
+    if trend_score > Decimal("0.5"):
+        return None
+
+    confidence = _d(features, "confidence_score")
+    if confidence <= 0:
+        confidence = min(Decimal("1"), down / Decimal("8"))
+    if confidence < Decimal("0.25"):
+        return None
+
+    if not _truthy(features.values.get("orderbook_missing")):
+        spread_ticks = _d(features, "spread_ticks")
+        if spread_ticks > config.scalping.spread_max_ticks:
+            return None
+        spread_bps = _d(features, "spread_bps")
+        if spread_bps > Decimal("50"):
+            return None
+
+    return (
+        features.instrument,
+        PositionSide.SHORT,
+        min(confidence, Decimal("1")),
+        "eth impulse short: price below rolling low, negative return, down impulse",
+    )
 
 
 def _orderbook_pressure(
@@ -407,6 +381,24 @@ def _d(features: FeatureSnapshot, key: str) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal("0")
+
+
+def _first_decimal(features: FeatureSnapshot, *keys: str) -> Decimal | None:
+    for key in keys:
+        value = features.values.get(key)
+        if value is None:
+            continue
+        try:
+            return Decimal(str(value))
+        except Exception:
+            continue
+    return None
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def _params_payload(params: BotParams) -> dict[str, object]:

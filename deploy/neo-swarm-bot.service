@@ -1,0 +1,24 @@
+[Unit]
+Description=neo_swarm_scalper ETH basket paper/live-data bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-trader
+Group=neo-trader
+WorkingDirectory=/opt/neo_trader
+EnvironmentFile=/etc/neo-trader/neo-swarm-scalper.env
+Environment=REAL_TRADING_ENABLED=false
+Environment=ALLOW_REAL_ORDERS=false
+Environment=PAPER_LIVE_DATA_ONLY=true
+ExecStart=/opt/neo_trader/.venv/bin/python -m neo_swarm_scalper.run --config configs/neo_swarm_scalper.yaml --poll-interval 5 --db data/neo_swarm_scalper.sqlite --reports-dir reports/neo_swarm_scalper
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

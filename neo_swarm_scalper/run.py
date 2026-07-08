@@ -1,4 +1,4 @@
-﻿"""Runtime loop for `neo_swarm_scalper`."""
+"""Runtime loop for ETH 5m Reversal Rescue Basket paper/live-data mode."""
 
 from __future__ import annotations
 
@@ -10,18 +10,30 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from neo_swarm_scalper.bots import NeoScalperBot, build_default_bots
+from neo_swarm_scalper.basket import (
+    Basket,
+    BasketEngine,
+    BasketLeg,
+    execution_cost_bps,
+    leg_pnl,
+)
+from neo_swarm_scalper.bots import build_default_bots
 from neo_swarm_scalper.config import DEFAULT_CONFIG_PATH, NeoSwarmScalperConfig, load_config
-from neo_swarm_scalper.curator import NeoSwarmCurator
-from neo_swarm_scalper.feature_engine import NeoFeatureEngine
-from neo_swarm_scalper.labels import update_future_labels
 from neo_swarm_scalper.market_data import NeoMarketDataFeed, ReadOnlyMarketDataProvider
 from neo_swarm_scalper.reports import write_report
 from neo_swarm_scalper.safety import apply_paper_safety_env
-from neo_swarm_scalper.simulator import PaperExecutionError, PaperExecutionSimulator
 from neo_swarm_scalper.storage import SQLiteJournal
-from neo_swarm_scalper.types import BotAction, MarketSnapshot
+from neo_swarm_scalper.types import (
+    BotAction,
+    BotDecision,
+    MarketSnapshot,
+    Position,
+    PositionSide,
+    Side,
+    VirtualAccount,
+)
 from neo_trader.runtime import get_runtime_commit_hash
 
 Clock = Callable[[], datetime]
@@ -34,6 +46,7 @@ class RuntimeResult:
     db_path: Path
     report_path: Path | None
     real_orders_disabled: bool
+    token_masked: bool
 
 
 def run_swarm(
@@ -56,87 +69,44 @@ def run_swarm(
         timestamp_utc=runtime_start,
         level="INFO",
         component="runtime",
-        message="neo_swarm_scalper started in paper_live_data mode",
+        message="neo_swarm_scalper started: paper/live-data only, real orders disabled",
         details={
-            "real_orders_enabled": False,
-            "paper_trading_enabled": True,
-            "allow_real_orders": False,
+            "real_orders_disabled": True,
+            "token_masked": True,
+            "strategy": "ETH 5m Reversal Rescue Basket",
         },
     )
+
     feed = NeoMarketDataFeed(config, storage=storage, provider=provider)
     feed.connect()
-    engine = NeoFeatureEngine()
-    bot_params = build_default_bots(config)
-    bots = [NeoScalperBot(params, config) for params in bot_params]
-    simulator = PaperExecutionSimulator(config, storage=storage)
-    simulator.initialize_accounts(bot_params)
-    curator = NeoSwarmCurator(config, storage=storage, bots=bot_params)
-    interval = config.data.orderbook_depth * 0
-    poll_interval = config.data.stale_data_sec if poll_interval_sec is None else poll_interval_sec
-    cycles = 0
-    last_report_at = runtime_start
+    bots = build_default_bots(config)
+    accounts = _initialize_accounts(config, storage, bots)
+    engine = BasketEngine(config)
     report_path: Path | None = None
-    target_cycles = max_cycles
-    while target_cycles is None or cycles < target_cycles:
+    last_report_at = runtime_start
+    cycles = 0
+
+    while max_cycles is None or cycles < max_cycles:
         cycles += 1
         timestamp = now()
         snapshots = feed.poll_once(timestamp_utc=timestamp)
-        features_by_instrument = _features_from_snapshots(engine, storage, snapshots)
-        snapshot_by_instrument = {snapshot.instrument: snapshot for snapshot in snapshots}
-        _settle_open_positions(
-            simulator=simulator,
-            curator=curator,
-            bot_params=bot_params,
-            snapshot_by_instrument=snapshot_by_instrument,
-            timestamp=timestamp,
-        )
-        for bot in bots:
-            params = bot.params
-            account = simulator.accounts[params.account_ref]
-            decision = bot.decide(
-                features=features_by_instrument,
-                has_open_position=account.open_position is not None,
+        snapshot = _eth_snapshot(snapshots)
+        if snapshot is None:
+            storage.record_data_quality(
                 timestamp_utc=timestamp,
+                instrument="neoether",
+                issue_type="missing_eth_snapshot",
+                severity="warning",
+                details="ETHUSDperpA snapshot unavailable",
             )
-            storage.record_bot_decision(decision)
-            if decision.action not in {BotAction.OPEN_LONG, BotAction.OPEN_SHORT}:
-                continue
-            if decision.instrument is None or decision.side is None:
-                continue
-            features = features_by_instrument.get(decision.instrument)
-            if not curator.approve_trade(
-                decision=decision,
-                account=account,
-                features=features,
-                timestamp_utc=timestamp,
-            ):
-                continue
-            snapshot = snapshot_by_instrument.get(decision.instrument)
-            if snapshot is None:
-                continue
-            try:
-                simulator.open_position(
-                    bot=params,
-                    snapshot=snapshot,
-                    side=decision.side,
-                    qty=Decimal(config.simulation.base_lot),
-                    timestamp_utc=timestamp,
-                )
-                params.last_trade_time = timestamp
-            except PaperExecutionError as exc:
-                storage.record_data_quality(
-                    timestamp_utc=timestamp,
-                    instrument=decision.instrument,
-                    issue_type="paper_execution_reject",
-                    severity="warning",
-                    details=str(exc),
-                )
-        curator.update_bot_parameters(timestamp_utc=timestamp)
-        update_future_labels(storage, as_of=timestamp)
-        if (
-            config.reports.enabled
-            and (timestamp - last_report_at).total_seconds() >= config.reports.interval_sec
-        ):
+        else:
+            candles = _recent_5m_candles(storage)
+            _record_wait_decisions(storage, bots, snapshot, timestamp, engine)
+            _advance_engine(engine, storage, config, bots, accounts, candles, snapshot, timestamp)
+            _mark_accounts(config, storage, accounts, engine, snapshot, timestamp)
+
+        report_due = (timestamp - last_report_at).total_seconds() >= config.reports.interval_sec
+        if config.reports.enabled and report_due:
             report_path = write_report(
                 storage=storage,
                 config=config,
@@ -145,10 +115,14 @@ def run_swarm(
                 commit_hash=get_runtime_commit_hash(),
             )
             last_report_at = timestamp
-        if target_cycles is None:
-            sleep(max(poll_interval + interval, 0))
-        elif poll_interval > 0:
-            sleep(poll_interval)
+        if max_cycles is None:
+            interval = (
+                config.data.stale_data_sec if poll_interval_sec is None else poll_interval_sec
+            )
+            sleep(max(interval, 0))
+        elif poll_interval_sec and poll_interval_sec > 0:
+            sleep(poll_interval_sec)
+
     if config.reports.enabled:
         report_path = write_report(
             storage=storage,
@@ -158,145 +132,441 @@ def run_swarm(
             commit_hash=get_runtime_commit_hash(),
             final=True,
         )
-    return RuntimeResult(
-        cycles=cycles,
-        db_path=storage.path,
-        report_path=report_path,
-        real_orders_disabled=True,
+    return RuntimeResult(cycles, storage.path, report_path, True, True)
+
+
+def _advance_engine(
+    engine: BasketEngine,
+    storage: SQLiteJournal,
+    config: NeoSwarmScalperConfig,
+    bots: list[Any],
+    accounts: dict[str, VirtualAccount],
+    candles: list[dict[str, Decimal]],
+    snapshot: MarketSnapshot,
+    timestamp: datetime,
+) -> None:
+    for basket in list(engine.baskets.values()):
+        reason = engine.close_reason(basket, snapshot, timestamp)
+        if reason is not None:
+            engine.close_basket(basket, snapshot, timestamp, reason)
+            _persist_basket_close(storage, basket, snapshot, timestamp, reason)
+            continue
+        leg = engine.maybe_rescue(basket, snapshot, timestamp)
+        if leg is not None:
+            _persist_leg_open(storage, leg, snapshot, "RESCUE")
+            _curator(
+                storage,
+                leg.bot_id,
+                leg.account_ref,
+                basket.name,
+                "ADD_RESCUE_LEG",
+                timestamp,
+                leg.side.value,
+            )
+        storage.record_basket(
+            basket_id=basket.basket_id,
+            name=basket.name,
+            status=basket.status,
+            opened_at=basket.opened_at,
+            anchor_price=basket.anchor_price,
+            unrealized_pnl=engine.pnl(basket, snapshot),
+        )
+
+    if len(engine.baskets) >= config.strategy.max_parallel_baskets:
+        return
+    if "A" not in engine.baskets and engine.can_enter(candles, snapshot):
+        basket = engine.open_basket(
+            name="A",
+            bot_ids=tuple(bot.bot_id for bot in bots[:5]),
+            account_refs=tuple(bot.account_ref for bot in bots[:5]),
+            snapshot=snapshot,
+            now=timestamp,
+        )
+        _persist_basket_open(storage, basket, snapshot)
+        _curator(
+            storage,
+            basket.bot_ids[0],
+            basket.account_refs[0],
+            "A",
+            "OPEN_BASKET",
+            timestamp,
+            "entry_range",
+        )
+    elif (
+        "A" in engine.baskets
+        and "B" not in engine.baskets
+        and engine.can_open_basket_b(snapshot, timestamp)
+    ):
+        if engine.can_enter(candles, snapshot):
+            basket = engine.open_basket(
+                name="B",
+                bot_ids=tuple(bot.bot_id for bot in bots[5:10]),
+                account_refs=tuple(bot.account_ref for bot in bots[5:10]),
+                snapshot=snapshot,
+                now=timestamp,
+            )
+            _persist_basket_open(storage, basket, snapshot)
+            _curator(
+                storage,
+                basket.bot_ids[0],
+                basket.account_refs[0],
+                "B",
+                "OPEN_BASKET",
+                timestamp,
+                "stagger_ok",
+            )
+
+
+def _initialize_accounts(
+    config: NeoSwarmScalperConfig,
+    storage: SQLiteJournal,
+    bots: list[Any],
+) -> dict[str, VirtualAccount]:
+    accounts: dict[str, VirtualAccount] = {}
+    for bot in bots:
+        account = VirtualAccount(
+            account_ref=bot.account_ref,
+            bot_id=bot.bot_id,
+            cash=config.simulation.initial_cash_per_account,
+            equity=config.simulation.initial_cash_per_account,
+        )
+        storage.upsert_account(account)
+        accounts[bot.account_ref] = account
+    return accounts
+
+
+def _mark_accounts(
+    config: NeoSwarmScalperConfig,
+    storage: SQLiteJournal,
+    accounts: dict[str, VirtualAccount],
+    engine: BasketEngine,
+    snapshot: MarketSnapshot,
+    timestamp: datetime,
+) -> None:
+    unrealized_by_account = {key: Decimal("0") for key in accounts}
+    for basket in engine.baskets.values():
+        price = snapshot.mid_price or snapshot.executable_price
+        if price is None:
+            continue
+        for leg in basket.open_legs:
+            unrealized_by_account[leg.account_ref] += leg_pnl(leg, price)
+    realized_by_account = {key: Decimal("0") for key in accounts}
+    for basket in engine.closed:
+        for leg in basket.legs:
+            if leg.exit_price is not None:
+                realized_by_account[leg.account_ref] += leg_pnl(leg, leg.exit_price)
+    for account_ref, account in accounts.items():
+        account.realized_pnl = realized_by_account[account_ref]
+        account.unrealized_pnl = unrealized_by_account[account_ref]
+        account.equity = (
+            config.simulation.initial_cash_per_account
+            + account.realized_pnl
+            + account.unrealized_pnl
+        )
+        account.last_update_time = timestamp
+        storage.upsert_account(account)
+
+
+def _persist_basket_open(storage: SQLiteJournal, basket: Basket, snapshot: MarketSnapshot) -> None:
+    storage.record_basket(
+        basket_id=basket.basket_id,
+        name=basket.name,
+        status=basket.status,
+        opened_at=basket.opened_at,
+        anchor_price=basket.anchor_price,
+        unrealized_pnl=Decimal("0"),
+    )
+    for leg in basket.legs:
+        _persist_leg_open(storage, leg, snapshot, "BASE_HEDGE")
+
+
+def _persist_leg_open(
+    storage: SQLiteJournal, leg: BasketLeg, snapshot: MarketSnapshot, order_type: str
+) -> None:
+    side = Side.BUY if leg.side is PositionSide.LONG else Side.SELL
+    storage.record_bot_decision(
+        BotDecision(
+            decision_id=f"BOT_DECISION_{uuid4().hex}",
+            timestamp_utc=leg.entry_time,
+            bot_id=leg.bot_id,
+            account_ref=leg.account_ref,
+            instrument=snapshot.instrument,
+            action=BotAction.OPEN_LONG if leg.side is PositionSide.LONG else BotAction.OPEN_SHORT,
+            side=leg.side,
+            confidence=Decimal("1"),
+            reason=f"{order_type.lower()} entry",
+            features_snapshot={
+                "last_price": str(snapshot.last_price or snapshot.executable_price or ""),
+                "mid_price": str(snapshot.mid_price or ""),
+                "spread_ticks": str(snapshot.spread_ticks or ""),
+                "tick_size": str(snapshot.tick_size or ""),
+            },
+            bot_params={"basket_id": leg.basket_id, "order_type": order_type},
+        )
+    )
+    order_id = f"SIM_ORDER_{uuid4().hex}"
+    storage.record_order(
+        order_id=order_id,
+        timestamp_utc=leg.entry_time,
+        bot_id=leg.bot_id,
+        account_ref=leg.account_ref,
+        instrument=snapshot.instrument,
+        side=side.value,
+        qty=leg.qty,
+        order_type=f"{order_type}_PAPER",
+        requested_price=snapshot.mid_price,
+        status="FILLED",
+    )
+    storage.record_fill(
+        fill_id=f"SIM_FILL_{uuid4().hex}",
+        order_id=order_id,
+        timestamp_utc=leg.entry_time,
+        fill_price=leg.entry_price,
+        qty=leg.qty,
+        spread_ticks=snapshot.spread_ticks,
+        slippage_ticks=Decimal("1"),
+        commission=Decimal("0"),
+        fill_quality="bid_ask_with_slippage",
+    )
+    storage.record_basket_leg(
+        leg_id=leg.leg_id,
+        basket_id=leg.basket_id,
+        bot_id=leg.bot_id,
+        account_ref=leg.account_ref,
+        side=leg.side.value,
+        qty=leg.qty,
+        entry_price=leg.entry_price,
+        entry_time=leg.entry_time,
+        status=leg.status,
     )
 
 
-def _features_from_snapshots(
-    engine: NeoFeatureEngine,
+def _persist_basket_close(
     storage: SQLiteJournal,
-    snapshots: Sequence[MarketSnapshot],
-) -> dict[str, Any]:
-    result: dict[str, Any] = {}
+    basket: Basket,
+    snapshot: MarketSnapshot,
+    timestamp: datetime,
+    reason: str,
+) -> None:
+    storage.record_basket(
+        basket_id=basket.basket_id,
+        name=basket.name,
+        status=basket.status,
+        opened_at=basket.opened_at,
+        closed_at=timestamp,
+        anchor_price=basket.anchor_price,
+        close_reason=reason,
+        realized_pnl=basket.realized_pnl,
+        unrealized_pnl=Decimal("0"),
+    )
+    for leg in basket.legs:
+        storage.record_basket_leg(
+            leg_id=leg.leg_id,
+            basket_id=leg.basket_id,
+            bot_id=leg.bot_id,
+            account_ref=leg.account_ref,
+            side=leg.side.value,
+            qty=leg.qty,
+            entry_price=leg.entry_price,
+            entry_time=leg.entry_time,
+            status=leg.status,
+            exit_price=leg.exit_price,
+            exit_time=timestamp,
+        )
+        if leg.exit_price is None:
+            continue
+        exit_side = Side.SELL if leg.side is PositionSide.LONG else Side.BUY
+        order_id = f"SIM_ORDER_{uuid4().hex}"
+        storage.record_order(
+            order_id=order_id,
+            timestamp_utc=timestamp,
+            bot_id=leg.bot_id,
+            account_ref=leg.account_ref,
+            instrument=snapshot.instrument,
+            side=exit_side.value,
+            qty=leg.qty,
+            order_type="BASKET_CLOSE_PAPER",
+            requested_price=snapshot.mid_price,
+            status="FILLED",
+        )
+        storage.record_fill(
+            fill_id=f"SIM_FILL_{uuid4().hex}",
+            order_id=order_id,
+            timestamp_utc=timestamp,
+            fill_price=leg.exit_price,
+            qty=leg.qty,
+            spread_ticks=snapshot.spread_ticks,
+            slippage_ticks=Decimal("1"),
+            commission=Decimal("0"),
+            fill_quality="bid_ask_with_slippage",
+        )
+        position = Position(
+            position_id=leg.leg_id,
+            bot_id=leg.bot_id,
+            account_ref=leg.account_ref,
+            instrument=snapshot.instrument,
+            side=leg.side,
+            qty=leg.qty,
+            entry_price=leg.entry_price,
+            entry_time=leg.entry_time,
+            status="CLOSED",
+            exit_price=leg.exit_price,
+            exit_time=timestamp,
+        )
+        pnl = leg_pnl(leg, leg.exit_price)
+        storage.record_position(position)
+        storage.record_trade(
+            trade_id=f"SIM_TRADE_{uuid4().hex}",
+            position=position,
+            gross_pnl=pnl,
+            commission=Decimal("0"),
+            slippage_cost=Decimal("0"),
+            net_pnl=pnl,
+            duration_sec=(timestamp - leg.entry_time).total_seconds(),
+            exit_reason=reason,
+        )
+
+
+def _record_wait_decisions(
+    storage: SQLiteJournal,
+    bots: list[Any],
+    snapshot: MarketSnapshot,
+    timestamp: datetime,
+    engine: BasketEngine,
+) -> None:
+    features = {
+        "spread_slippage_bps_side": str(execution_cost_bps(snapshot, load_config())),
+        "active_baskets": len(engine.baskets),
+    }
+    for bot in bots:
+        storage.record_bot_decision(
+            BotDecision(
+                decision_id=f"BOT_DECISION_{uuid4().hex}",
+                timestamp_utc=timestamp,
+                bot_id=bot.bot_id,
+                account_ref=bot.account_ref,
+                instrument="neoether",
+                action=BotAction.WAIT,
+                side=None,
+                confidence=Decimal("0"),
+                reason="basket engine controls entries",
+                features_snapshot=features,
+                bot_params={"basket": "A" if bot.bot_id <= "bot_05" else "B"},
+            )
+        )
+
+
+def _curator(
+    storage: SQLiteJournal,
+    bot_id: str,
+    account_ref: str,
+    instrument: str,
+    action: str,
+    timestamp: datetime,
+    reason: str,
+) -> None:
+    storage.record_curator_decision(
+        decision_id=f"CURATOR_{uuid4().hex}",
+        timestamp_utc=timestamp,
+        bot_id=bot_id,
+        account_ref=account_ref,
+        instrument=instrument,
+        action=action,
+        old_params={},
+        new_params={},
+        reason=reason,
+        metrics_snapshot={},
+    )
+
+
+def _eth_snapshot(snapshots: Sequence[MarketSnapshot]) -> MarketSnapshot | None:
     for snapshot in snapshots:
-        features = engine.update(snapshot)
-        storage.record_features(features)
-        result[snapshot.instrument] = features
+        if snapshot.instrument == "neoether" or snapshot.metadata.ticker == "ETHUSDperpA":
+            return snapshot
+    return None
+
+
+def _recent_5m_candles(storage: SQLiteJournal) -> list[dict[str, Decimal]]:
+    rows = storage.fetch_all(
+        """
+        SELECT open, high, low, close, volume
+        FROM candles_5m
+        WHERE instrument = 'neoether'
+        ORDER BY id DESC
+        LIMIT 5
+        """
+    )
+    result = []
+    for row in reversed(rows):
+        result.append(
+            {
+                "open": Decimal(str(row["open"])),
+                "high": Decimal(str(row["high"])),
+                "low": Decimal(str(row["low"])),
+                "close": Decimal(str(row["close"])),
+                "volume": Decimal(str(row["volume"])),
+            }
+        )
     return result
 
 
-def _settle_open_positions(
-    *,
-    simulator: PaperExecutionSimulator,
-    curator: NeoSwarmCurator,
-    bot_params: list[Any],
-    snapshot_by_instrument: Mapping[str, MarketSnapshot],
-    timestamp: datetime,
-) -> None:
-    for bot in bot_params:
-        account = simulator.accounts[bot.account_ref]
-        position = account.open_position
-        if position is None:
-            continue
-        snapshot = snapshot_by_instrument.get(position.instrument)
-        if snapshot is None:
-            continue
-        exit_reason = simulator.evaluate_exit(
-            account=account,
-            bot=bot,
-            snapshot=snapshot,
-            timestamp_utc=timestamp,
-        )
-        if exit_reason is None:
-            continue
-        curator.close_decision(
-            bot_id=bot.bot_id,
-            account_ref=bot.account_ref,
-            instrument=position.instrument,
-            reason=exit_reason,
-            timestamp_utc=timestamp,
-        )
-        pnl = simulator.close_position(
-            account=account,
-            snapshot=snapshot,
-            timestamp_utc=timestamp,
-            exit_reason=exit_reason,
-        )
-        bot.last_trade_time = timestamp
-        bot.cooldown_sec = (
-            curator.config.risk.cooldown_after_win_sec
-            if pnl >= 0
-            else curator.config.risk.cooldown_after_loss_sec
-        )
-
-
 class MockNeoMarketDataProvider:
-    """Deterministic read-only provider used by smoke tests."""
+    """Deterministic read-only provider used by tests and smoke runs."""
 
     def __init__(self) -> None:
         self._cycle = 0
 
     def find_instruments(self, query: str) -> Sequence[Mapping[str, Any]]:
-        query_upper = query.upper()
-        if "BTC" in query_upper or "BITCOIN" in query_upper:
-            return [
-                {
-                    "ticker": "BTCUSDperpA",
-                    "figi": "BTCUSDPERP00",
-                    "uid": "4effa274-4e8f-422c-93ff-04aa34fe8e39",
-                    "classCode": "SPBDMFUT",
-                    "name": "Neo Bitcoin",
-                    "instrumentType": "futures",
-                    "exchange": "spb_future",
-                    "currency": "rub",
-                    "lot": 1,
-                    "minPriceIncrement": "0.1",
-                }
-            ]
-        if "ETH" in query_upper or "ETHER" in query_upper or "ETHEREUM" in query_upper:
-            return [
-                {
-                    "ticker": "ETHUSDperpA",
-                    "figi": "ETHUSDPERP00",
-                    "uid": "eceb99e7-5935-412a-9515-975ec4b5e244",
-                    "classCode": "SPBDMFUT",
-                    "name": "Neo Ethereum",
-                    "instrumentType": "futures",
-                    "exchange": "spb_future",
-                    "currency": "rub",
-                    "lot": 1,
-                    "minPriceIncrement": "0.01",
-                }
-            ]
-        return []
+        if "ETH" not in query.upper() and "ETHER" not in query.upper():
+            return []
+        return [
+            {
+                "ticker": "ETHUSDperpA",
+                "figi": "ETHUSDPERP00",
+                "uid": "eceb99e7-5935-412a-9515-975ec4b5e244",
+                "classCode": "SPBDMFUT",
+                "name": "Neo Ethereum",
+                "instrumentType": "futures",
+                "exchange": "spb_future",
+                "currency": "rub",
+                "lot": 1,
+                "minPriceIncrement": "0.01",
+            }
+        ]
 
     def get_trading_status(self, instrument_id: str) -> Mapping[str, Any]:
         return {"instrumentUid": instrument_id, "tradingStatus": "normal_trading"}
 
     def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
-        del depth
+        del instrument_id, depth
         self._cycle += 1
-        is_btc = "4eff" in instrument_id or "BTC" in instrument_id
-        tick = Decimal("0.1") if is_btc else Decimal("0.01")
-        base = Decimal("1000") if is_btc else Decimal("100")
-        direction = Decimal(self._cycle % 9) - Decimal("4")
-        bid = base + (direction * tick * Decimal("8"))
-        ask = bid + tick
-        bid_qty = 250 if direction >= 0 else 45
-        ask_qty = 45 if direction >= 0 else 250
+        path = [
+            Decimal("100"),
+            Decimal("101.4"),
+            Decimal("100.9"),
+            Decimal("100.1"),
+            Decimal("99.2"),
+            Decimal("98.8"),
+        ]
+        mid = path[(self._cycle - 1) % len(path)]
+        bid = mid - Decimal("0.01")
+        ask = mid + Decimal("0.01")
         return {
-            "instrumentUid": instrument_id,
-            "bids": _levels(bid, tick, bid_qty, reverse=True),
-            "asks": _levels(ask, tick, ask_qty, reverse=False),
-            "lastPrice": str((bid + ask) / Decimal("2")),
+            "instrumentUid": "eceb99e7-5935-412a-9515-975ec4b5e244",
+            "bids": [
+                {"price": str(bid - Decimal(i) * Decimal("0.01")), "quantity": 100}
+                for i in range(5)
+            ],
+            "asks": [
+                {"price": str(ask + Decimal(i) * Decimal("0.01")), "quantity": 100}
+                for i in range(5)
+            ],
+            "lastPrice": str(mid),
         }
 
     def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
-        is_btc = "4eff" in instrument_id or "BTC" in instrument_id
-        tick = Decimal("0.1") if is_btc else Decimal("0.01")
-        base = Decimal("1000") if is_btc else Decimal("100")
-        drift = Decimal(self._cycle % 9) - Decimal("4")
-        return [
-            {
-                "price": str(base + (drift * tick * Decimal("8")) + tick),
-                "quantity": "1",
-                "side": "BUY" if drift >= 0 else "SELL",
-            }
-        ]
+        del instrument_id
+        return [{"price": "100", "quantity": "1", "side": "BUY"}]
 
     def get_candles(
         self,
@@ -306,43 +576,21 @@ class MockNeoMarketDataProvider:
         from_time: datetime,
         to_time: datetime,
     ) -> Sequence[Mapping[str, Any]]:
-        del interval, from_time, to_time
-        is_btc = "4eff" in instrument_id or "BTC" in instrument_id
-        tick = Decimal("0.1") if is_btc else Decimal("0.01")
-        base = Decimal("1000") if is_btc else Decimal("100")
-        drift = Decimal(self._cycle % 9) - Decimal("4")
-        close = base + (drift * tick * Decimal("8"))
+        del instrument_id, interval, from_time, to_time
+        base = Decimal("100")
         return [
             {
-                "open": str(close - tick),
-                "high": str(close + tick),
-                "low": str(close - (tick * Decimal("2"))),
-                "close": str(close),
+                "open": str(base),
+                "high": str(base + Decimal("1.35")),
+                "low": str(base),
+                "close": str(base + Decimal("0.4")),
                 "volume": "10",
             }
         ]
 
 
-def _levels(
-    price: Decimal,
-    tick: Decimal,
-    top_qty: int,
-    *,
-    reverse: bool,
-) -> list[dict[str, object]]:
-    return [
-        {
-            "price": str(
-                price - (tick * Decimal(index)) if reverse else price + (tick * Decimal(index))
-            ),
-            "quantity": top_qty - (index * 10),
-        }
-        for index in range(5)
-    ]
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run paper/live-data neo swarm scalper")
+    parser = argparse.ArgumentParser(description="Run paper/live-data ETH basket scalper")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--max-cycles", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=None)
@@ -350,9 +598,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reports-dir", default=None)
     parser.add_argument("--mock-data", action="store_true")
     args = parser.parse_args(argv)
-    config = load_config(args.config)
     result = run_swarm(
-        config,
+        load_config(args.config),
         max_cycles=args.max_cycles,
         poll_interval_sec=args.poll_interval,
         provider=MockNeoMarketDataProvider() if args.mock_data else None,
@@ -364,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     if result.report_path is not None:
         print(f"report={result.report_path}")
     print("real_orders_disabled=true")
+    print("token_masked=true")
     return 0
 
 

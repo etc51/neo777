@@ -195,6 +195,110 @@ class SQLiteJournal:
                     _json(raw or {}),
                 ),
             )
+            if timeframe == "5m":
+                conn.execute(
+                    """
+                    INSERT INTO candles_5m(
+                        timestamp_utc, instrument, open, high, low, close, volume
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        timestamp_utc.isoformat(),
+                        instrument,
+                        _num(open_price),
+                        _num(high),
+                        _num(low),
+                        _num(close),
+                        _num(volume),
+                    ),
+                )
+            conn.commit()
+
+    def record_basket(
+        self,
+        *,
+        basket_id: str,
+        name: str,
+        status: str,
+        opened_at: datetime,
+        anchor_price: Decimal,
+        closed_at: datetime | None = None,
+        close_reason: str | None = None,
+        realized_pnl: Decimal | None = None,
+        unrealized_pnl: Decimal | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO baskets(
+                    basket_id, name, status, opened_at, closed_at, anchor_price,
+                    close_reason, realized_pnl, unrealized_pnl
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(basket_id) DO UPDATE SET
+                    status=excluded.status,
+                    closed_at=excluded.closed_at,
+                    close_reason=excluded.close_reason,
+                    realized_pnl=excluded.realized_pnl,
+                    unrealized_pnl=excluded.unrealized_pnl
+                """,
+                (
+                    basket_id,
+                    name,
+                    status,
+                    opened_at.isoformat(),
+                    None if closed_at is None else closed_at.isoformat(),
+                    _num(anchor_price),
+                    close_reason,
+                    _num(realized_pnl),
+                    _num(unrealized_pnl),
+                ),
+            )
+            conn.commit()
+
+    def record_basket_leg(
+        self,
+        *,
+        leg_id: str,
+        basket_id: str,
+        bot_id: str,
+        account_ref: str,
+        side: str,
+        qty: Decimal,
+        entry_price: Decimal,
+        entry_time: datetime,
+        status: str,
+        exit_price: Decimal | None = None,
+        exit_time: datetime | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO basket_legs(
+                    leg_id, basket_id, bot_id, {ACCT_COL}, side, qty, entry_price,
+                    entry_time, status, exit_price, exit_time
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(leg_id) DO UPDATE SET
+                    status=excluded.status,
+                    exit_price=excluded.exit_price,
+                    exit_time=excluded.exit_time
+                """,
+                (
+                    leg_id,
+                    basket_id,
+                    bot_id,
+                    account_ref,
+                    side,
+                    _num(qty),
+                    _num(entry_price),
+                    entry_time.isoformat(),
+                    status,
+                    _num(exit_price),
+                    None if exit_time is None else exit_time.isoformat(),
+                ),
+            )
             conn.commit()
 
     def record_features(self, features: FeatureSnapshot) -> None:
@@ -549,7 +653,10 @@ class SQLiteJournal:
             "market_events",
             "orderbook_snapshots",
             "candles",
+            "candles_5m",
             "features",
+            "baskets",
+            "basket_legs",
             "bot_decisions",
             "curator_decisions",
             "simulated_orders",
@@ -591,6 +698,24 @@ class SQLiteJournal:
                     1,
                 ),
             )
+            if timeframe == "5m":
+                conn.execute(
+                    """
+                    INSERT INTO candles_5m(
+                        timestamp_utc, instrument, open, high, low, close, volume
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.timestamp_utc.isoformat(),
+                        snapshot.instrument,
+                        _num(price),
+                        _num(price),
+                        _num(price),
+                        _num(price),
+                        1,
+                    ),
+                )
 
 
 def _json(value: Mapping[str, Any] | Sequence[Any]) -> str:
@@ -678,6 +803,17 @@ CREATE TABLE IF NOT EXISTS candles (
     volume REAL
 );
 
+CREATE TABLE IF NOT EXISTS candles_5m (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL
+);
+
 CREATE TABLE IF NOT EXISTS features (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc TEXT NOT NULL,
@@ -700,6 +836,32 @@ CREATE TABLE IF NOT EXISTS virtual_accounts (
     entry_time TEXT,
     last_update_time TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS baskets (
+    basket_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    anchor_price REAL NOT NULL,
+    close_reason TEXT,
+    realized_pnl REAL,
+    unrealized_pnl REAL
+);
+
+CREATE TABLE IF NOT EXISTS basket_legs (
+    leg_id TEXT PRIMARY KEY,
+    basket_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    {ACCT_COL} TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_time TEXT NOT NULL,
+    status TEXT NOT NULL,
+    exit_price REAL,
+    exit_time TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bot_decisions (

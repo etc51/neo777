@@ -41,7 +41,12 @@ class DataConfig:
 @dataclass(frozen=True)
 class SimulationConfig:
     virtual_accounts_count: int = 10
-    initial_cash_per_account: Decimal = Decimal("100000")
+    total_capital: Decimal = Decimal("300000")
+    reserve_cash: Decimal = Decimal("60000")
+    working_capital: Decimal = Decimal("240000")
+    initial_cash_per_account: Decimal = Decimal("24000")
+    paper_leverage: Decimal = Decimal("3")
+    leg_notional: Decimal = Decimal("72000")
     base_lot: int = 1
     max_position_lots_per_bot: int = 1
     allow_long: bool = True
@@ -54,6 +59,24 @@ class SimulationConfig:
     fallback_slippage_ticks: Decimal = Decimal("1")
     max_trade_lifetime_sec: int = 300
     close_all_before_session_end: bool = True
+
+
+@dataclass(frozen=True)
+class BasketStrategyConfig:
+    timeframe: str = "5m"
+    entry_lookback_candles: int = 5
+    entry_range_bps: Decimal = Decimal("125")
+    rescue_trigger_bps: Decimal = Decimal("70")
+    rescue_step_bps: Decimal = Decimal("10")
+    take_profit_bps: Decimal = Decimal("60")
+    stop_loss_bps: Decimal = Decimal("-250")
+    time_stop_min: int = 60
+    preferred_spread_slippage_bps_side: Decimal = Decimal("2")
+    hard_spread_slippage_bps_side: Decimal = Decimal("3")
+    basket_b_min_delay_min: int = 15
+    basket_b_min_anchor_move_bps: Decimal = Decimal("30")
+    max_legs_per_basket: int = 5
+    max_parallel_baskets: int = 2
 
 
 @dataclass(frozen=True)
@@ -121,6 +144,7 @@ class NeoSwarmScalperConfig:
     instruments: tuple[InstrumentConfig, ...]
     data: DataConfig
     simulation: SimulationConfig
+    strategy: BasketStrategyConfig
     risk: RiskConfig
     scalping: ScalpingConfig
     curator: CuratorConfig
@@ -137,10 +161,22 @@ class NeoSwarmScalperConfig:
             raise ValueError("paper_trading_enabled must remain true.")
         if self.token_env != "TBANK_TOKEN":
             raise ValueError("token_env must be TBANK_TOKEN.")
-        if len(self.instruments) != 2:
-            raise ValueError("exactly two neo instruments are expected.")
+        if len(self.instruments) != 1:
+            raise ValueError("exactly one ETH neo instrument is expected.")
+        if self.enabled_instruments[0].ticker not in {"AUTO_DISCOVER", "ETHUSDperpA"}:
+            raise ValueError("neo_swarm_scalper is ETHUSDperpA only.")
         if self.simulation.virtual_accounts_count != 10:
             raise ValueError("virtual_accounts_count must be 10.")
+        if self.simulation.total_capital != Decimal("300000"):
+            raise ValueError("total_capital must be 300000.")
+        if self.simulation.reserve_cash != Decimal("60000"):
+            raise ValueError("reserve_cash must be 60000.")
+        if self.simulation.initial_cash_per_account != Decimal("24000"):
+            raise ValueError("each paper bot must have 24000 equity.")
+        if self.simulation.paper_leverage != Decimal("3"):
+            raise ValueError("paper leverage must be x3.")
+        if self.simulation.leg_notional != Decimal("72000"):
+            raise ValueError("leg notional must be 72000.")
         if self.simulation.allow_averaging:
             raise ValueError("allow_averaging must remain false.")
         if self.simulation.allow_flip_without_close:
@@ -169,6 +205,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> NeoSwarmScalperConfig
         ),
         data=_data(_mapping(_required(raw, "data"), "data")),
         simulation=_simulation(_mapping(_required(raw, "simulation"), "simulation")),
+        strategy=_strategy(_mapping(_required(raw, "strategy"), "strategy")),
         risk=_risk(_mapping(_required(raw, "risk"), "risk")),
         scalping=_scalping(_mapping(_required(raw, "scalping"), "scalping")),
         curator=_curator(_mapping(_required(raw, "curator"), "curator")),
@@ -208,10 +245,15 @@ def _simulation(raw: Mapping[str, Any]) -> SimulationConfig:
         virtual_accounts_count=_int(
             raw.get("virtual_accounts_count", 10), "virtual_accounts_count"
         ),
+        total_capital=_decimal(raw.get("total_capital", "300000"), "total_capital"),
+        reserve_cash=_decimal(raw.get("reserve_cash", "60000"), "reserve_cash"),
+        working_capital=_decimal(raw.get("working_capital", "240000"), "working_capital"),
         initial_cash_per_account=_decimal(
-            raw.get("initial_cash_per_account", "100000"),
+            raw.get("initial_cash_per_account", "24000"),
             "initial_cash_per_account",
         ),
+        paper_leverage=_decimal(raw.get("paper_leverage", "3"), "paper_leverage"),
+        leg_notional=_decimal(raw.get("leg_notional", "72000"), "leg_notional"),
         base_lot=_int(raw.get("base_lot", 1), "base_lot"),
         max_position_lots_per_bot=_int(
             raw.get("max_position_lots_per_bot", 1),
@@ -239,6 +281,37 @@ def _simulation(raw: Mapping[str, Any]) -> SimulationConfig:
             raw.get("close_all_before_session_end", True),
             "close_all_before_session_end",
         ),
+    )
+
+
+def _strategy(raw: Mapping[str, Any]) -> BasketStrategyConfig:
+    return BasketStrategyConfig(
+        timeframe=_string(raw.get("timeframe", "5m"), "timeframe"),
+        entry_lookback_candles=_int(raw.get("entry_lookback_candles", 5), "entry_lookback_candles"),
+        entry_range_bps=_decimal(raw.get("entry_range_bps", "125"), "entry_range_bps"),
+        rescue_trigger_bps=_decimal(raw.get("rescue_trigger_bps", "70"), "rescue_trigger_bps"),
+        rescue_step_bps=_decimal(raw.get("rescue_step_bps", "10"), "rescue_step_bps"),
+        take_profit_bps=_decimal(raw.get("take_profit_bps", "60"), "take_profit_bps"),
+        stop_loss_bps=_decimal(raw.get("stop_loss_bps", "-250"), "stop_loss_bps"),
+        time_stop_min=_int(raw.get("time_stop_min", 60), "time_stop_min"),
+        preferred_spread_slippage_bps_side=_decimal(
+            raw.get("preferred_spread_slippage_bps_side", "2"),
+            "preferred_spread_slippage_bps_side",
+        ),
+        hard_spread_slippage_bps_side=_decimal(
+            raw.get("hard_spread_slippage_bps_side", "3"),
+            "hard_spread_slippage_bps_side",
+        ),
+        basket_b_min_delay_min=_int(
+            raw.get("basket_b_min_delay_min", 15),
+            "basket_b_min_delay_min",
+        ),
+        basket_b_min_anchor_move_bps=_decimal(
+            raw.get("basket_b_min_anchor_move_bps", "30"),
+            "basket_b_min_anchor_move_bps",
+        ),
+        max_legs_per_basket=_int(raw.get("max_legs_per_basket", 5), "max_legs_per_basket"),
+        max_parallel_baskets=_int(raw.get("max_parallel_baskets", 2), "max_parallel_baskets"),
     )
 
 
@@ -390,6 +463,7 @@ __all__ = [
     "NeoSwarmScalperConfig",
     "ReportsConfig",
     "RiskConfig",
+    "BasketStrategyConfig",
     "ScalpingConfig",
     "SimulationConfig",
     "StorageConfig",

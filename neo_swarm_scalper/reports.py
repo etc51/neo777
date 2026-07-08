@@ -56,6 +56,22 @@ def build_report_payload(
         ORDER BY count DESC
         """
     )
+    basket_rows = storage.fetch_all(
+        """
+        SELECT name, status, anchor_price, close_reason, realized_pnl, unrealized_pnl
+        FROM baskets
+        ORDER BY opened_at DESC
+        LIMIT 10
+        """
+    )
+    spread_rows = storage.fetch_all(
+        """
+        SELECT instrument, best_bid, best_ask, spread_ticks
+        FROM orderbook_snapshots
+        ORDER BY id DESC
+        LIMIT 5
+        """
+    )
     total_pnl = sum((Decimal(str(row["net_pnl"])) for row in bot_rows), Decimal("0"))
     best_bot = max(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
     worst_bot = min(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
@@ -68,6 +84,11 @@ def build_report_payload(
         "real_orders_disabled": not config.real_orders_enabled,
         "paper_trading_enabled": config.paper_trading_enabled,
         "token_masked": True,
+        "capital_rub": str(config.simulation.total_capital),
+        "reserve_rub": str(config.simulation.reserve_cash),
+        "working_capital_rub": str(config.simulation.working_capital),
+        "bots_count": config.simulation.virtual_accounts_count,
+        "max_baskets": config.strategy.max_parallel_baskets,
         "instruments": [
             {"name": item.name, "display_name": item.display_name}
             for item in config.enabled_instruments
@@ -81,6 +102,8 @@ def build_report_payload(
         "worst_bot": None if worst_bot is None else _row_dict(worst_bot),
         "curator_changes": [_row_dict(row) for row in curator_rows],
         "data_quality": [_row_dict(row) for row in data_quality_rows],
+        "baskets": [_row_dict(row) for row in basket_rows],
+        "spread_slippage": [_row_dict(row) for row in spread_rows],
         "next_steps": [
             "Watch data freshness and orderbook_missing warnings.",
             "Compare expectancy after at least 30 closed trades per bot.",
@@ -129,6 +152,11 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- mode: {payload['mode']}",
         f"- real orders disabled: {payload['real_orders_disabled']}",
         f"- token masked: {payload['token_masked']}",
+        f"- capital: {payload['capital_rub']} RUB",
+        f"- reserve: {payload['reserve_rub']} RUB",
+        f"- working capital: {payload['working_capital_rub']} RUB",
+        f"- bots: {payload['bots_count']}",
+        f"- max baskets: {payload['max_baskets']}",
         f"- final report: {payload['final']}",
         "",
         "## Instruments",
@@ -148,6 +176,36 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"- bot decisions: {counts['bot_decisions']}",
             f"- curator decisions: {counts['curator_decisions']}",
             f"- total paper PnL: {payload['total_paper_pnl']}",
+            f"- simulated orders: {counts['simulated_orders']}",
+            f"- simulated fills: {counts['simulated_fills']}",
+            "",
+            "## Baskets",
+            "",
+            "| basket | status | anchor | realized_pnl | unrealized_pnl | close_reason |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in payload["baskets"]:
+        lines.append(
+            f"| {row['name']} | {row['status']} | {row['anchor_price']} | "
+            f"{row['realized_pnl']} | {row['unrealized_pnl']} | {row['close_reason']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Spread Slippage",
+            "",
+            "| instrument | best_bid | best_ask | spread_ticks |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for row in payload["spread_slippage"]:
+        lines.append(
+            f"| {row['instrument']} | {row['best_bid']} | "
+            f"{row['best_ask']} | {row['spread_ticks']} |"
+        )
+    lines.extend(
+        [
             "",
             "## Bots",
             "",

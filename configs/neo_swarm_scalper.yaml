@@ -4,14 +4,8 @@ paper_trading_enabled: true
 token_env: TBANK_TOKEN
 
 instruments:
-  - name: neobitcoin
-    display_name: Необиткоин
-    ticker: AUTO_DISCOVER
-    figi: AUTO_DISCOVER
-    class_code: AUTO_DISCOVER
-    enabled: true
   - name: neoether
-    display_name: Неоэфир
+    display_name: Neoether
     ticker: AUTO_DISCOVER
     figi: AUTO_DISCOVER
     class_code: AUTO_DISCOVER
@@ -22,15 +16,20 @@ data:
   orderbook_depth: 20
   collect_trades: true
   collect_orderbook: true
-  collect_candles_1m: true
+  collect_candles_1m: false
   collect_candles_5m: true
-  collect_candles_15m: true
+  collect_candles_15m: false
   reconnect: true
   stale_data_sec: 10
 
 simulation:
   virtual_accounts_count: 10
-  initial_cash_per_account: 100000
+  total_capital: 300000
+  reserve_cash: 60000
+  working_capital: 240000
+  initial_cash_per_account: 24000
+  paper_leverage: 3
+  leg_notional: 72000
   base_lot: 1
   max_position_lots_per_bot: 1
   allow_long: true
@@ -41,8 +40,24 @@ simulation:
   use_spread_cost: true
   use_slippage_cost: true
   fallback_slippage_ticks: 1
-  max_trade_lifetime_sec: 300
+  max_trade_lifetime_sec: 3600
   close_all_before_session_end: true
+
+strategy:
+  timeframe: 5m
+  entry_lookback_candles: 5
+  entry_range_bps: 125
+  rescue_trigger_bps: 70
+  rescue_step_bps: 10
+  take_profit_bps: 60
+  stop_loss_bps: -250
+  time_stop_min: 60
+  preferred_spread_slippage_bps_side: 2
+  hard_spread_slippage_bps_side: 3
+  basket_b_min_delay_min: 15
+  basket_b_min_anchor_move_bps: 30
+  max_legs_per_basket: 5
+  max_parallel_baskets: 2
 
 risk:
   no_global_stop_on_paper_loss: true
@@ -58,8 +73,8 @@ scalping:
   take_profit_ticks_max: 8
   stop_loss_ticks_min: 2
   stop_loss_ticks_max: 6
-  time_stop_sec_min: 30
-  time_stop_sec_max: 180
+  time_stop_sec_min: 3600
+  time_stop_sec_max: 3600
   spread_max_ticks: 3
   min_impulse_ticks: 3
 
@@ -70,9 +85,9 @@ curator:
   min_trades_before_weight_change: 10
   min_weight: 0.05
   max_weight: 1.00
-  adaptive_tp_sl: true
-  adaptive_cooldown: true
-  adaptive_bot_enable: true
+  adaptive_tp_sl: false
+  adaptive_cooldown: false
+  adaptive_bot_enable: false
   shadow_mode_for_bad_bots: true
 
 storage:
