@@ -6,6 +6,7 @@ locally. It never submits, cancels, or replaces broker orders.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import time
@@ -14,6 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -26,7 +28,11 @@ from neo_trader.neo_universal_swarm.instruments import (
     SwarmInstrumentCatalog,
     load_swarm_instrument_catalog,
 )
-from neo_trader.neo_universal_swarm.model import PairEVModel, PairEVModelConfig
+from neo_trader.neo_universal_swarm.model import (
+    PairEVModel,
+    PairEVModelConfig,
+    PairEVPrediction,
+)
 from neo_trader.neo_universal_swarm.simulator import (
     HedgePairSimulationConfig,
     aggregate_pair_metrics,
@@ -128,6 +134,240 @@ class _LivePairState:
     latest_snapshot: BookSnapshot | None = None
 
 
+class _LivePaperRecorder:
+    """Append-only detailed recorder for live-paper runtime data."""
+
+    def __init__(self, reports_dir: Path | str) -> None:
+        self.reports_dir = Path(reports_dir)
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self._pair_labels_csv_path = self.reports_dir / "live_paper_pair_labels.csv"
+        self._ensure_pair_labels_csv()
+
+    def record_orderbook(self, *, cycle: int, snapshot: BookSnapshot) -> None:
+        self._append(
+            "live_paper_orderbooks.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "snapshot": _snapshot_payload(snapshot),
+            },
+        )
+
+    def record_prediction(
+        self,
+        *,
+        cycle: int,
+        snapshot: BookSnapshot,
+        prediction: PairEVPrediction,
+        opened_pair_id: str | None = None,
+        skipped_reason: str | None = None,
+    ) -> None:
+        self._append(
+            "live_paper_predictions.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "instrument": snapshot.instrument.value,
+                "timestamp": snapshot.timestamp,
+                "opened_pair_id": opened_pair_id,
+                "skipped_reason": skipped_reason,
+                "prediction": _prediction_payload(prediction),
+                "snapshot": _snapshot_payload(snapshot),
+            },
+        )
+
+    def record_pair_opened(
+        self,
+        *,
+        cycle: int,
+        state: _LivePairState,
+        snapshot: BookSnapshot,
+    ) -> None:
+        self._append(
+            "live_paper_pair_opened.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "pair": _active_pair_payload(state.pair),
+                "entry": _live_pair_state_payload(state, snapshot),
+                "snapshot": _snapshot_payload(snapshot),
+            },
+        )
+
+    def record_pair_update(
+        self,
+        *,
+        cycle: int,
+        state: _LivePairState,
+        snapshot: BookSnapshot,
+        label: PairLabel | None,
+    ) -> None:
+        self._append(
+            "live_paper_pair_updates.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "pair": _active_pair_payload(state.pair),
+                "state": _live_pair_state_payload(state, snapshot),
+                "snapshot": _snapshot_payload(snapshot),
+                "closed_label": None if label is None else _label_payload(label),
+            },
+        )
+
+    def record_pair_label(self, *, cycle: int, label: PairLabel) -> None:
+        payload = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "label": _label_payload(label),
+        }
+        self._append("live_paper_pair_labels.jsonl", payload)
+        self._append_pair_label_csv(cycle=cycle, label=label)
+
+    def record_bot_states(self, *, cycle: int, curator: CuratorBot) -> None:
+        self._append(
+            "live_paper_bot_states.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "bots": [
+                    {
+                        "bot_id": bot.bot_id,
+                        "account_ref": _masked_account_ref(bot.account_ref),
+                        "account_kind": bot.config.account_kind.value,
+                        "state": bot.state.value,
+                        "assigned_pair_id": bot.assigned_pair_id,
+                        "realized_pnl_ticks": bot.realized_pnl_ticks,
+                        "last_command_id": bot.last_command_id,
+                        "paper_enabled": bot.config.paper_enabled,
+                        "live_enabled": bot.config.live_enabled,
+                    }
+                    for bot in curator.bots.values()
+                ],
+            },
+        )
+
+    def record_metrics(self, *, cycle: int, metrics: SwarmMetrics, curator: CuratorBot) -> None:
+        self._append(
+            "live_paper_metrics.jsonl",
+            {
+                "cycle": cycle,
+                "recorded_at": datetime.now(UTC),
+                "curator": {
+                    "active_pairs": len(curator.active_pairs),
+                    "closed_pairs": len(curator.closed_pairs),
+                    "total_pnl_ticks": curator.total_pnl_ticks,
+                    "rejections": {
+                        reason.value: count for reason, count in curator.rejections.items()
+                    },
+                },
+                "metrics": _metrics_payload(metrics),
+            },
+        )
+
+    def record_cycle(self, cycle: LivePaperSwarmCycle) -> None:
+        self._append(
+            "live_paper_cycles.jsonl",
+            {
+                "cycle": cycle.cycle,
+                "started_at": cycle.started_at,
+                "finished_at": cycle.finished_at,
+                "status": cycle.status,
+                "snapshots": cycle.snapshots,
+                "active_pairs": cycle.active_pairs,
+                "closed_pairs": cycle.closed_pairs,
+                "total_pnl_ticks": cycle.total_pnl_ticks,
+                "error": cycle.error,
+            },
+        )
+
+    def record_error(self, *, cycle: int, started_at: datetime, exc: Exception) -> None:
+        self._append(
+            "live_paper_errors.jsonl",
+            {
+                "cycle": cycle,
+                "started_at": started_at,
+                "recorded_at": datetime.now(UTC),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+
+    def _append(self, filename: str, payload: Mapping[str, object]) -> None:
+        path = self.reports_dir / filename
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(_json_safe_mapping(payload), ensure_ascii=False, sort_keys=True))
+            file.write("\n")
+
+    def _ensure_pair_labels_csv(self) -> None:
+        if self._pair_labels_csv_path.exists():
+            return
+        with self._pair_labels_csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    "cycle",
+                    "pair_id",
+                    "instrument",
+                    "entry_timestamp",
+                    "exit_timestamp",
+                    "stop_loss_ticks",
+                    "loser_side",
+                    "loser_loss_ticks",
+                    "runner_side",
+                    "runner_mfe_ticks",
+                    "runner_mae_ticks",
+                    "runner_exit_ticks",
+                    "pair_total_pnl_ticks",
+                    "pair_total_pnl_rub",
+                    "exit_reason",
+                    "max_adverse_excursion",
+                    "max_favorable_excursion",
+                    "fakeout_flag",
+                    "runner_success_flag",
+                    "entry_spread_cost_ticks",
+                    "avg_slippage_ticks",
+                    "latency_ms",
+                    "regime",
+                    "long_bot_id",
+                    "short_bot_id",
+                ]
+            )
+
+    def _append_pair_label_csv(self, *, cycle: int, label: PairLabel) -> None:
+        with self._pair_labels_csv_path.open("a", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    cycle,
+                    label.pair_id,
+                    label.instrument.value,
+                    label.entry_timestamp.isoformat(),
+                    label.exit_timestamp.isoformat(),
+                    label.stop_loss_ticks,
+                    None if label.loser_side is None else label.loser_side.value,
+                    label.loser_loss_ticks,
+                    None if label.runner_side is None else label.runner_side.value,
+                    label.runner_mfe_ticks,
+                    label.runner_mae_ticks,
+                    label.runner_exit_ticks,
+                    label.pair_total_pnl_ticks,
+                    label.pair_total_pnl_rub,
+                    label.exit_reason.value,
+                    label.max_adverse_excursion,
+                    label.max_favorable_excursion,
+                    label.fakeout_flag,
+                    label.runner_success_flag,
+                    label.entry_spread_cost_ticks,
+                    label.avg_slippage_ticks,
+                    label.latency_ms,
+                    label.regime,
+                    label.long_bot_id,
+                    label.short_bot_id,
+                ]
+            )
+
+
 def run_live_paper_swarm(
     config: LivePaperSwarmConfig | None = None,
     *,
@@ -151,6 +391,7 @@ def run_live_paper_swarm(
     curator = CuratorBot(accounts=accounts, model=model)
     client = provider or TBankClient()
     owns_client = provider is None
+    recorder = _LivePaperRecorder(resolved_config.reports_dir)
     latest_snapshots: dict[SwarmInstrument, BookSnapshot] = {}
     live_pairs: dict[str, _LivePairState] = {}
     labels: list[PairLabel] = []
@@ -172,29 +413,69 @@ def run_live_paper_swarm(
                 )
                 for snapshot in snapshots:
                     latest_snapshots[snapshot.instrument] = snapshot
-                    closed = _update_live_pair_for_snapshot(
-                        snapshot,
-                        live_pairs=live_pairs,
-                        config=resolved_config,
-                    )
-                    for label in closed:
+                    recorder.record_orderbook(cycle=cycle_number, snapshot=snapshot)
+                    for state in tuple(live_pairs.values()):
+                        if state.pair.instrument is not snapshot.instrument:
+                            continue
+                        label = _update_live_pair(state, snapshot, config=resolved_config)
+                        recorder.record_pair_update(
+                            cycle=cycle_number,
+                            state=state,
+                            snapshot=snapshot,
+                            label=label,
+                        )
+                        if label is None:
+                            continue
                         curator.settle_pair(label)
                         labels.append(label)
+                        recorder.record_pair_label(cycle=cycle_number, label=label)
                         live_pairs.pop(label.pair_id, None)
 
                 curator.release_cooldowns()
+                predictions = {
+                    snapshot.instrument: model.predict(snapshot) for snapshot in snapshots
+                }
                 for snapshot in snapshots:
+                    prediction = predictions[snapshot.instrument]
                     if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
+                        recorder.record_prediction(
+                            cycle=cycle_number,
+                            snapshot=snapshot,
+                            prediction=prediction,
+                            skipped_reason="ACTIVE_PAIR_EXISTS",
+                        )
                         continue
                     active_pair = curator.maybe_open_pair(snapshot)
+                    skipped_reason = None
+                    if active_pair is None:
+                        skipped_reason = (
+                            prediction.rejection_reason.value
+                            if prediction.rejection_reason is not None
+                            else "NO_FREE_BOTS_OR_DISABLED"
+                        )
+                    recorder.record_prediction(
+                        cycle=cycle_number,
+                        snapshot=snapshot,
+                        prediction=prediction,
+                        opened_pair_id=None if active_pair is None else active_pair.pair_id,
+                        skipped_reason=skipped_reason,
+                    )
                     if active_pair is not None:
-                        live_pairs[active_pair.pair_id] = _new_live_pair_state(
+                        state = _new_live_pair_state(
                             active_pair,
                             snapshot,
                             slippage_stress_ticks=resolved_config.slippage_stress_ticks,
                         )
+                        live_pairs[active_pair.pair_id] = state
+                        recorder.record_pair_opened(
+                            cycle=cycle_number,
+                            state=state,
+                            snapshot=snapshot,
+                        )
 
                 metrics = _metrics(labels, curator)
+                recorder.record_metrics(cycle=cycle_number, metrics=metrics, curator=curator)
+                recorder.record_bot_states(cycle=cycle_number, curator=curator)
                 if latest_snapshots:
                     _write_live_dashboard_state(
                         resolved_config.dashboard_state_path,
@@ -224,6 +505,7 @@ def run_live_paper_swarm(
                     total_pnl_ticks=curator.total_pnl_ticks,
                 )
             except Exception as exc:  # pragma: no cover - service resilience path
+                recorder.record_error(cycle=cycle_number, started_at=started_at, exc=exc)
                 cycle = LivePaperSwarmCycle(
                     cycle=cycle_number,
                     started_at=started_at,
@@ -238,6 +520,7 @@ def run_live_paper_swarm(
                 _write_error_log(resolved_config.reports_dir, exc)
 
             cycles.append(cycle)
+            recorder.record_cycle(cycle)
             _write_heartbeat(resolved_config.heartbeat_path, cycle)
             if (
                 resolved_config.max_cycles is not None
@@ -524,6 +807,204 @@ def _label(
     )
 
 
+def _snapshot_payload(snapshot: BookSnapshot) -> dict[str, object]:
+    return {
+        "timestamp": snapshot.timestamp,
+        "instrument": snapshot.instrument.value,
+        "best_bid": snapshot.best_bid,
+        "best_ask": snapshot.best_ask,
+        "mid_price": snapshot.mid_price,
+        "spread_price": snapshot.spread_price,
+        "spread_ticks": snapshot.spread_ticks,
+        "spread_bps": (snapshot.spread_price / snapshot.mid_price) * Decimal("10000"),
+        "microprice": snapshot.microprice,
+        "microprice_edge_ticks": snapshot.microprice_edge_ticks,
+        "imbalance_1": snapshot.imbalance(1),
+        "imbalance_3": snapshot.imbalance(3),
+        "imbalance_5": snapshot.imbalance(5),
+        "tick_size": snapshot.tick_size,
+        "last_price": snapshot.last_price,
+        "last_trade_size": snapshot.last_trade_size,
+        "trade_side": None if snapshot.trade_side is None else snapshot.trade_side.value,
+        "tick_direction": snapshot.tick_direction,
+        "tick_velocity": snapshot.tick_velocity,
+        "volume_delta_1s": snapshot.volume_delta_1s,
+        "volume_delta_5s": snapshot.volume_delta_5s,
+        "volume_delta_15s": snapshot.volume_delta_15s,
+        "volatility_5s": snapshot.volatility_5s,
+        "volatility_15s": snapshot.volatility_15s,
+        "volatility_60s": snapshot.volatility_60s,
+        "mfi": snapshot.mfi,
+        "own_orders": snapshot.own_orders,
+        "own_executions": snapshot.own_executions,
+        "latency_ms": snapshot.latency_ms,
+        "slippage_ticks": snapshot.slippage_ticks,
+        "bid_levels": [
+            {"price": level.price, "quantity": level.quantity}
+            for level in snapshot.bid_levels
+        ],
+        "ask_levels": [
+            {"price": level.price, "quantity": level.quantity}
+            for level in snapshot.ask_levels
+        ],
+        "feature_row": snapshot.model_feature_row(),
+    }
+
+
+def _prediction_payload(prediction: PairEVPrediction) -> dict[str, object]:
+    return {
+        "instrument": prediction.instrument.value,
+        "pair_ev_ticks": prediction.pair_ev_ticks,
+        "probability_pair_profit": prediction.probability_pair_profit,
+        "expected_runner_mfe_ticks": prediction.expected_runner_mfe_ticks,
+        "probability_fakeout": prediction.probability_fakeout,
+        "best_stop_loss_ticks": prediction.best_stop_loss_ticks,
+        "best_instrument": prediction.best_instrument.value,
+        "trade_allowed": prediction.trade_allowed,
+        "p_up_runner": prediction.p_up_runner,
+        "p_down_runner": prediction.p_down_runner,
+        "avg_long_runner_profit_ticks": prediction.avg_long_runner_profit_ticks,
+        "avg_short_runner_profit_ticks": prediction.avg_short_runner_profit_ticks,
+        "avg_fakeout_loss_ticks": prediction.avg_fakeout_loss_ticks,
+        "avg_spread_cost_ticks": prediction.avg_spread_cost_ticks,
+        "avg_slippage_ticks": prediction.avg_slippage_ticks,
+        "avg_execution_error_ticks": prediction.avg_execution_error_ticks,
+        "reason_codes": list(prediction.reason_codes),
+        "rejection_reason": None
+        if prediction.rejection_reason is None
+        else prediction.rejection_reason.value,
+    }
+
+
+def _active_pair_payload(pair: ActivePair) -> dict[str, object]:
+    return {
+        "pair_id": pair.pair_id,
+        "instrument": pair.instrument.value,
+        "long_bot_id": pair.long_bot_id,
+        "short_bot_id": pair.short_bot_id,
+        "opened_at": pair.opened_at,
+        "stop_loss_ticks": pair.stop_loss_ticks,
+        "breakeven_ticks": pair.breakeven_ticks,
+        "status": pair.status.value,
+        "model_ev_ticks": pair.model_ev_ticks,
+        "entry_reason_codes": list(pair.entry_reason_codes),
+    }
+
+
+def _live_pair_state_payload(
+    state: _LivePairState,
+    snapshot: BookSnapshot,
+) -> dict[str, object]:
+    long_pnl = _long_exit_ticks(state, snapshot)
+    short_pnl = _short_exit_ticks(state, snapshot)
+    runner_pnl: Decimal | None = None
+    if state.runner_side is not None:
+        runner_pnl = _runner_exit_ticks(state, snapshot)
+    pair_total = (
+        long_pnl + short_pnl
+        if runner_pnl is None
+        else runner_pnl - state.loser_loss_ticks
+    )
+    risk_exit_reason = _risk_exit_reason(snapshot)
+    return {
+        "pair_id": state.pair.pair_id,
+        "instrument": state.pair.instrument.value,
+        "entry_timestamp": state.entry.timestamp,
+        "current_timestamp": snapshot.timestamp,
+        "age_seconds": (_as_utc(snapshot.timestamp) - state.entry.timestamp).total_seconds(),
+        "long_bot_id": state.pair.long_bot_id,
+        "short_bot_id": state.pair.short_bot_id,
+        "long_entry": state.long_entry,
+        "short_entry": state.short_entry,
+        "current_best_bid": snapshot.best_bid,
+        "current_best_ask": snapshot.best_ask,
+        "long_pnl_ticks": long_pnl,
+        "short_pnl_ticks": short_pnl,
+        "pair_total_pnl_ticks": pair_total,
+        "stop_loss_ticks": state.stop,
+        "breakeven_ticks": state.pair.breakeven_ticks,
+        "slippage_ticks": state.slippage,
+        "loser_side": None if state.loser_side is None else state.loser_side.value,
+        "runner_side": None if state.runner_side is None else state.runner_side.value,
+        "loser_loss_ticks": state.loser_loss_ticks,
+        "runner_pnl_ticks": runner_pnl,
+        "runner_mfe_ticks": _none_if_uninitialized(state.runner_mfe_ticks, Decimal("-999999")),
+        "runner_mae_ticks": _none_if_uninitialized(state.runner_mae_ticks, Decimal("999999")),
+        "breakeven_active": state.breakeven_active,
+        "max_adverse_excursion": state.max_adverse_excursion,
+        "max_favorable_excursion": state.max_favorable_excursion,
+        "risk_exit_reason": None if risk_exit_reason is None else risk_exit_reason.value,
+        "microstructure_trailing_exit": _microstructure_trailing_exit(
+            snapshot,
+            state.runner_side,
+        ),
+    }
+
+
+def _label_payload(label: PairLabel) -> dict[str, object]:
+    return {
+        "pair_id": label.pair_id,
+        "instrument": label.instrument.value,
+        "entry_timestamp": label.entry_timestamp,
+        "exit_timestamp": label.exit_timestamp,
+        "stop_loss_ticks": label.stop_loss_ticks,
+        "loser_side": None if label.loser_side is None else label.loser_side.value,
+        "loser_loss_ticks": label.loser_loss_ticks,
+        "runner_side": None if label.runner_side is None else label.runner_side.value,
+        "runner_mfe_ticks": label.runner_mfe_ticks,
+        "runner_mae_ticks": label.runner_mae_ticks,
+        "runner_exit_ticks": label.runner_exit_ticks,
+        "pair_total_pnl_ticks": label.pair_total_pnl_ticks,
+        "pair_total_pnl_rub": label.pair_total_pnl_rub,
+        "exit_reason": label.exit_reason.value,
+        "max_adverse_excursion": label.max_adverse_excursion,
+        "max_favorable_excursion": label.max_favorable_excursion,
+        "fakeout_flag": label.fakeout_flag,
+        "runner_success_flag": label.runner_success_flag,
+        "entry_spread_cost_ticks": label.entry_spread_cost_ticks,
+        "avg_slippage_ticks": label.avg_slippage_ticks,
+        "latency_ms": label.latency_ms,
+        "regime": label.regime,
+        "long_bot_id": label.long_bot_id,
+        "short_bot_id": label.short_bot_id,
+    }
+
+
+def _metrics_payload(metrics: SwarmMetrics) -> dict[str, object]:
+    return {
+        "total_pairs": metrics.total_pairs,
+        "profitable_pairs": metrics.profitable_pairs,
+        "losing_pairs": metrics.losing_pairs,
+        "pair_winrate": metrics.pair_winrate,
+        "pair_ev_ticks": metrics.pair_ev_ticks,
+        "pair_ev_rub": metrics.pair_ev_rub,
+        "avg_runner_profit_ticks": metrics.avg_runner_profit_ticks,
+        "avg_loser_loss_ticks": metrics.avg_loser_loss_ticks,
+        "avg_spread_cost_ticks": metrics.avg_spread_cost_ticks,
+        "avg_slippage_ticks": metrics.avg_slippage_ticks,
+        "fakeout_rate": metrics.fakeout_rate,
+        "runner_to_breakeven_rate": metrics.runner_to_breakeven_rate,
+        "runner_trailing_capture_ratio": metrics.runner_trailing_capture_ratio,
+        "profit_factor": metrics.profit_factor,
+        "max_drawdown": metrics.max_drawdown,
+        "pnl_by_bot": metrics.pnl_by_bot,
+        "pnl_by_account": {
+            _masked_account_ref(key): value for key, value in metrics.pnl_by_account.items()
+        },
+        "pnl_by_instrument": metrics.pnl_by_instrument,
+        "pnl_by_regime": metrics.pnl_by_regime,
+        "rejected_by_model": metrics.rejected_by_model,
+        "rejected_by_spread": metrics.rejected_by_spread,
+        "rejected_by_stale_book": metrics.rejected_by_stale_book,
+        "rejected_by_chop": metrics.rejected_by_chop,
+        "rejected_by_latency": metrics.rejected_by_latency,
+    }
+
+
+def _none_if_uninitialized(value: Decimal, sentinel: Decimal) -> Decimal | None:
+    return None if value == sentinel else value
+
+
 def _metrics(labels: Sequence[PairLabel], curator: CuratorBot) -> SwarmMetrics:
     return aggregate_pair_metrics(
         labels,
@@ -684,11 +1165,11 @@ def _write_heartbeat(path: Path, cycle: LivePaperSwarmCycle) -> None:
 def _write_error_log(reports_dir: Path, exc: Exception) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     error_path = reports_dir / "live_paper_error.log"
-    error_path.write_text(
-        f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n"
-        f"{traceback.format_exc()}",
-        encoding="utf-8",
-    )
+    with error_path.open("a", encoding="utf-8") as file:
+        file.write(
+            f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}\n"
+        )
 
 
 def _assert_safe_environment() -> None:
@@ -714,6 +1195,32 @@ def _assert_safe_environment() -> None:
 
 def _as_utc(value: datetime) -> datetime:
     return as_utc(value)
+
+
+def _masked_account_ref(value: str) -> str:
+    if value.startswith("PAPER_ACCOUNT_"):
+        return value
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _json_safe_mapping(raw: Mapping[str, object]) -> dict[str, object]:
+    return {str(key): _json_safe_value(value) for key, value in raw.items()}
+
+
+def _json_safe_value(value: object) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return _as_utc(value).isoformat()
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_json_safe_value(item) for item in value]
+    return value
 
 
 __all__ = [

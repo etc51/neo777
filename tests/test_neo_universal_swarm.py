@@ -275,6 +275,31 @@ def test_live_paper_swarm_uses_tbank_orderbooks_and_writes_dashboard(
     assert '"market_data_source": "tbank-readonly-rest"' in dashboard
     assert '"total_pairs": 1' in dashboard
     assert "mode=live-paper" in (tmp_path / "heartbeat.txt").read_text(encoding="utf-8")
+    reports = tmp_path / "reports"
+    expected_logs = (
+        "live_paper_orderbooks.jsonl",
+        "live_paper_predictions.jsonl",
+        "live_paper_pair_opened.jsonl",
+        "live_paper_pair_updates.jsonl",
+        "live_paper_pair_labels.jsonl",
+        "live_paper_pair_labels.csv",
+        "live_paper_bot_states.jsonl",
+        "live_paper_metrics.jsonl",
+        "live_paper_cycles.jsonl",
+    )
+    for name in expected_logs:
+        path = reports / name
+        assert path.exists(), name
+        assert path.read_text(encoding="utf-8").strip(), name
+    assert '"bid_levels"' in (reports / "live_paper_orderbooks.jsonl").read_text(
+        encoding="utf-8"
+    )
+    updates = (reports / "live_paper_pair_updates.jsonl").read_text(encoding="utf-8")
+    assert "runner_mfe_ticks" in updates
+    assert "runner_mae_ticks" in updates
+    labels_csv = (reports / "live_paper_pair_labels.csv").read_text(encoding="utf-8")
+    assert "pair_total_pnl_ticks" in labels_csv
+    assert len(labels_csv.strip().splitlines()) == 2
 
 
 def _snapshot(
