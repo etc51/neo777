@@ -343,6 +343,10 @@ class PairLabel:
     avoided_wide_spread_exits: int = 0
     missed_runner_profit_ticks: Decimal = Decimal("0")
     trail_lock_4_active: bool = False
+    wide_spread_pnl_before_wait: Decimal = Decimal("0")
+    wide_spread_pnl_after_wait: Decimal = Decimal("0")
+    panic_wait_helped: bool = False
+    panic_wait_hurt: bool = False
 
 
 @dataclass(frozen=True)

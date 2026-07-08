@@ -32,13 +32,17 @@ CHALLENGER_MODES: tuple[ExperimentalMode, ...] = (
     ExperimentalMode.WIDE_TRAILING,
 )
 DEFAULT_MODE_ALLOCATIONS: dict[ExperimentalMode, Decimal] = {
-    ExperimentalMode.BASELINE: Decimal("0.70"),
-    ExperimentalMode.TRADE_AGGRESSION: Decimal("0.20"),
-    ExperimentalMode.PERSISTENT_IMBALANCE: Decimal("0.03"),
-    ExperimentalMode.TICK_VELOCITY: Decimal("0.03"),
-    ExperimentalMode.WIDE_TRAILING: Decimal("0.04"),
+    ExperimentalMode.BASELINE: Decimal("0.40"),
+    ExperimentalMode.TRADE_AGGRESSION: Decimal("0.30"),
+    ExperimentalMode.TICK_VELOCITY: Decimal("0.20"),
+    ExperimentalMode.PERSISTENT_IMBALANCE: Decimal("0.02"),
+    ExperimentalMode.WIDE_TRAILING: Decimal("0.02"),
 }
+EXPLORATION_ALLOCATION: Decimal = Decimal("0.06")
 MIN_COOLDOWN_ALLOCATION: Decimal = Decimal("0.01")
+BAD_MODE_ALLOCATION: Decimal = Decimal("0.02")
+BAD_MODE_MIN_CLOSED_PAIRS: int = 30
+BAD_MODE_AVG_PNL_THRESHOLD: Decimal = Decimal("-5")
 RUNNER_SIDE_NONE_COOLDOWN_AFTER: int = 3
 RUNNER_SIDE_NONE_COOLDOWN: timedelta = timedelta(minutes=10)
 
@@ -55,6 +59,10 @@ class ModePerformance:
     consecutive_runner_side_none: int = 0
     wide_spread_closed_pairs: int = 0
     wide_spread_loss_ticks: Decimal = Decimal("0")
+    panic_wait_helped: int = 0
+    panic_wait_hurt: int = 0
+    total_wide_spread_pnl_before_wait: Decimal = Decimal("0")
+    total_wide_spread_pnl_after_wait: Decimal = Decimal("0")
     total_runner_mfe_ticks: Decimal = Decimal("0")
     total_runner_mae_ticks: Decimal = Decimal("0")
 
@@ -74,6 +82,12 @@ class ModePerformance:
             self.wide_spread_closed_pairs += 1
             if label.pair_total_pnl_ticks < 0:
                 self.wide_spread_loss_ticks += abs(label.pair_total_pnl_ticks)
+        if label.panic_wait_helped:
+            self.panic_wait_helped += 1
+        if label.panic_wait_hurt:
+            self.panic_wait_hurt += 1
+        self.total_wide_spread_pnl_before_wait += label.wide_spread_pnl_before_wait
+        self.total_wide_spread_pnl_after_wait += label.wide_spread_pnl_after_wait
         self.total_runner_mfe_ticks += label.runner_mfe_ticks
         self.total_runner_mae_ticks += label.runner_mae_ticks
 
@@ -119,6 +133,20 @@ class ModePerformance:
             "runner_to_breakeven_rate": str(self.runner_to_breakeven_rate),
             "runner_side_none_rate": str(self.runner_side_none_rate),
             "wide_spread_loss_per_trade": str(self.wide_spread_loss_per_trade),
+            "wide_spread_pnl_before_wait": str(
+                decimal_ratio(
+                    self.total_wide_spread_pnl_before_wait,
+                    Decimal(self.closed_pairs),
+                )
+            ),
+            "wide_spread_pnl_after_wait": str(
+                decimal_ratio(
+                    self.total_wide_spread_pnl_after_wait,
+                    Decimal(self.closed_pairs),
+                )
+            ),
+            "panic_wait_helped": self.panic_wait_helped,
+            "panic_wait_hurt": self.panic_wait_hurt,
             "avg_runner_mfe": str(self.avg_runner_mfe_ticks),
             "avg_runner_mae": str(self.avg_runner_mae_ticks),
             "fakeouts": self.fakeouts,
@@ -198,7 +226,33 @@ class InstrumentLearningState:
             self.best_challenger = ExperimentalMode.TRADE_AGGRESSION
             self.worst_mode = ExperimentalMode.WIDE_TRAILING
 
-        self.allocations = _normalize_allocations(dict(DEFAULT_MODE_ALLOCATIONS))
+        allocations = _initial_allocations()
+        bad_modes = [
+            mode
+            for mode in ExperimentalMode
+            if self.performances[mode].closed_pairs >= BAD_MODE_MIN_CLOSED_PAIRS
+            and self.performances[mode].avg_pair_pnl_ticks < BAD_MODE_AVG_PNL_THRESHOLD
+        ]
+        reduced_total = Decimal("0")
+        for mode in bad_modes:
+            current = allocations.get(mode, Decimal("0"))
+            if current > BAD_MODE_ALLOCATION:
+                reduced_total += current - BAD_MODE_ALLOCATION
+                allocations[mode] = BAD_MODE_ALLOCATION
+        if reduced_total:
+            preferred_modes = [
+                mode
+                for mode in (
+                    ExperimentalMode.BASELINE,
+                    ExperimentalMode.TRADE_AGGRESSION,
+                    ExperimentalMode.TICK_VELOCITY,
+                )
+                if mode not in bad_modes
+            ]
+            per_mode = decimal_ratio(reduced_total, Decimal(len(preferred_modes)))
+            for mode in preferred_modes:
+                allocations[mode] = allocations.get(mode, Decimal("0")) + per_mode
+        self.allocations = _normalize_allocations(allocations)
 
     def _update_runner_side_none_guard(
         self,
@@ -247,6 +301,11 @@ class InstrumentLearningState:
                 mode.value: str(self.allocations.get(mode, Decimal("0")))
                 for mode in ExperimentalMode
             },
+            "target_mode_allocation": {
+                mode.value: str(DEFAULT_MODE_ALLOCATIONS.get(mode, Decimal("0")))
+                for mode in ExperimentalMode
+            },
+            "exploration_allocation": str(EXPLORATION_ALLOCATION),
             "effective_mode_allocation": {
                 mode.value: str(
                     self._effective_allocations(datetime.now(UTC)).get(mode, Decimal("0"))
@@ -300,6 +359,8 @@ class OnlineLearningState:
     instruments: dict[SwarmInstrument, InstrumentLearningState] = field(default_factory=dict)
     bot_assignment_counts: dict[str, int] = field(default_factory=dict)
     total_closed_pairs: int = 0
+    panic_wait_helped: int = 0
+    panic_wait_hurt: int = 0
 
     def __post_init__(self) -> None:
         if not self.instruments:
@@ -323,11 +384,22 @@ class OnlineLearningState:
         label: PairLabel,
     ) -> None:
         self.total_closed_pairs += 1
+        if label.panic_wait_helped:
+            self.panic_wait_helped += 1
+        if label.panic_wait_hurt:
+            self.panic_wait_hurt += 1
         self.instruments[instrument].update_label(mode=mode, label=label)
+
+    @property
+    def panic_wait_disabled(self) -> bool:
+        return self.panic_wait_hurt > self.panic_wait_helped
 
     def to_payload(self) -> dict[str, object]:
         return {
             "total_closed_pairs": self.total_closed_pairs,
+            "panic_wait_helped": self.panic_wait_helped,
+            "panic_wait_hurt": self.panic_wait_hurt,
+            "panic_wait_disabled": self.panic_wait_disabled,
             "instruments": {
                 instrument.value: state.to_payload()
                 for instrument, state in self.instruments.items()
@@ -344,9 +416,14 @@ class OnlineLearningState:
                 for instrument, state in self.instruments.items()
             },
             "instrument_allocation": {
-                SwarmInstrument.NEOBITOK.value: "0.85",
-                SwarmInstrument.NEOEFIR.value: "0.15",
+                SwarmInstrument.NEOBITOK.value: "0.55",
+                SwarmInstrument.NEOEFIR.value: "0.45",
             },
+            "target_mode_allocation": {
+                mode.value: str(DEFAULT_MODE_ALLOCATIONS.get(mode, Decimal("0")))
+                for mode in ExperimentalMode
+            },
+            "exploration_allocation": str(EXPLORATION_ALLOCATION),
             "ev_by_mode": {
                 instrument.value: {
                     mode.value: str(state.performances[mode].ev_ticks)
@@ -408,7 +485,16 @@ class OnlineLearningState:
 
 
 def _initial_allocations() -> dict[ExperimentalMode, Decimal]:
-    return dict(DEFAULT_MODE_ALLOCATIONS)
+    allocations = dict(DEFAULT_MODE_ALLOCATIONS)
+    exploration_modes = (
+        ExperimentalMode.PERSISTENT_IMBALANCE,
+        ExperimentalMode.TICK_VELOCITY,
+        ExperimentalMode.WIDE_TRAILING,
+    )
+    per_mode = decimal_ratio(EXPLORATION_ALLOCATION, Decimal(len(exploration_modes)))
+    for mode in exploration_modes:
+        allocations[mode] = allocations.get(mode, Decimal("0")) + per_mode
+    return _normalize_allocations(allocations)
 
 
 def _instrument_ev(state: InstrumentLearningState) -> Decimal:

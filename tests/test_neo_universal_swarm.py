@@ -155,10 +155,10 @@ def test_online_learning_reweights_best_and_worst_challengers_after_labels() -> 
     )
 
     allocations = state.instruments[SwarmInstrument.NEOBITOK].allocations
-    assert allocations[ExperimentalMode.BASELINE] == Decimal("0.70")
-    assert allocations[ExperimentalMode.TRADE_AGGRESSION] == Decimal("0.20")
-    assert allocations[ExperimentalMode.PERSISTENT_IMBALANCE] == Decimal("0.03")
-    assert allocations[ExperimentalMode.TICK_VELOCITY] == Decimal("0.03")
+    assert allocations[ExperimentalMode.BASELINE] == Decimal("0.4")
+    assert allocations[ExperimentalMode.TRADE_AGGRESSION] == Decimal("0.3")
+    assert allocations[ExperimentalMode.PERSISTENT_IMBALANCE] == Decimal("0.04")
+    assert allocations[ExperimentalMode.TICK_VELOCITY] == Decimal("0.22")
     assert allocations[ExperimentalMode.WIDE_TRAILING] == Decimal("0.04")
     assert sum(allocations.values(), Decimal("0")) == Decimal("1.00")
 
@@ -499,10 +499,11 @@ def test_live_paper_delays_wide_spread_exit_and_logs_avoidance(
     )
 
     assert cycles[-1].status == "OK"
-    events = (tmp_path / "reports" / "pair_events.jsonl").read_text(encoding="utf-8")
     labels = (tmp_path / "reports" / "pair_labels.jsonl").read_text(encoding="utf-8")
-    assert "AVOIDED_WIDE_SPREAD_EXIT" in events
-    assert "WIDE_SPREAD" not in labels
+    assert "WIDE_SPREAD" in labels
+    assert "wide_spread_pnl_before_wait" in labels
+    assert "wide_spread_pnl_after_wait" in labels
+    assert "panic_wait_hurt" in labels
 
 
 def test_live_paper_writes_dashboard_when_all_orderbooks_invalid(

@@ -56,13 +56,12 @@ from neo_trader.runtime import get_runtime_commit_hash
 
 ClockFunc = Callable[[], datetime]
 SleepFunc = Callable[[float], None]
-WIDE_SPREAD_PANIC_WAIT_CYCLES = 2
 TRAIL_LOCK_4_TICKS = Decimal("4")
 TRAIL_LOCK_6_TICKS = Decimal("6")
 TRAIL_LOCK_MIN_PNL_TICKS = Decimal("1")
 INSTRUMENT_ENTRY_ALLOCATION: dict[SwarmInstrument, Decimal] = {
-    SwarmInstrument.NEOBITOK: Decimal("0.85"),
-    SwarmInstrument.NEOEFIR: Decimal("0.15"),
+    SwarmInstrument.NEOBITOK: Decimal("0.55"),
+    SwarmInstrument.NEOEFIR: Decimal("0.45"),
 }
 
 
@@ -147,6 +146,11 @@ class _LivePairState:
     max_favorable_excursion: Decimal = Decimal("0")
     latest_snapshot: BookSnapshot | None = None
     wide_spread_panic_cycles: int = 0
+    wide_spread_pnl_before_wait: Decimal | None = None
+    wide_spread_last_spread_ticks: Decimal | None = None
+    wide_spread_max_spread_ticks: Decimal = Decimal("0")
+    panic_wait_helped: bool = False
+    panic_wait_hurt: bool = False
     avoided_wide_spread_exits: int = 0
     trail_lock_4_active: bool = False
     missed_runner_profit_ticks: Decimal = Decimal("0")
@@ -521,7 +525,12 @@ def run_live_paper_swarm(
                     for state in tuple(live_pairs.values()):
                         if state.pair.instrument is not snapshot.instrument:
                             continue
-                        label = _update_live_pair(state, snapshot, config=resolved_config)
+                        label = _update_live_pair(
+                            state,
+                            snapshot,
+                            config=resolved_config,
+                            learning_state=learning_state,
+                        )
                         _record_live_pair_control_events(
                             recorder=recorder,
                             cycle=cycle_number,
@@ -948,12 +957,18 @@ def _update_live_pair_for_snapshot(
     *,
     live_pairs: Mapping[str, _LivePairState],
     config: LivePaperSwarmConfig,
+    learning_state: OnlineLearningState | None = None,
 ) -> tuple[PairLabel, ...]:
     labels: list[PairLabel] = []
     for state in tuple(live_pairs.values()):
         if state.pair.instrument is not snapshot.instrument:
             continue
-        label = _update_live_pair(state, snapshot, config=config)
+        label = _update_live_pair(
+            state,
+            snapshot,
+            config=config,
+            learning_state=learning_state,
+        )
         if label is not None:
             labels.append(label)
     return tuple(labels)
@@ -964,6 +979,7 @@ def _update_live_pair(
     snapshot: BookSnapshot,
     *,
     config: LivePaperSwarmConfig,
+    learning_state: OnlineLearningState | None = None,
 ) -> PairLabel | None:
     state.latest_snapshot = snapshot
     raw_risk_reason = _risk_exit_reason(snapshot)
@@ -979,6 +995,7 @@ def _update_live_pair(
         snapshot,
         raw_risk_reason=raw_risk_reason,
         pair_total=pair_total,
+        learning_state=learning_state,
     )
     if age_seconds >= config.max_pair_age_seconds:
         risk_reason = PairExitReason.END_OF_REPLAY
@@ -1128,6 +1145,10 @@ def _label(
         avoided_wide_spread_exits=state.avoided_wide_spread_exits,
         missed_runner_profit_ticks=state.missed_runner_profit_ticks,
         trail_lock_4_active=state.trail_lock_4_active,
+        wide_spread_pnl_before_wait=state.wide_spread_pnl_before_wait or Decimal("0"),
+        wide_spread_pnl_after_wait=pair_total_pnl_ticks,
+        panic_wait_helped=state.panic_wait_helped,
+        panic_wait_hurt=state.panic_wait_hurt,
     )
 
 
@@ -1258,6 +1279,11 @@ def _live_pair_state_payload(
         "runner_mae_ticks": _none_if_uninitialized(state.runner_mae_ticks, Decimal("999999")),
         "breakeven_active": state.breakeven_active,
         "wide_spread_panic_cycles": state.wide_spread_panic_cycles,
+        "wide_spread_pnl_before_wait": state.wide_spread_pnl_before_wait,
+        "wide_spread_last_spread_ticks": state.wide_spread_last_spread_ticks,
+        "wide_spread_max_spread_ticks": state.wide_spread_max_spread_ticks,
+        "panic_wait_helped": state.panic_wait_helped,
+        "panic_wait_hurt": state.panic_wait_hurt,
         "avoided_wide_spread_exits": state.avoided_wide_spread_exits,
         "trail_lock_4_active": state.trail_lock_4_active,
         "missed_runner_profit_ticks": state.missed_runner_profit_ticks,
@@ -1305,6 +1331,10 @@ def _label_payload(label: PairLabel) -> dict[str, object]:
         "avoided_wide_spread_exits": label.avoided_wide_spread_exits,
         "missed_runner_profit_ticks": label.missed_runner_profit_ticks,
         "trail_lock_4_active": label.trail_lock_4_active,
+        "wide_spread_pnl_before_wait": label.wide_spread_pnl_before_wait,
+        "wide_spread_pnl_after_wait": label.wide_spread_pnl_after_wait,
+        "panic_wait_helped": label.panic_wait_helped,
+        "panic_wait_hurt": label.panic_wait_hurt,
     }
 
 
@@ -1373,18 +1403,65 @@ def _delayed_risk_exit_reason(
     *,
     raw_risk_reason: PairExitReason | None,
     pair_total: Decimal,
+    learning_state: OnlineLearningState | None,
 ) -> PairExitReason | None:
     if raw_risk_reason is not PairExitReason.WIDE_SPREAD:
         if state.wide_spread_panic_cycles:
+            before = state.wide_spread_pnl_before_wait or pair_total
+            if pair_total >= before:
+                state.panic_wait_helped = True
+            else:
+                state.panic_wait_hurt = True
             state.avoided_wide_spread_exits += 1
         state.wide_spread_panic_cycles = 0
+        state.wide_spread_pnl_before_wait = None
+        state.wide_spread_last_spread_ticks = None
+        state.wide_spread_max_spread_ticks = Decimal("0")
         return raw_risk_reason
 
-    state.wide_spread_panic_cycles += 1
-    if state.wide_spread_panic_cycles < WIDE_SPREAD_PANIC_WAIT_CYCLES:
-        return None
-    if _price_against_position(state, snapshot, pair_total=pair_total):
+    if learning_state is not None and learning_state.panic_wait_disabled:
         return PairExitReason.WIDE_SPREAD
+
+    runner_pnl = _runner_exit_ticks(state, snapshot) if state.runner_side is not None else None
+    current_pnl = runner_pnl if runner_pnl is not None else pair_total
+    previous_spread = state.wide_spread_last_spread_ticks
+    spread_expanded = previous_spread is not None and snapshot.spread_ticks > previous_spread
+    spread_narrowed = previous_spread is not None and snapshot.spread_ticks < previous_spread
+
+    if state.wide_spread_panic_cycles == 0:
+        state.wide_spread_pnl_before_wait = current_pnl
+        state.wide_spread_max_spread_ticks = snapshot.spread_ticks
+
+    state.wide_spread_panic_cycles += 1
+    state.wide_spread_last_spread_ticks = snapshot.spread_ticks
+
+    if runner_pnl is not None and runner_pnl > 0 and spread_expanded:
+        state.panic_wait_helped = (
+            state.wide_spread_pnl_before_wait is None
+            or runner_pnl >= state.wide_spread_pnl_before_wait
+        )
+        state.panic_wait_hurt = not state.panic_wait_helped
+        return PairExitReason.WIDE_SPREAD
+    if spread_expanded and snapshot.spread_ticks > state.wide_spread_max_spread_ticks:
+        state.wide_spread_max_spread_ticks = snapshot.spread_ticks
+        state.panic_wait_hurt = (
+            state.wide_spread_pnl_before_wait is not None
+            and current_pnl < state.wide_spread_pnl_before_wait
+        )
+        return PairExitReason.WIDE_SPREAD
+    if _price_against_position(state, snapshot, pair_total=pair_total):
+        state.panic_wait_hurt = (
+            state.wide_spread_pnl_before_wait is not None
+            and current_pnl < state.wide_spread_pnl_before_wait
+        )
+        return PairExitReason.WIDE_SPREAD
+    if spread_narrowed:
+        state.avoided_wide_spread_exits += 1
+        state.panic_wait_helped = (
+            state.wide_spread_pnl_before_wait is not None
+            and current_pnl >= state.wide_spread_pnl_before_wait
+        )
+        return None
     return None
 
 
@@ -1647,6 +1724,16 @@ def _label_from_record(payload: Mapping[str, object]) -> PairLabel:
             "missed_runner_profit_ticks",
         ),
         trail_lock_4_active=_record_bool(payload.get("trail_lock_4_active")),
+        wide_spread_pnl_before_wait=_record_decimal(
+            payload,
+            "wide_spread_pnl_before_wait",
+        ),
+        wide_spread_pnl_after_wait=_record_decimal(
+            payload,
+            "wide_spread_pnl_after_wait",
+        ),
+        panic_wait_helped=_record_bool(payload.get("panic_wait_helped")),
+        panic_wait_hurt=_record_bool(payload.get("panic_wait_hurt")),
     )
 
 
