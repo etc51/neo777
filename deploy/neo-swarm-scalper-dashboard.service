@@ -1,0 +1,19 @@
+[Unit]
+Description=neo_swarm_scalper Streamlit dashboard
+After=network-online.target neo-swarm-scalper.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-trader
+Group=neo-trader
+WorkingDirectory=/opt/neo_trader
+EnvironmentFile=/etc/neo-trader/neo-swarm-scalper.env
+ExecStart=/opt/neo_trader/.venv/bin/streamlit run src/neo_swarm_scalper/dashboard.py --server.port 8025 --server.address 0.0.0.0 --server.headless true -- --db data/neo_swarm_scalper.sqlite
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
