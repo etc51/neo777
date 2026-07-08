@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -28,6 +29,7 @@ def test_config_is_neobitcoin_paper_only_zero_commission() -> None:
     assert config.ticker == "BTCUSDperpA"
     assert config.paper_mode is True
     assert config.live_trading is False
+    assert config.multi_pair_mode is False
     assert config.commission == 0
     assert config.round_trip_commission == 0
     assert config.max_entry_spread_ticks == Decimal("3")
@@ -97,6 +99,9 @@ def test_pair_entry_opens_long_and_short_and_records_fills(tmp_path: Path) -> No
 
     assert result.entry_opened is True
     rows = journal.fetch_all("SELECT long_bot_id, short_bot_id, actual_fill_json FROM pair_entries")
+    pair_id = journal.fetch_all("SELECT pair_id FROM pair_entries")[0]["pair_id"]
+    assert re.fullmatch(r"NBPAIR_[0-9a-f]{32}", pair_id)
+    assert "NBPAIR_000001" not in pair_id
     assert rows[0]["long_bot_id"] == "Bot_LONG"
     assert rows[0]["short_bot_id"] == "Bot_SHORT"
     fills = json.loads(rows[0]["actual_fill_json"])
@@ -104,6 +109,27 @@ def test_pair_entry_opens_long_and_short_and_records_fills(tmp_path: Path) -> No
     positions = journal.fetch_all("SELECT side, state FROM positions ORDER BY id")
     assert [row["side"] for row in positions[:2]] == ["LONG", "SHORT"]
     assert all(row["state"] == "OPEN" for row in positions[:2])
+
+
+def test_default_single_pair_mode_blocks_new_entry_when_active_pair_exists(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    resolver = DualBotNeobitcoinResolver(ResolverConfig(), journal)
+    base = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+
+    opened = resolver.process_snapshot(_snapshot(timestamp=base))
+    resolver.active_pair = None
+    blocked = resolver.process_snapshot(_snapshot(timestamp=base + timedelta(seconds=1)))
+
+    assert opened.entry_opened is True
+    assert blocked.entry_opened is False
+    assert blocked.blocked_reason == ResolverReason.ACTIVE_PAIR_EXISTS.value
+    assert journal.active_pair_count() == 1
+    entries = journal.fetch_all("SELECT pair_id FROM pair_entries")
+    assert len(entries) == 1
+    blocked_rows = journal.fetch_all("SELECT reason FROM blocked_entries ORDER BY id DESC LIMIT 1")
+    assert blocked_rows[0]["reason"] == ResolverReason.ACTIVE_PAIR_EXISTS.value
 
 
 def test_decision_zone_closes_loser_and_promotes_winner(tmp_path: Path) -> None:
@@ -173,10 +199,75 @@ def test_dynamic_protection_never_closes_negative_after_activation(tmp_path: Pat
     )
     assert Decimal(winner_rows[0]["estimated_net_pnl"]) >= 0
     protection_rows = journal.fetch_all(
-        "SELECT no_loss_mode_active, final_result FROM protection_events ORDER BY id"
+        "SELECT no_loss_mode_active, final_result, protection_audit_json "
+        "FROM protection_events ORDER BY id"
     )
     assert protection_rows[0]["no_loss_mode_active"] == 1
     assert Decimal(protection_rows[-1]["final_result"]) >= 0
+    audit = json.loads(protection_rows[0]["protection_audit_json"])
+    assert Decimal(audit["would_exit_net_pnl"]) >= 0
+    assert Decimal(audit["estimated_exit_price"]) >= Decimal(audit["safe_exit_price"])
+
+
+def test_short_down_scenario_closes_long_and_protects_short(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    resolver = DualBotNeobitcoinResolver(ResolverConfig(), journal)
+    base = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+
+    resolver.process_snapshot(_snapshot(timestamp=base, bid="10000", ask="10002"))
+    decision = resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=1),
+            bid="9975",
+            ask="9977",
+            bid_qty="40",
+            ask_qty="220",
+            tick_velocity=Decimal("-1.2"),
+        )
+    )
+    protected = resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=2),
+            bid="9960",
+            ask="9962",
+            bid_qty="40",
+            ask_qty="240",
+            tick_velocity=Decimal("-1.4"),
+        )
+    )
+    closed = resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=3),
+            bid="9993.4",
+            ask="9995.6",
+            bid_qty="120",
+            ask_qty="120",
+            tick_velocity=Decimal("1.0"),
+        )
+    )
+
+    assert decision.loser_closed == PositionSide.LONG.value
+    assert decision.state == "WINNER_TRAILING"
+    assert protected.protection_active is True
+    assert closed.final_exit is True
+    decisions = journal.fetch_all(
+        "SELECT decision_zone, loser_closed, winner_selected FROM resolver_decisions"
+    )
+    assert decisions[0]["decision_zone"] == ResolverReason.DECISION_ZONE_DOWN.value
+    assert decisions[0]["loser_closed"] == "LONG"
+    assert decisions[0]["winner_selected"] == "SHORT"
+    short_rows = journal.fetch_all(
+        "SELECT estimated_net_pnl FROM positions "
+        "WHERE bot_id = 'Bot_SHORT' AND state = 'CLOSED' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert Decimal(short_rows[0]["estimated_net_pnl"]) >= 0
+    audit_rows = journal.fetch_all(
+        "SELECT protection_audit_json FROM protection_events ORDER BY id"
+    )
+    audits = [json.loads(row["protection_audit_json"]) for row in audit_rows]
+    assert audits[0]["exit_side"] == "ASK"
+    assert Decimal(audits[-1]["would_exit_net_pnl"]) >= 0
 
 
 def test_storage_has_required_tables_and_smoke_writes_dashboard(tmp_path: Path) -> None:
@@ -212,6 +303,9 @@ def test_storage_has_required_tables_and_smoke_writes_dashboard(tmp_path: Path) 
     dashboard = json.loads(result.dashboard_path.read_text(encoding="utf-8"))
     assert dashboard["instrument"] == "NEOBITOK"
     assert dashboard["live_trading"] is False
+    assert dashboard["active_pair_count"] >= 0
+    assert "pair_metrics" in dashboard
+    assert "protection_audit" in dashboard
 
 
 def test_dashboard_server_renders_html_from_state(tmp_path: Path) -> None:
@@ -230,6 +324,9 @@ def test_dashboard_server_renders_html_from_state(tmp_path: Path) -> None:
 
     assert "Dual-Bot Neobitcoin Resolver" in html
     assert "NEOBITOK" in html
+    assert "Active Pair Count" in html
+    assert "Pair Total PnL" in html
+    assert "Protection Audit" in html
     assert "state.json" in html
 
 

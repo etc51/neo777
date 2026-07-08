@@ -38,6 +38,7 @@ class ResolverReason(StrEnum):
     STALE_DATA = "STALE_DATA"
     BAD_DATA = "BAD_DATA"
     PAIR_ENTRY_BAD = "PAIR_ENTRY_BAD"
+    ACTIVE_PAIR_EXISTS = "ACTIVE_PAIR_EXISTS"
     DECISION_ZONE_UP = "DECISION_ZONE_UP"
     DECISION_ZONE_DOWN = "DECISION_ZONE_DOWN"
     CLOSE_SHORT_LOSER = "CLOSE_SHORT_LOSER"
@@ -127,6 +128,7 @@ class PairState:
     protection_active: bool = False
     protection_trigger_reason: str | None = None
     safe_exit_price: Decimal | None = None
+    protection_audit: dict[str, object] | None = None
     closed_at: datetime | None = None
 
     @property

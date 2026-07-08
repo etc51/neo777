@@ -38,6 +38,7 @@ class ResolverConfig:
     bot_ids: BotIds = BotIds()
     paper_mode: bool = True
     live_trading: bool = False
+    multi_pair_mode: bool = False
     commission: Decimal = Decimal("0")
     round_trip_commission: Decimal = Decimal("0")
     orderbook_depth: int = 10
@@ -79,6 +80,8 @@ class ResolverConfig:
             raise ValueError("PAPER_MODE must default to true.")
         if self.live_trading:
             raise ValueError("live trading requires a separate explicit runtime approval.")
+        if self.multi_pair_mode:
+            raise ValueError("MULTI_PAIR_MODE must default to false for the paper resolver.")
         if self.commission != 0 or self.round_trip_commission != 0:
             raise ValueError("commission and round-trip commission must be zero.")
         if self.max_entry_spread_ticks != Decimal("3"):
@@ -106,7 +109,12 @@ def load_resolver_config() -> ResolverConfig:
     live_value = os.environ.get("LIVE_TRADING", "false").strip().lower()
     live_trading = live_value == "true"
     paper_mode = os.environ.get("PAPER_MODE", "true").strip().lower() != "false"
-    return ResolverConfig(paper_mode=paper_mode, live_trading=live_trading)
+    multi_pair_mode = os.environ.get("MULTI_PAIR_MODE", "false").strip().lower() == "true"
+    return ResolverConfig(
+        paper_mode=paper_mode,
+        live_trading=live_trading,
+        multi_pair_mode=multi_pair_mode,
+    )
 
 
 __all__ = ["BotIds", "ResolverConfig", "load_resolver_config"]

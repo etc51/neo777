@@ -42,7 +42,7 @@ class DualBotNeobitcoinResolver:
         self.cooldown_until: datetime | None = None
         self.last_orderbook_time: datetime | None = None
         self.last_trade_time: datetime | None = None
-        self._pair_sequence = 0
+        self._restore_active_pair()
 
     def process_snapshot(self, snapshot: GateSnapshot) -> ResolverCycleResult:
         self._validate_snapshot(snapshot)
@@ -53,6 +53,12 @@ class DualBotNeobitcoinResolver:
 
         if self.active_pair is not None:
             result = self._manage_pair(snapshot)
+            self._record_heartbeat(snapshot, result.state)
+            return result
+
+        active_pair_count = self.journal.active_pair_count()
+        if active_pair_count > 0 and not self.config.multi_pair_mode:
+            result = self._block_active_pair_exists(snapshot)
             self._record_heartbeat(snapshot, result.state)
             return result
 
@@ -114,8 +120,7 @@ class DualBotNeobitcoinResolver:
 
     def _open_pair(self, snapshot: GateSnapshot, gates: tuple[GateResult, ...]) -> PairState:
         book = snapshot.book
-        self._pair_sequence += 1
-        pair_id = f"NBPAIR_{self._pair_sequence:06d}_{uuid4().hex[:8]}"
+        pair_id = f"NBPAIR_{uuid4().hex}"
         slippage = self._expected_slippage_ticks(snapshot)
         long_entry = book.best_ask + (slippage * book.tick_size)
         short_entry = book.best_bid - (slippage * book.tick_size)
@@ -234,6 +239,40 @@ class DualBotNeobitcoinResolver:
             final_exit=final_exit,
         )
 
+    def _restore_active_pair(self) -> None:
+        if self.config.multi_pair_mode:
+            return
+        active_pair_id = self.journal.latest_active_pair_id()
+        if active_pair_id is not None:
+            self.journal.close_stale_active_pairs(keep_pair_id=active_pair_id)
+        self.active_pair = self.journal.load_active_pair(active_pair_id)
+
+    def _block_active_pair_exists(self, snapshot: GateSnapshot) -> ResolverCycleResult:
+        gates = (
+            GateResult(
+                GateName.PAIR_EXECUTION,
+                False,
+                ResolverReason.ACTIVE_PAIR_EXISTS,
+                {
+                    "active_pair_count": self.journal.active_pair_count(),
+                    "active_pair_id": self.journal.latest_active_pair_id(),
+                    "multi_pair_mode": self.config.multi_pair_mode,
+                },
+            ),
+        )
+        self.journal.record_blocked_entry(
+            timestamp=snapshot.timestamp,
+            reason=ResolverReason.ACTIVE_PAIR_EXISTS.value,
+            snapshot=snapshot,
+            gates=gates,
+        )
+        return ResolverCycleResult(
+            timestamp=snapshot.timestamp,
+            pair_id=self.journal.latest_active_pair_id(),
+            state="BLOCKED",
+            blocked_reason=ResolverReason.ACTIVE_PAIR_EXISTS.value,
+        )
+
     def _mark_pair(self, pair: PairState, snapshot: GateSnapshot) -> None:
         book = snapshot.book
         spread_slippage_cost = self._spread_slippage_cost(snapshot)
@@ -282,10 +321,16 @@ class DualBotNeobitcoinResolver:
         buffer_price = buffer_ticks * snapshot.book.tick_size
         spread_cost = snapshot.book.spread_ticks * snapshot.book.tick_size
         expected_slippage = self._expected_slippage_ticks(snapshot) * snapshot.book.tick_size
-        if winner.side is PositionSide.LONG:
-            safe_exit = winner.entry_price + spread_cost + expected_slippage + buffer_price
-        else:
-            safe_exit = winner.entry_price - spread_cost - expected_slippage - buffer_price
+        audit = self._protection_audit(
+            winner=winner,
+            snapshot=snapshot,
+            spread_cost=spread_cost,
+            expected_slippage=expected_slippage,
+            buffer_price=buffer_price,
+        )
+        if Decimal(str(audit["would_exit_net_pnl"])) < 0:
+            return
+        safe_exit = Decimal(str(audit["safe_exit_price"]))
         pair.protection_active = True
         pair.protection_trigger_reason = (
             "trigger_percent"
@@ -293,6 +338,7 @@ class DualBotNeobitcoinResolver:
             else "market_deterioration"
         )
         pair.safe_exit_price = safe_exit
+        pair.protection_audit = audit
         pair.state = "NO_LOSS_OR_PROFIT_ONLY"
         self.journal.record_protection_event(
             timestamp=snapshot.timestamp,
@@ -301,6 +347,7 @@ class DualBotNeobitcoinResolver:
             spread_at_protection=snapshot.book.spread_ticks,
             expected_slippage=self._expected_slippage_ticks(snapshot),
             buffer=buffer_ticks,
+            protection_audit=audit,
         )
 
     def _safe_exit_touched(self, pair: PairState, snapshot: GateSnapshot) -> bool:
@@ -317,6 +364,10 @@ class DualBotNeobitcoinResolver:
             return
         winner = pair.long_leg if pair.winner_side is PositionSide.LONG else pair.short_leg
         exit_price = pair.safe_exit_price
+        audit = self._protection_audit_for_exit(winner=winner, pair=pair, snapshot=snapshot)
+        if Decimal(str(audit["would_exit_net_pnl"])) < 0:
+            pair.protection_audit = audit
+            return
         winner.exit_price = exit_price
         winner.exit_time = snapshot.timestamp
         winner.state = "CLOSED"
@@ -339,7 +390,73 @@ class DualBotNeobitcoinResolver:
                 + self.config.min_profit_buffer_ticks
             ),
             final_result=winner.estimated_net_pnl,
+            protection_audit=audit,
         )
+
+    def _protection_audit(
+        self,
+        *,
+        winner: PositionLeg,
+        snapshot: GateSnapshot,
+        spread_cost: Decimal,
+        expected_slippage: Decimal,
+        buffer_price: Decimal,
+    ) -> dict[str, object]:
+        if winner.side is PositionSide.LONG:
+            safe_exit = winner.entry_price + spread_cost + expected_slippage + buffer_price
+            estimated_exit = snapshot.book.best_bid
+            would_exit_net_pnl = estimated_exit - safe_exit
+            exit_side = "BID"
+        else:
+            safe_exit = winner.entry_price - spread_cost - expected_slippage - buffer_price
+            estimated_exit = snapshot.book.best_ask
+            would_exit_net_pnl = safe_exit - estimated_exit
+            exit_side = "ASK"
+        return {
+            "entry_price": winner.entry_price,
+            "current_bid": snapshot.book.best_bid,
+            "current_ask": snapshot.book.best_ask,
+            "safe_exit_price": safe_exit,
+            "estimated_exit_price": estimated_exit,
+            "exit_side": exit_side,
+            "spread": snapshot.book.spread_ticks,
+            "expected_slippage": expected_slippage / snapshot.book.tick_size,
+            "buffer": buffer_price / snapshot.book.tick_size,
+            "would_exit_net_pnl": would_exit_net_pnl,
+        }
+
+    def _protection_audit_for_exit(
+        self,
+        *,
+        winner: PositionLeg,
+        pair: PairState,
+        snapshot: GateSnapshot,
+    ) -> dict[str, object]:
+        buffer_ticks = (
+            self.config.orderbook_risk_buffer_ticks
+            + self.config.microstructure_risk_buffer_ticks
+            + self.config.safety_buffer_ticks
+            + self.config.min_profit_buffer_ticks
+        )
+        safe_exit = pair.safe_exit_price or winner.entry_price
+        if winner.side is PositionSide.LONG:
+            would_exit_net_pnl = safe_exit - winner.entry_price
+            exit_side = "BID"
+        else:
+            would_exit_net_pnl = winner.entry_price - safe_exit
+            exit_side = "ASK"
+        return {
+            "entry_price": winner.entry_price,
+            "current_bid": snapshot.book.best_bid,
+            "current_ask": snapshot.book.best_ask,
+            "safe_exit_price": safe_exit,
+            "estimated_exit_price": safe_exit,
+            "exit_side": exit_side,
+            "spread": snapshot.book.spread_ticks,
+            "expected_slippage": self._expected_slippage_ticks(snapshot),
+            "buffer": buffer_ticks,
+            "would_exit_net_pnl": would_exit_net_pnl,
+        }
 
     def _session_gate(self, snapshot: GateSnapshot) -> GateResult:
         seconds_to_close = _seconds_to_session_close(

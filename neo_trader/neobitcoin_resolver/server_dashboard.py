@@ -26,6 +26,9 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     status = _mapping(state.get("status"))
     market = _mapping(state.get("market"))
     pnl = _mapping(state.get("pnl"))
+    protection_audit = _mapping(state.get("protection_audit"))
+    pair_metrics = state.get("pair_metrics")
+    pair_metric_rows = pair_metrics if isinstance(pair_metrics, list) else []
     positions = state.get("open_pair_positions")
     position_rows = positions if isinstance(positions, list) else []
     return f"""<!doctype html>
@@ -62,12 +65,27 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
     {_metric("API", status.get("api_status"))}
     {_metric("Data", status.get("data_freshness"))}
     {_metric("Open Pair", status.get("current_open_pair") or "none")}
+    {_metric("Active Pair Count", state.get("active_pair_count"))}
+    {_metric("Entry Blocked", state.get("entry_blocked_by_active_pair"))}
   </section>
   <section class="grid">
     {_metric("Spread Ticks", market.get("spread_ticks"))}
     {_metric("Best Bid", market.get("best_bid"))}
     {_metric("Best Ask", market.get("best_ask"))}
     {_metric("Closed PnL", pnl.get("estimated_net_pnl"))}
+    {_metric("Pair Total PnL", state.get("pair_total_pnl"))}
+  </section>
+  <section>
+    <h2>Pair Metrics</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Pair</th><th>Total</th><th>Winner</th><th>Loser</th>
+          <th>After Protection</th><th>Drawdown</th>
+        </tr>
+      </thead>
+      <tbody>{_pair_metric_rows(pair_metric_rows)}</tbody>
+    </table>
   </section>
   <section>
     <h2>Open Positions</h2>
@@ -75,6 +93,10 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
       <thead><tr><th>Pair</th><th>Bot</th><th>Side</th><th>State</th><th>MFE</th><th>MAE</th></tr></thead>
       <tbody>{_position_rows(position_rows)}</tbody>
     </table>
+  </section>
+  <section>
+    <h2>Protection Audit</h2>
+    <pre>{json.dumps(protection_audit, ensure_ascii=False, indent=2)}</pre>
   </section>
   <section>
     <a href="/state.json">state.json</a> <code>/health</code>
@@ -158,6 +180,23 @@ def _position_rows(rows: list[object]) -> str:
             "</tr>"
         )
     return "".join(html_rows) or '<tr><td colspan="6">No open positions</td></tr>'
+
+
+def _pair_metric_rows(rows: list[object]) -> str:
+    html_rows: list[str] = []
+    for item in rows:
+        row = _mapping(item)
+        html_rows.append(
+            "<tr>"
+            f"<td>{row.get('pair_id', '')}</td>"
+            f"<td>{row.get('pair_total_pnl', '')}</td>"
+            f"<td>{row.get('winner_pnl', '')}</td>"
+            f"<td>{row.get('loser_pnl', '')}</td>"
+            f"<td>{row.get('total_after_protection', '')}</td>"
+            f"<td>{row.get('max_pair_drawdown', '')}</td>"
+            "</tr>"
+        )
+    return "".join(html_rows) or '<tr><td colspan="6">No pair metrics</td></tr>'
 
 
 def main(argv: list[str] | None = None) -> int:

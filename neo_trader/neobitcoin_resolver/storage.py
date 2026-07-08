@@ -10,7 +10,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from neo_trader.neobitcoin_resolver.types import GateResult, GateSnapshot, PairState, PositionLeg
+from neo_trader.neobitcoin_resolver.types import (
+    GateResult,
+    GateSnapshot,
+    PairState,
+    PositionLeg,
+    PositionSide,
+)
 
 
 class ResolverJournal:
@@ -24,6 +30,7 @@ class ResolverJournal:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
 
     def connect(self) -> sqlite3.Connection:
@@ -34,6 +41,188 @@ class ResolverJournal:
     def fetch_all(self, query: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return list(conn.execute(query, params))
+
+    def active_pair_count(self) -> int:
+        """Return number of pairs whose latest leg state still has open risk."""
+
+        with self.connect() as conn:
+            rows = list(conn.execute(ACTIVE_PAIR_IDS_SQL))
+        return len(rows)
+
+    def latest_active_pair_id(self) -> str | None:
+        """Return the most recently updated active pair id, if any."""
+
+        active_pair_ids = [str(row["pair_id"]) for row in self.fetch_all(ACTIVE_PAIR_IDS_SQL)]
+        if not active_pair_ids:
+            return None
+        placeholders = ",".join("?" for _ in active_pair_ids)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT pair_id
+                FROM positions
+                WHERE pair_id IN ({placeholders})
+                GROUP BY pair_id
+                ORDER BY MAX(id) DESC
+                LIMIT 1
+                """,
+                tuple(active_pair_ids),
+            ).fetchone()
+        return None if row is None else str(row["pair_id"])
+
+    def close_stale_active_pairs(self, *, keep_pair_id: str | None) -> int:
+        """Close active pairs other than the selected one using their latest PnL marks."""
+
+        active_pair_ids = [str(row["pair_id"]) for row in self.fetch_all(ACTIVE_PAIR_IDS_SQL)]
+        stale_pair_ids = [pair_id for pair_id in active_pair_ids if pair_id != keep_pair_id]
+        if not stale_pair_ids:
+            return 0
+        placeholders = ",".join("?" for _ in stale_pair_ids)
+        now = datetime.now().isoformat()
+        closed_rows = 0
+        with self.connect() as conn:
+            rows = list(
+                conn.execute(
+                    f"""
+                    WITH latest AS (
+                        SELECT pair_id, bot_id, MAX(id) AS max_id
+                        FROM positions
+                        WHERE pair_id IN ({placeholders})
+                        GROUP BY pair_id, bot_id
+                    )
+                    SELECT p.*
+                    FROM positions p
+                    JOIN latest l ON p.id = l.max_id
+                    WHERE p.state != 'CLOSED'
+                    """,
+                    tuple(stale_pair_ids),
+                )
+            )
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO positions(
+                        pair_id, bot_id, side, entry, exit, state, gross_pnl,
+                        estimated_net_pnl, mfe, mae, mfi_context, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'CLOSED', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["pair_id"],
+                        row["bot_id"],
+                        row["side"],
+                        row["entry"],
+                        row["exit"] or row["entry"],
+                        row["gross_pnl"],
+                        row["estimated_net_pnl"],
+                        row["mfe"],
+                        row["mae"],
+                        row["mfi_context"],
+                        now,
+                    ),
+                )
+                closed_rows += 1
+            conn.commit()
+        return closed_rows
+
+    def load_active_pair(self, pair_id: str | None = None) -> PairState | None:
+        """Rehydrate the latest active pair from the append-only journal."""
+
+        resolved_pair_id = pair_id or self.latest_active_pair_id()
+        if resolved_pair_id is None:
+            return None
+        with self.connect() as conn:
+            entry = conn.execute(
+                "SELECT * FROM pair_entries WHERE pair_id = ? ORDER BY id DESC LIMIT 1",
+                (resolved_pair_id,),
+            ).fetchone()
+            latest_positions = list(
+                conn.execute(
+                    """
+                    WITH latest AS (
+                        SELECT bot_id, MAX(id) AS max_id
+                        FROM positions
+                        WHERE pair_id = ?
+                        GROUP BY bot_id
+                    )
+                    SELECT p.*
+                    FROM positions p
+                    JOIN latest l ON p.id = l.max_id
+                    ORDER BY p.bot_id
+                    """,
+                    (resolved_pair_id,),
+                )
+            )
+            decision = conn.execute(
+                """
+                SELECT *
+                FROM resolver_decisions
+                WHERE pair_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (resolved_pair_id,),
+            ).fetchone()
+            protection = conn.execute(
+                """
+                SELECT *
+                FROM protection_events
+                WHERE pair_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (resolved_pair_id,),
+            ).fetchone()
+        if entry is None or len(latest_positions) < 2:
+            return None
+
+        by_side = {str(row["side"]): row for row in latest_positions}
+        long_row = by_side.get(PositionSide.LONG.value)
+        short_row = by_side.get(PositionSide.SHORT.value)
+        if long_row is None or short_row is None:
+            return None
+        if long_row["state"] == "CLOSED" and short_row["state"] == "CLOSED":
+            return None
+
+        winner_side = None
+        if decision is not None and decision["winner_selected"] is not None:
+            winner_side = PositionSide(str(decision["winner_selected"]))
+        protection_active = (
+            protection is not None
+            and int(protection["no_loss_mode_active"]) == 1
+            and not (long_row["state"] == "CLOSED" and short_row["state"] == "CLOSED")
+        )
+        safe_exit_price = (
+            None
+            if protection is None or protection["safe_exit_price"] is None
+            else Decimal(str(protection["safe_exit_price"]))
+        )
+        return PairState(
+            pair_id=resolved_pair_id,
+            opened_at=datetime.fromisoformat(str(entry["timestamp"])),
+            entry_mid_price=(
+                Decimal(str(entry["long_entry_price"])) + Decimal(str(entry["short_entry_price"]))
+            )
+            / Decimal("2"),
+            entry_spread_ticks=Decimal(str(entry["spread_at_entry"])),
+            expected_slippage_ticks=Decimal(str(entry["expected_slippage"])),
+            long_leg=_leg_from_row(long_row),
+            short_leg=_leg_from_row(short_row),
+            gate_results=(),
+            state="NO_LOSS_OR_PROFIT_ONLY"
+            if protection_active
+            else ("WINNER_TRAILING" if winner_side is not None else "BOTH_OPEN"),
+            winner_side=winner_side,
+            loser_closed=decision is not None and decision["loser_closed"] is not None,
+            protection_active=protection_active,
+            protection_trigger_reason=None
+            if protection is None
+            else protection["dynamic_trigger_reason"],
+            safe_exit_price=safe_exit_price,
+            protection_audit=None
+            if protection is None
+            else _json_loads_optional(protection["protection_audit_json"]),
+        )
 
     def record_orderbook(self, snapshot: GateSnapshot) -> None:
         book = snapshot.book
@@ -242,6 +431,7 @@ class ResolverJournal:
         expected_slippage: Decimal,
         buffer: Decimal,
         final_result: Decimal | None = None,
+        protection_audit: Mapping[str, object] | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -249,9 +439,10 @@ class ResolverJournal:
                 INSERT INTO protection_events(
                     pair_id, timestamp, winner_side, trigger_percent,
                     dynamic_trigger_reason, safe_exit_price, spread_at_protection,
-                    expected_slippage, buffer, no_loss_mode_active, final_result
+                    expected_slippage, buffer, no_loss_mode_active, final_result,
+                    protection_audit_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pair.pair_id,
@@ -265,6 +456,7 @@ class ResolverJournal:
                     _num(buffer),
                     int(pair.protection_active),
                     _num(final_result),
+                    _json(protection_audit or pair.protection_audit or {}),
                 ),
             )
             conn.commit()
@@ -300,6 +492,19 @@ class ResolverJournal:
                 ),
             )
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        protection_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(protection_events)")
+        }
+        if "protection_audit_json" not in protection_columns:
+            conn.execute(
+                "ALTER TABLE protection_events "
+                "ADD COLUMN protection_audit_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        pair_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pair_entries)")}
+        if "pair_total_pnl" not in pair_columns:
+            conn.execute("ALTER TABLE pair_entries ADD COLUMN pair_total_pnl TEXT")
 
     def record_heartbeat(
         self,
@@ -343,6 +548,30 @@ def _num(value: object) -> str | None:
     if isinstance(value, Decimal):
         return str(value)
     return str(value)
+
+
+def _json_loads_optional(value: object) -> dict[str, object] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    loaded = json.loads(value)
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _leg_from_row(row: sqlite3.Row) -> PositionLeg:
+    leg = PositionLeg(
+        bot_id=str(row["bot_id"]),
+        side=PositionSide(str(row["side"])),
+        entry_price=Decimal(str(row["entry"])),
+        entry_time=datetime.fromisoformat(str(row["updated_at"])),
+        state=str(row["state"]),
+        exit_price=None if row["exit"] is None else Decimal(str(row["exit"])),
+        gross_pnl=Decimal(str(row["gross_pnl"])),
+        estimated_net_pnl=Decimal(str(row["estimated_net_pnl"])),
+        mfe=Decimal(str(row["mfe"])),
+        mae=Decimal(str(row["mae"])),
+        mfi_context=None if row["mfi_context"] is None else Decimal(str(row["mfi_context"])),
+    )
+    return leg
 
 
 def _json(value: object) -> str:
@@ -468,7 +697,8 @@ CREATE TABLE IF NOT EXISTS pair_entries (
     expected_slippage TEXT NOT NULL,
     actual_fill_json TEXT NOT NULL,
     gates_json TEXT NOT NULL,
-    reason_if_blocked TEXT
+    reason_if_blocked TEXT,
+    pair_total_pnl TEXT
 );
 
 CREATE TABLE IF NOT EXISTS resolver_decisions (
@@ -515,7 +745,8 @@ CREATE TABLE IF NOT EXISTS protection_events (
     expected_slippage TEXT NOT NULL,
     buffer TEXT NOT NULL,
     no_loss_mode_active INTEGER NOT NULL,
-    final_result TEXT
+    final_result TEXT,
+    protection_audit_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS blocked_entries (
@@ -541,6 +772,24 @@ CREATE TABLE IF NOT EXISTS heartbeat (
     current_state TEXT NOT NULL,
     current_open_pair TEXT
 );
+"""
+
+
+ACTIVE_PAIR_IDS_SQL = """
+WITH latest AS (
+    SELECT pair_id, bot_id, MAX(id) AS max_id
+    FROM positions
+    GROUP BY pair_id, bot_id
+),
+latest_positions AS (
+    SELECT p.pair_id, p.state
+    FROM positions p
+    JOIN latest l ON p.id = l.max_id
+)
+SELECT pair_id
+FROM latest_positions
+GROUP BY pair_id
+HAVING SUM(CASE WHEN state != 'CLOSED' THEN 1 ELSE 0 END) > 0
 """
 
 
