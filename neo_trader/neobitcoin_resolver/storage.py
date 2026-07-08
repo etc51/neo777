@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime
@@ -75,9 +76,24 @@ class ResolverJournal:
 
         active_pair_ids = [str(row["pair_id"]) for row in self.fetch_all(ACTIVE_PAIR_IDS_SQL)]
         stale_pair_ids = [pair_id for pair_id in active_pair_ids if pair_id != keep_pair_id]
-        if not stale_pair_ids:
+        return self.close_active_pairs(stale_pair_ids)
+
+    def close_legacy_active_pairs(self) -> int:
+        """Close pre-UUID active pairs created by the old restart-local sequence."""
+
+        active_pair_ids = [str(row["pair_id"]) for row in self.fetch_all(ACTIVE_PAIR_IDS_SQL)]
+        legacy_pair_ids = [
+            pair_id for pair_id in active_pair_ids if LEGACY_PAIR_ID_RE.fullmatch(pair_id)
+        ]
+        return self.close_active_pairs(legacy_pair_ids)
+
+    def close_active_pairs(self, pair_ids: list[str]) -> int:
+        """Append CLOSED position rows for supplied active pair ids."""
+
+        active_pair_ids = list(dict.fromkeys(pair_ids))
+        if not active_pair_ids:
             return 0
-        placeholders = ",".join("?" for _ in stale_pair_ids)
+        placeholders = ",".join("?" for _ in active_pair_ids)
         now = datetime.now().isoformat()
         closed_rows = 0
         with self.connect() as conn:
@@ -95,7 +111,7 @@ class ResolverJournal:
                     JOIN latest l ON p.id = l.max_id
                     WHERE p.state != 'CLOSED'
                     """,
-                    tuple(stale_pair_ids),
+                    tuple(active_pair_ids),
                 )
             )
             for row in rows:
@@ -791,6 +807,8 @@ FROM latest_positions
 GROUP BY pair_id
 HAVING SUM(CASE WHEN state != 'CLOSED' THEN 1 ELSE 0 END) > 0
 """
+
+LEGACY_PAIR_ID_RE = re.compile(r"NBPAIR_\d{6}_[0-9a-f]{8}")
 
 
 __all__ = ["ResolverJournal"]

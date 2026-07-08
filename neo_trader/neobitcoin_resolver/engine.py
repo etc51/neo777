@@ -242,6 +242,7 @@ class DualBotNeobitcoinResolver:
     def _restore_active_pair(self) -> None:
         if self.config.multi_pair_mode:
             return
+        self.journal.close_legacy_active_pairs()
         active_pair_id = self.journal.latest_active_pair_id()
         if active_pair_id is not None:
             self.journal.close_stale_active_pairs(keep_pair_id=active_pair_id)
