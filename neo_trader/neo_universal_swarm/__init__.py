@@ -1,5 +1,11 @@
 """Neo Universal Bot Swarm paper/simulation package."""
 
+from neo_trader.neo_universal_swarm.backtest import (
+    OrderbookBacktestArtifacts,
+    OrderbookBacktestConfig,
+    OrderbookBacktestResult,
+    run_orderbook_backtest,
+)
 from neo_trader.neo_universal_swarm.bots import CuratorBot, UniversalAccountBot
 from neo_trader.neo_universal_swarm.config import (
     AccountKind,
@@ -66,6 +72,9 @@ __all__ = [
     "BookSnapshot",
     "CuratorBot",
     "CuratorConfig",
+    "OrderbookBacktestArtifacts",
+    "OrderbookBacktestConfig",
+    "OrderbookBacktestResult",
     "HedgePairSimulationConfig",
     "HedgePairSimulator",
     "ExperimentalMode",
@@ -100,6 +109,7 @@ __all__ = [
     "orderbook_snapshot_to_book_snapshot",
     "render_swarm_dashboard_html",
     "run_live_paper_swarm",
+    "run_orderbook_backtest",
     "run_paper_simulation",
     "run_swarm_daemon",
     "serve_swarm_dashboard",
