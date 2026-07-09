@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
+from neo_trader.neo_universal_swarm.first_bot_logic_clone import MODE_ALLOCATION
 from neo_trader.neo_universal_swarm.types import (
     PairExitReason,
     PairLabel,
@@ -16,29 +17,25 @@ from neo_trader.neo_universal_swarm.types import (
 
 
 class ExperimentalMode(StrEnum):
-    """Paper-only experimental entry/management modes."""
+    """First-bot-clone paper pair modes."""
 
-    BASELINE = "BASELINE"
-    PERSISTENT_IMBALANCE = "PERSISTENT_IMBALANCE"
-    TICK_VELOCITY = "TICK_VELOCITY"
-    TRADE_AGGRESSION = "TRADE_AGGRESSION"
-    WIDE_TRAILING = "WIDE_TRAILING"
+    BASELINE_PAIR = "BASELINE_PAIR"
+    BOLLINGER_PAIR = "BOLLINGER_PAIR"
+    IMBALANCE_PAIR = "IMBALANCE_PAIR"
+    MICROPRICE_PAIR = "MICROPRICE_PAIR"
+    TICK_VELOCITY_PAIR = "TICK_VELOCITY_PAIR"
 
 
 CHALLENGER_MODES: tuple[ExperimentalMode, ...] = (
-    ExperimentalMode.PERSISTENT_IMBALANCE,
-    ExperimentalMode.TICK_VELOCITY,
-    ExperimentalMode.TRADE_AGGRESSION,
-    ExperimentalMode.WIDE_TRAILING,
+    ExperimentalMode.BOLLINGER_PAIR,
+    ExperimentalMode.IMBALANCE_PAIR,
+    ExperimentalMode.MICROPRICE_PAIR,
+    ExperimentalMode.TICK_VELOCITY_PAIR,
 )
 DEFAULT_MODE_ALLOCATIONS: dict[ExperimentalMode, Decimal] = {
-    ExperimentalMode.BASELINE: Decimal("0.40"),
-    ExperimentalMode.TRADE_AGGRESSION: Decimal("0.30"),
-    ExperimentalMode.TICK_VELOCITY: Decimal("0.20"),
-    ExperimentalMode.PERSISTENT_IMBALANCE: Decimal("0.02"),
-    ExperimentalMode.WIDE_TRAILING: Decimal("0.02"),
+    ExperimentalMode(mode): allocation for mode, allocation in MODE_ALLOCATION.items()
 }
-EXPLORATION_ALLOCATION: Decimal = Decimal("0.06")
+EXPLORATION_ALLOCATION: Decimal = Decimal("0")
 MIN_COOLDOWN_ALLOCATION: Decimal = Decimal("0.01")
 BAD_MODE_ALLOCATION: Decimal = Decimal("0.02")
 BAD_MODE_MIN_CLOSED_PAIRS: int = 30
@@ -165,9 +162,9 @@ class InstrumentLearningState:
     instrument: SwarmInstrument
     allocations: dict[ExperimentalMode, Decimal] = field(default_factory=dict)
     performances: dict[ExperimentalMode, ModePerformance] = field(default_factory=dict)
-    active_mode: ExperimentalMode = ExperimentalMode.BASELINE
-    best_challenger: ExperimentalMode = ExperimentalMode.TRADE_AGGRESSION
-    worst_mode: ExperimentalMode = ExperimentalMode.WIDE_TRAILING
+    active_mode: ExperimentalMode = ExperimentalMode.BASELINE_PAIR
+    best_challenger: ExperimentalMode = ExperimentalMode.BOLLINGER_PAIR
+    worst_mode: ExperimentalMode = ExperimentalMode.TICK_VELOCITY_PAIR
     assigned_pairs: int = 0
     closed_pairs: int = 0
     last_recalibrated_at_pairs: int = 0
@@ -197,7 +194,7 @@ class InstrumentLearningState:
             if bucket < running:
                 self.active_mode = mode
                 return mode
-        self.active_mode = ExperimentalMode.WIDE_TRAILING
+        self.active_mode = ExperimentalMode.TICK_VELOCITY_PAIR
         return self.active_mode
 
     def update_label(self, *, mode: ExperimentalMode, label: PairLabel) -> None:
@@ -223,8 +220,8 @@ class InstrumentLearningState:
                 key=lambda mode: self.performances[mode].ev_ticks,
             )
         else:
-            self.best_challenger = ExperimentalMode.TRADE_AGGRESSION
-            self.worst_mode = ExperimentalMode.WIDE_TRAILING
+            self.best_challenger = ExperimentalMode.BOLLINGER_PAIR
+            self.worst_mode = ExperimentalMode.TICK_VELOCITY_PAIR
 
         allocations = _initial_allocations()
         bad_modes = [
@@ -243,9 +240,9 @@ class InstrumentLearningState:
             preferred_modes = [
                 mode
                 for mode in (
-                    ExperimentalMode.BASELINE,
-                    ExperimentalMode.TRADE_AGGRESSION,
-                    ExperimentalMode.TICK_VELOCITY,
+                    ExperimentalMode.BASELINE_PAIR,
+                    ExperimentalMode.BOLLINGER_PAIR,
+                    ExperimentalMode.IMBALANCE_PAIR,
                 )
                 if mode not in bad_modes
             ]
@@ -280,8 +277,8 @@ class InstrumentLearningState:
                 allocations[mode] = MIN_COOLDOWN_ALLOCATION
         if reduced_total:
             preferred_modes = (
-                ExperimentalMode.BASELINE,
-                ExperimentalMode.TRADE_AGGRESSION,
+                ExperimentalMode.BASELINE_PAIR,
+                ExperimentalMode.BOLLINGER_PAIR,
             )
             per_mode = decimal_ratio(reduced_total, Decimal(len(preferred_modes)))
             for mode in preferred_modes:
@@ -486,14 +483,6 @@ class OnlineLearningState:
 
 def _initial_allocations() -> dict[ExperimentalMode, Decimal]:
     allocations = dict(DEFAULT_MODE_ALLOCATIONS)
-    exploration_modes = (
-        ExperimentalMode.PERSISTENT_IMBALANCE,
-        ExperimentalMode.TICK_VELOCITY,
-        ExperimentalMode.WIDE_TRAILING,
-    )
-    per_mode = decimal_ratio(EXPLORATION_ALLOCATION, Decimal(len(exploration_modes)))
-    for mode in exploration_modes:
-        allocations[mode] = allocations.get(mode, Decimal("0")) + per_mode
     return _normalize_allocations(allocations)
 
 

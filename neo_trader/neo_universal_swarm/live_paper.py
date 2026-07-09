@@ -12,7 +12,7 @@ import os
 import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -24,6 +24,16 @@ from neo_trader.broker.tbank import TBankClient, TBankOrderBookSnapshot
 from neo_trader.neo_universal_swarm.bots import CuratorBot
 from neo_trader.neo_universal_swarm.config import DEFAULT_ACCOUNTS_CONFIG, load_accounts_config
 from neo_trader.neo_universal_swarm.dashboard import build_swarm_dashboard_state
+from neo_trader.neo_universal_swarm.first_bot_logic_clone import (
+    ARCHITECTURE,
+    FIRST_BOT_LOGIC_CLONE_ENABLED,
+    INSTRUMENT_ALLOCATION,
+    LEGACY_UNIVERSAL_LOGIC_ENABLED,
+    LOGIC_SOURCE,
+    force_first_bot_prediction,
+    instrument_allowed,
+    label_enrichment,
+)
 from neo_trader.neo_universal_swarm.instruments import (
     SwarmInstrumentCatalog,
     load_swarm_instrument_catalog,
@@ -59,10 +69,7 @@ SleepFunc = Callable[[float], None]
 TRAIL_LOCK_4_TICKS = Decimal("4")
 TRAIL_LOCK_6_TICKS = Decimal("6")
 TRAIL_LOCK_MIN_PNL_TICKS = Decimal("1")
-INSTRUMENT_ENTRY_ALLOCATION: dict[SwarmInstrument, Decimal] = {
-    SwarmInstrument.NEOBITOK: Decimal("0.55"),
-    SwarmInstrument.NEOEFIR: Decimal("0.45"),
-}
+INSTRUMENT_ENTRY_ALLOCATION: dict[SwarmInstrument, Decimal] = dict(INSTRUMENT_ALLOCATION)
 
 
 class OrderBookProvider(Protocol):
@@ -156,6 +163,9 @@ class _LivePairState:
     missed_runner_profit_ticks: Decimal = Decimal("0")
     logged_avoided_wide_spread_exits: int = 0
     logged_missed_runner_profit_ticks: Decimal = Decimal("0")
+    logged_loser_stop: bool = False
+    logged_runner_breakeven: bool = False
+    logged_runner_trail: bool = False
 
 
 class _LivePaperRecorder:
@@ -232,10 +242,56 @@ class _LivePaperRecorder:
         state: _LivePairState,
         snapshot: BookSnapshot,
     ) -> None:
+        base_event = {
+            "cycle": cycle,
+            "recorded_at": datetime.now(UTC),
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
+            "mode": state.mode.value,
+            "pair_id": state.pair.pair_id,
+            "instrument": state.pair.instrument.value,
+            "symbol": state.pair.instrument.value,
+            "long_bot": state.pair.long_bot_id,
+            "short_bot": state.pair.short_bot_id,
+            "long_bot_id": state.pair.long_bot_id,
+            "short_bot_id": state.pair.short_bot_id,
+            "entry_bid": snapshot.best_bid,
+            "entry_ask": snapshot.best_ask,
+            "entry_spread": snapshot.spread_ticks,
+            "long_entry_price": state.long_entry,
+            "short_entry_price": state.short_entry,
+            "stop_loss_ticks": state.pair.stop_loss_ticks,
+            "breakeven_ticks": state.pair.breakeven_ticks,
+            "paper": True,
+            "live": False,
+        }
+        for event_name in (
+            "PAIR_OPEN_REQUEST",
+            "PAIR_OPEN",
+            "LONG_LEG_OPEN",
+            "SHORT_LEG_OPEN",
+        ):
+            event = {
+                **base_event,
+                "event": event_name,
+                "event_type": event_name,
+            }
+            if event_name == "LONG_LEG_OPEN":
+                event["bot_id"] = state.pair.long_bot_id
+                event["side"] = LegSide.LONG.value
+                event["entry_price"] = state.long_entry
+            elif event_name == "SHORT_LEG_OPEN":
+                event["bot_id"] = state.pair.short_bot_id
+                event["side"] = LegSide.SHORT.value
+                event["entry_price"] = state.short_entry
+            self._append("pair_events.jsonl", event)
         payload = {
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
             "event_type": "PAIR_OPENED",
+            "event": "PAIR_OPEN",
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
             "mode": state.mode.value,
             "pair": _active_pair_payload(state.pair),
             "entry": _live_pair_state_payload(state, snapshot),
@@ -256,6 +312,9 @@ class _LivePaperRecorder:
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
             "event_type": "PAIR_UPDATE" if label is None else "PAIR_CLOSED",
+            "event": "PAIR_UPDATE" if label is None else "PAIR_CLOSE",
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
             "mode": state.mode.value,
             "pair": _active_pair_payload(state.pair),
             "state": _live_pair_state_payload(state, snapshot),
@@ -264,6 +323,32 @@ class _LivePaperRecorder:
         }
         self._append("live_paper_pair_updates.jsonl", payload)
         self._append("pair_events.jsonl", payload)
+        if label is not None:
+            self._append(
+                "pair_events.jsonl",
+                {
+                    "cycle": cycle,
+                    "recorded_at": datetime.now(UTC),
+                    "event": "PAIR_CLOSE",
+                    "event_type": "PAIR_CLOSE",
+                    "logic_source": LOGIC_SOURCE,
+                    "architecture": ARCHITECTURE,
+                    "mode": state.mode.value,
+                    "pair_id": label.pair_id,
+                    "instrument": label.instrument.value,
+                    "symbol": label.instrument.value,
+                    "long_bot": label.long_bot_id,
+                    "short_bot": label.short_bot_id,
+                    "runner_side": None if label.runner_side is None else label.runner_side.value,
+                    "loser_side": None if label.loser_side is None else label.loser_side.value,
+                    "pair_pnl_after_spread": label.pair_total_pnl_ticks,
+                    "raw_pair_pnl": label.pair_total_pnl_ticks + label.entry_spread_cost_ticks,
+                    "spread_cost": label.entry_spread_cost_ticks,
+                    "exit_reason": label.exit_reason.value,
+                    "paper": True,
+                    "live": False,
+                },
+            )
 
     def record_control_event(
         self,
@@ -274,15 +359,20 @@ class _LivePaperRecorder:
         snapshot: BookSnapshot,
         payload: Mapping[str, object],
     ) -> None:
+        normalized_payload = dict(payload)
+        event_name = str(normalized_payload.pop("event", event_type))
         event = {
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
+            "event": event_name,
             "event_type": event_type,
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
             "mode": state.mode.value,
             "pair_id": state.pair.pair_id,
             "instrument": state.pair.instrument.value,
             "state": _live_pair_state_payload(state, snapshot),
-            "payload": dict(payload),
+            "payload": normalized_payload,
         }
         self._append("pair_events.jsonl", event)
 
@@ -292,12 +382,16 @@ class _LivePaperRecorder:
         cycle: int,
         mode: ExperimentalMode,
         label: PairLabel,
+        state: _LivePairState | None = None,
     ) -> None:
+        label_payload = _label_payload(label, state=state)
         payload = {
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
             "mode": mode.value,
-            "label": _label_payload(label),
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
+            "label": label_payload,
         }
         self._append("live_paper_pair_labels.jsonl", payload)
         self._append(
@@ -305,7 +399,7 @@ class _LivePaperRecorder:
             {
                 "cycle": cycle,
                 "recorded_at": datetime.now(UTC),
-                **_label_payload(label),
+                **label_payload,
                 "mode": mode.value,
             },
         )
@@ -556,6 +650,7 @@ def run_live_paper_swarm(
                             cycle=cycle_number,
                             mode=state.mode,
                             label=label,
+                            state=state,
                         )
                         live_pairs.pop(label.pair_id, None)
 
@@ -570,6 +665,11 @@ def run_live_paper_swarm(
                         snapshot,
                         mode=mode,
                         base_config=base_model_config,
+                    )
+                    prediction = force_first_bot_prediction(
+                        prediction,
+                        snapshot=snapshot,
+                        mode=mode.value,
                     )
                     prediction = _apply_online_entry_gates(
                         prediction,
@@ -827,36 +927,12 @@ def _apply_online_entry_gates(
     snapshot: BookSnapshot,
     mode: ExperimentalMode,
 ) -> PairEVPrediction:
-    if not prediction.trade_allowed:
-        return prediction
-    required_runner_mfe = (
-        Decimal(prediction.best_stop_loss_ticks) + snapshot.spread_ticks + Decimal("1")
-    )
-    if prediction.expected_runner_mfe_ticks >= required_runner_mfe:
-        return prediction
-    if _is_exploration_mode(mode):
-        return replace(
-            prediction,
-            reason_codes=prediction.reason_codes + ("RUNNER_GATE_EXPLORATION",),
-        )
-    return replace(
-        prediction,
-        trade_allowed=False,
-        rejection_reason=RejectionReason.MODEL,
-        reason_codes=prediction.reason_codes
-        + (
-            "RUNNER_GATE_REJECT",
-            f"EXPECTED_MFE_LT_{required_runner_mfe}",
-        ),
-    )
+    del snapshot, mode
+    return prediction
 
 
 def _is_exploration_mode(mode: ExperimentalMode) -> bool:
-    return mode in {
-        ExperimentalMode.PERSISTENT_IMBALANCE,
-        ExperimentalMode.TICK_VELOCITY,
-        ExperimentalMode.WIDE_TRAILING,
-    }
+    return mode is ExperimentalMode.TICK_VELOCITY_PAIR
 
 
 def _instrument_entry_allowed(
@@ -870,17 +946,18 @@ def _instrument_entry_allowed(
         return True
     if instrument not in INSTRUMENT_ENTRY_ALLOCATION:
         return True
-    bucket = Decimal((cycle * 7919) % 100) / Decimal("100")
-    if instrument is SwarmInstrument.NEOBITOK:
-        return bucket < INSTRUMENT_ENTRY_ALLOCATION[SwarmInstrument.NEOBITOK]
-    return bucket >= INSTRUMENT_ENTRY_ALLOCATION[SwarmInstrument.NEOBITOK]
+    return instrument_allowed(
+        instrument=instrument,
+        cycle=cycle,
+        available_count=len(instruments),
+    )
 
 
 def _model_config_for_mode(
     base_config: PairEVModelConfig,
     mode: ExperimentalMode,
 ) -> PairEVModelConfig:
-    if mode is ExperimentalMode.PERSISTENT_IMBALANCE:
+    if mode is ExperimentalMode.IMBALANCE_PAIR:
         return PairEVModelConfig(
             min_required_ev_ticks=base_config.min_required_ev_ticks,
             max_spread_ticks=base_config.max_spread_ticks,
@@ -891,7 +968,7 @@ def _model_config_for_mode(
             slippage_stress_ticks=base_config.slippage_stress_ticks,
             execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
         )
-    if mode is ExperimentalMode.TICK_VELOCITY:
+    if mode is ExperimentalMode.TICK_VELOCITY_PAIR:
         return PairEVModelConfig(
             min_required_ev_ticks=base_config.min_required_ev_ticks,
             max_spread_ticks=base_config.max_spread_ticks,
@@ -902,7 +979,7 @@ def _model_config_for_mode(
             slippage_stress_ticks=base_config.slippage_stress_ticks,
             execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
         )
-    if mode is ExperimentalMode.TRADE_AGGRESSION:
+    if mode is ExperimentalMode.MICROPRICE_PAIR:
         return PairEVModelConfig(
             min_required_ev_ticks=base_config.min_required_ev_ticks,
             max_spread_ticks=base_config.max_spread_ticks,
@@ -913,7 +990,7 @@ def _model_config_for_mode(
             slippage_stress_ticks=base_config.slippage_stress_ticks,
             execution_error_per_250ms_ticks=base_config.execution_error_per_250ms_ticks,
         )
-    if mode is ExperimentalMode.WIDE_TRAILING:
+    if mode is ExperimentalMode.BOLLINGER_PAIR:
         return PairEVModelConfig(
             min_required_ev_ticks=base_config.min_required_ev_ticks,
             max_spread_ticks=Decimal("3"),
@@ -928,7 +1005,7 @@ def _model_config_for_mode(
 
 
 def _trailing_retrace_ticks(mode: ExperimentalMode) -> Decimal:
-    if mode is ExperimentalMode.WIDE_TRAILING:
+    if mode is ExperimentalMode.BOLLINGER_PAIR:
         return Decimal("3")
     return Decimal("2")
 
@@ -1223,6 +1300,8 @@ def _prediction_payload(prediction: PairEVPrediction) -> dict[str, object]:
 
 def _active_pair_payload(pair: ActivePair) -> dict[str, object]:
     return {
+        "logic_source": LOGIC_SOURCE,
+        "architecture": ARCHITECTURE,
         "pair_id": pair.pair_id,
         "instrument": pair.instrument.value,
         "long_bot_id": pair.long_bot_id,
@@ -1297,8 +1376,20 @@ def _live_pair_state_payload(
     }
 
 
-def _label_payload(label: PairLabel) -> dict[str, object]:
+def _label_payload(
+    label: PairLabel,
+    *,
+    state: _LivePairState | None = None,
+) -> dict[str, object]:
+    enrichment = label_enrichment(
+        label=label,
+        long_entry_price=None if state is None else state.long_entry,
+        short_entry_price=None if state is None else state.short_entry,
+        entry_bid=None if state is None else state.entry.best_bid,
+        entry_ask=None if state is None else state.entry.best_ask,
+    )
     return {
+        **enrichment,
         "pair_id": label.pair_id,
         "instrument": label.instrument.value,
         "mode": label.regime,
@@ -1483,6 +1574,73 @@ def _record_live_pair_control_events(
     state: _LivePairState,
     snapshot: BookSnapshot,
 ) -> None:
+    if state.loser_side is not None and not state.logged_loser_stop:
+        loser_bot_id = (
+            state.pair.long_bot_id
+            if state.loser_side is LegSide.LONG
+            else state.pair.short_bot_id
+        )
+        recorder.record_control_event(
+            cycle=cycle,
+            event_type="LOSER_STOP",
+            state=state,
+            snapshot=snapshot,
+            payload={
+                "event": "LOSER_STOP",
+                "bot_id": loser_bot_id,
+                "side": state.loser_side.value,
+                "loser_loss_ticks": state.loser_loss_ticks,
+                "paper": True,
+                "live": False,
+            },
+        )
+        state.logged_loser_stop = True
+    if state.runner_side is not None and not state.logged_runner_breakeven:
+        runner_bot_id = (
+            state.pair.long_bot_id
+            if state.runner_side is LegSide.LONG
+            else state.pair.short_bot_id
+        )
+        recorder.record_control_event(
+            cycle=cycle,
+            event_type="RUNNER_BREAKEVEN",
+            state=state,
+            snapshot=snapshot,
+            payload={
+                "event": "RUNNER_BREAKEVEN",
+                "bot_id": runner_bot_id,
+                "side": state.runner_side.value,
+                "breakeven_ticks": state.pair.breakeven_ticks,
+                "paper": True,
+                "live": False,
+            },
+        )
+        state.logged_runner_breakeven = True
+    if state.runner_side is not None and not state.logged_runner_trail:
+        runner_bot_id = (
+            state.pair.long_bot_id
+            if state.runner_side is LegSide.LONG
+            else state.pair.short_bot_id
+        )
+        recorder.record_control_event(
+            cycle=cycle,
+            event_type="RUNNER_TRAIL",
+            state=state,
+            snapshot=snapshot,
+            payload={
+                "event": "RUNNER_TRAIL",
+                "bot_id": runner_bot_id,
+                "side": state.runner_side.value,
+                "runner_mfe_ticks": state.runner_mfe_ticks,
+                "runner_mae_ticks": state.runner_mae_ticks,
+                "trail_profile": "TRAIL_WIDE"
+                if state.pair.instrument is SwarmInstrument.NEOEFIR
+                else "DEFAULT",
+                "paper": True,
+                "live": False,
+            },
+        )
+        state.logged_runner_trail = True
     if state.avoided_wide_spread_exits > state.logged_avoided_wide_spread_exits:
         recorder.record_control_event(
             cycle=cycle,
@@ -1580,12 +1738,20 @@ def _write_live_dashboard_state(
     payload["market_data_source"] = "tbank-readonly-rest"
     payload["paper_enabled"] = True
     payload["live_enabled"] = False
+    payload["logic_source"] = LOGIC_SOURCE
+    payload["architecture"] = ARCHITECTURE
+    payload["first_bot_logic_clone_enabled"] = FIRST_BOT_LOGIC_CLONE_ENABLED
+    payload["legacy_universal_logic_enabled"] = LEGACY_UNIVERSAL_LOGIC_ENABLED
     learning_payload = learning_state.to_payload()
     payload["online_learning"] = learning_payload
     swarm = payload.get("swarm")
     if isinstance(swarm, dict):
         swarm["paper_enabled"] = True
         swarm["live_enabled"] = False
+        swarm["logic_source"] = LOGIC_SOURCE
+        swarm["architecture"] = ARCHITECTURE
+        swarm["first_bot_logic_clone_enabled"] = FIRST_BOT_LOGIC_CLONE_ENABLED
+        swarm["legacy_universal_logic_enabled"] = LEGACY_UNIVERSAL_LOGIC_ENABLED
         curator_payload = swarm.get("curator")
         if isinstance(curator_payload, dict):
             curator_payload["status"] = "LIVE_PAPER_COORDINATOR"
@@ -1628,6 +1794,12 @@ def _write_summary_json(
         "cycle": cycle,
         "runtime_mode": "live-paper",
         "market_data_source": "tbank-readonly-rest",
+        "logic_source": LOGIC_SOURCE,
+        "architecture": ARCHITECTURE,
+        "first_bot_logic_clone_enabled": FIRST_BOT_LOGIC_CLONE_ENABLED,
+        "legacy_universal_logic_enabled": LEGACY_UNIVERSAL_LOGIC_ENABLED,
+        "paper_enabled": True,
+        "live_enabled": False,
         "online_learning": learning_state.to_payload(),
         "active_pairs": len(active_pairs),
         "closed_pairs": metrics.total_pairs,

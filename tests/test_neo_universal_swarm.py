@@ -127,14 +127,14 @@ def test_online_learning_allocates_challengers_from_start() -> None:
 
     modes = [state.choose_mode(SwarmInstrument.NEOBITOK) for _ in range(100)]
 
-    assert ExperimentalMode.BASELINE in modes
-    assert ExperimentalMode.PERSISTENT_IMBALANCE in modes
+    assert ExperimentalMode.BASELINE_PAIR in modes
+    assert ExperimentalMode.BOLLINGER_PAIR in modes
     assert any(
         mode
         in {
-            ExperimentalMode.TICK_VELOCITY,
-            ExperimentalMode.TRADE_AGGRESSION,
-            ExperimentalMode.WIDE_TRAILING,
+            ExperimentalMode.IMBALANCE_PAIR,
+            ExperimentalMode.MICROPRICE_PAIR,
+            ExperimentalMode.TICK_VELOCITY_PAIR,
         }
         for mode in modes
     )
@@ -145,21 +145,21 @@ def test_online_learning_reweights_best_and_worst_challengers_after_labels() -> 
 
     state.update_label(
         instrument=SwarmInstrument.NEOBITOK,
-        mode=ExperimentalMode.PERSISTENT_IMBALANCE,
+        mode=ExperimentalMode.BOLLINGER_PAIR,
         label=_pair_label(pair_id="PAIR_GOOD", pnl_ticks=Decimal("2"), fakeout=False),
     )
     state.update_label(
         instrument=SwarmInstrument.NEOBITOK,
-        mode=ExperimentalMode.TICK_VELOCITY,
+        mode=ExperimentalMode.IMBALANCE_PAIR,
         label=_pair_label(pair_id="PAIR_BAD", pnl_ticks=Decimal("-4"), fakeout=True),
     )
 
     allocations = state.instruments[SwarmInstrument.NEOBITOK].allocations
-    assert allocations[ExperimentalMode.BASELINE] == Decimal("0.4")
-    assert allocations[ExperimentalMode.TRADE_AGGRESSION] == Decimal("0.3")
-    assert allocations[ExperimentalMode.PERSISTENT_IMBALANCE] == Decimal("0.04")
-    assert allocations[ExperimentalMode.TICK_VELOCITY] == Decimal("0.22")
-    assert allocations[ExperimentalMode.WIDE_TRAILING] == Decimal("0.04")
+    assert allocations[ExperimentalMode.BASELINE_PAIR] == Decimal("0.45")
+    assert allocations[ExperimentalMode.BOLLINGER_PAIR] == Decimal("0.20")
+    assert allocations[ExperimentalMode.IMBALANCE_PAIR] == Decimal("0.15")
+    assert allocations[ExperimentalMode.MICROPRICE_PAIR] == Decimal("0.15")
+    assert allocations[ExperimentalMode.TICK_VELOCITY_PAIR] == Decimal("0.05")
     assert sum(allocations.values(), Decimal("0")) == Decimal("1.00")
 
 
@@ -169,15 +169,15 @@ def test_online_learning_guards_runner_side_none_without_disabling_mode() -> Non
     for index in range(4):
         state.update_label(
             instrument=SwarmInstrument.NEOBITOK,
-            mode=ExperimentalMode.WIDE_TRAILING,
+            mode=ExperimentalMode.TICK_VELOCITY_PAIR,
             label=_runner_side_none_label(pair_id=f"PAIR_NONE_{index}"),
         )
 
     instrument_state = state.instruments[SwarmInstrument.NEOBITOK]
     effective = instrument_state.to_payload()["effective_mode_allocation"]
-    assert effective[ExperimentalMode.WIDE_TRAILING.value] == "0.01"
+    assert effective[ExperimentalMode.TICK_VELOCITY_PAIR.value] == "0.01"
     assert instrument_state.performances[
-        ExperimentalMode.WIDE_TRAILING
+        ExperimentalMode.TICK_VELOCITY_PAIR
     ].runner_side_none_rate == Decimal("1")
 
 
@@ -429,9 +429,15 @@ def test_live_paper_swarm_uses_tbank_orderbooks_and_writes_dashboard(
     assert "pair_total_pnl_ticks" in labels_csv
     assert len(labels_csv.strip().splitlines()) == 2
     learning_state = (reports / "online_learning_state.json").read_text(encoding="utf-8")
-    assert "BASELINE" in learning_state
-    assert "PERSISTENT_IMBALANCE" in learning_state
+    assert "BASELINE_PAIR" in learning_state
+    assert "BOLLINGER_PAIR" in learning_state
     assert "bot_utilization" in learning_state
+    assert "FIRST_BOT_CLONE" in requested_labels
+    assert '"architecture": "UNIVERSAL_10_BOTS"' in requested_labels
+    assert '"paper": true' in requested_labels
+    assert '"live": false' in requested_labels
+    assert "long_entry_price" in requested_labels
+    assert "short_entry_price" in requested_labels
 
 
 def test_live_paper_records_invalid_empty_orderbook_and_continues(
@@ -552,7 +558,7 @@ def test_live_paper_replays_pair_labels_into_online_learning_state(
     label = _pair_label(pair_id="PAIR_REPLAY", pnl_ticks=Decimal("3"), fakeout=False)
     (reports / "pair_labels.jsonl").write_text(
         json.dumps(
-            _pair_label_record(label=label, mode=ExperimentalMode.TRADE_AGGRESSION),
+            _pair_label_record(label=label, mode=ExperimentalMode.BOLLINGER_PAIR),
             sort_keys=True,
         )
         + "\n",
@@ -575,7 +581,7 @@ def test_live_paper_replays_pair_labels_into_online_learning_state(
 
     state = json.loads((reports / "online_learning_state.json").read_text(encoding="utf-8"))
     assert state["total_closed_pairs"] == 1
-    assert state["ev_by_mode"]["NEOBITOK"]["TRADE_AGGRESSION"] == "3"
+    assert state["ev_by_mode"]["NEOBITOK"]["BOLLINGER_PAIR"] == "3"
     assert state["bot_utilization"] == {"BOT_01": 1, "BOT_02": 1}
 
 
@@ -632,7 +638,7 @@ def _runner_side_none_label(*, pair_id: str) -> PairLabel:
         entry_spread_cost_ticks=Decimal("1"),
         avg_slippage_ticks=Decimal("0"),
         latency_ms=100,
-        regime=ExperimentalMode.WIDE_TRAILING.value,
+        regime=ExperimentalMode.TICK_VELOCITY_PAIR.value,
         long_bot_id="BOT_01",
         short_bot_id="BOT_02",
     )

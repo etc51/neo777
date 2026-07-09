@@ -19,6 +19,12 @@ from neo_trader.neo_universal_swarm.daemon import (
     SwarmDaemonCycle,
     run_swarm_daemon,
 )
+from neo_trader.neo_universal_swarm.first_bot_logic_clone import (
+    ARCHITECTURE,
+    FIRST_BOT_LOGIC_CLONE_ENABLED,
+    LEGACY_UNIVERSAL_LOGIC_ENABLED,
+    LOGIC_SOURCE,
+)
 from neo_trader.neo_universal_swarm.instruments import (
     SwarmInstrumentCatalog,
     SwarmInstrumentMetadata,
@@ -69,6 +75,7 @@ __all__ = [
     "AccountBotState",
     "AccountKind",
     "ActivePair",
+    "ARCHITECTURE",
     "BookSnapshot",
     "CuratorBot",
     "CuratorConfig",
@@ -78,10 +85,13 @@ __all__ = [
     "HedgePairSimulationConfig",
     "HedgePairSimulator",
     "ExperimentalMode",
+    "FIRST_BOT_LOGIC_CLONE_ENABLED",
     "InstrumentLearningState",
+    "LEGACY_UNIVERSAL_LOGIC_ENABLED",
     "LegSide",
     "LivePaperSwarmConfig",
     "LivePaperSwarmCycle",
+    "LOGIC_SOURCE",
     "ModePerformance",
     "OnlineLearningState",
     "PairEVModel",
