@@ -30,6 +30,8 @@ from neo_trader.neo_universal_swarm.first_bot_logic_clone import (
     INSTRUMENT_ALLOCATION,
     LEGACY_UNIVERSAL_LOGIC_ENABLED,
     LOGIC_SOURCE,
+    CloneGateDecision,
+    FirstBotCloneGate,
     force_first_bot_prediction,
     instrument_allowed,
     label_enrichment,
@@ -166,6 +168,7 @@ class _LivePairState:
     logged_loser_stop: bool = False
     logged_runner_breakeven: bool = False
     logged_runner_trail: bool = False
+    gate_decision: CloneGateDecision | None = None
 
 
 class _LivePaperRecorder:
@@ -220,10 +223,13 @@ class _LivePaperRecorder:
         prediction: PairEVPrediction,
         opened_pair_id: str | None = None,
         skipped_reason: str | None = None,
+        gate_decision: CloneGateDecision | None = None,
     ) -> None:
         payload = {
             "cycle": cycle,
             "recorded_at": datetime.now(UTC),
+            "logic_source": LOGIC_SOURCE,
+            "architecture": ARCHITECTURE,
             "instrument": snapshot.instrument.value,
             "timestamp": snapshot.timestamp,
             "mode": mode.value,
@@ -231,6 +237,7 @@ class _LivePaperRecorder:
             "skipped_reason": skipped_reason,
             "prediction": _prediction_payload(prediction),
             "snapshot": _snapshot_payload(snapshot),
+            "clone_diagnostic": None if gate_decision is None else gate_decision.to_payload(),
         }
         self._append("live_paper_predictions.jsonl", payload)
         self._append("model_predictions.jsonl", payload)
@@ -264,6 +271,9 @@ class _LivePaperRecorder:
             "breakeven_ticks": state.pair.breakeven_ticks,
             "paper": True,
             "live": False,
+            "clone_diagnostic": None
+            if state.gate_decision is None
+            else state.gate_decision.to_payload(),
         }
         for event_name in (
             "PAIR_OPEN_REQUEST",
@@ -592,6 +602,7 @@ def run_live_paper_swarm(
         or resolved_config.reports_dir / "online_learning_state.json"
     )
     learning_state = _load_online_learning_state(resolved_config.reports_dir)
+    clone_gate = FirstBotCloneGate(resolved_config.reports_dir / "first_bot_clone_state.json")
     latest_snapshots: dict[SwarmInstrument, BookSnapshot] = {}
     live_pairs: dict[str, _LivePairState] = {}
     labels: list[PairLabel] = []
@@ -659,8 +670,72 @@ def run_live_paper_swarm(
                 for snapshot in snapshots:
                     if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
                         mode = learning_state.instruments[snapshot.instrument].active_mode
-                    else:
-                        mode = learning_state.choose_mode(snapshot.instrument)
+                        prediction = _predict_for_mode(
+                            snapshot,
+                            mode=mode,
+                            base_config=base_model_config,
+                        )
+                        gate_decision = clone_gate.evaluate_pre_mode(
+                            snapshot=snapshot,
+                            cycle=cycle_number,
+                            available_count=len(snapshots),
+                            has_active_pair=True,
+                        )
+                        predictions[snapshot.instrument] = prediction
+                        recorder.record_prediction(
+                            cycle=cycle_number,
+                            snapshot=snapshot,
+                            mode=mode,
+                            prediction=prediction,
+                            skipped_reason="ACTIVE_PAIR_EXISTS",
+                            gate_decision=gate_decision,
+                        )
+                        continue
+                    pre_mode_gate = clone_gate.evaluate_pre_mode(
+                        snapshot=snapshot,
+                        cycle=cycle_number,
+                        available_count=len(snapshots),
+                        has_active_pair=False,
+                    )
+                    if not pre_mode_gate.allowed:
+                        mode = learning_state.instruments[snapshot.instrument].active_mode
+                        prediction = _predict_for_mode(
+                            snapshot,
+                            mode=mode,
+                            base_config=base_model_config,
+                        )
+                        predictions[snapshot.instrument] = prediction
+                        recorder.record_prediction(
+                            cycle=cycle_number,
+                            snapshot=snapshot,
+                            mode=mode,
+                            prediction=prediction,
+                            skipped_reason=pre_mode_gate.rejection_reason,
+                            gate_decision=pre_mode_gate,
+                        )
+                        continue
+                    mode = learning_state.choose_mode(snapshot.instrument)
+                    gate_decision = clone_gate.evaluate_mode(
+                        snapshot=snapshot,
+                        mode=mode.value,
+                        pre_mode=pre_mode_gate,
+                    )
+                    if not gate_decision.allowed:
+                        prediction = _predict_for_mode(
+                            snapshot,
+                            mode=mode,
+                            base_config=base_model_config,
+                        )
+                        predictions[snapshot.instrument] = prediction
+                        recorder.record_prediction(
+                            cycle=cycle_number,
+                            snapshot=snapshot,
+                            mode=mode,
+                            prediction=prediction,
+                            skipped_reason=gate_decision.rejection_reason,
+                            gate_decision=gate_decision,
+                        )
+                        continue
                     prediction = _predict_for_mode(
                         snapshot,
                         mode=mode,
@@ -677,28 +752,6 @@ def run_live_paper_swarm(
                         mode=mode,
                     )
                     predictions[snapshot.instrument] = prediction
-                    if _has_active_pair_for_instrument(live_pairs, snapshot.instrument):
-                        recorder.record_prediction(
-                            cycle=cycle_number,
-                            snapshot=snapshot,
-                            mode=mode,
-                            prediction=prediction,
-                            skipped_reason="ACTIVE_PAIR_EXISTS",
-                        )
-                        continue
-                    if not _instrument_entry_allowed(
-                        snapshots=snapshots,
-                        instrument=snapshot.instrument,
-                        cycle=cycle_number,
-                    ):
-                        recorder.record_prediction(
-                            cycle=cycle_number,
-                            snapshot=snapshot,
-                            mode=mode,
-                            prediction=prediction,
-                            skipped_reason="INSTRUMENT_ALLOCATION",
-                        )
-                        continue
                     active_pair = curator.maybe_open_pair(snapshot, prediction=prediction)
                     skipped_reason = None
                     if active_pair is None:
@@ -714,6 +767,7 @@ def run_live_paper_swarm(
                         prediction=prediction,
                         opened_pair_id=None if active_pair is None else active_pair.pair_id,
                         skipped_reason=skipped_reason,
+                        gate_decision=gate_decision,
                     )
                     if active_pair is not None:
                         state = _new_live_pair_state(
@@ -721,8 +775,14 @@ def run_live_paper_swarm(
                             mode,
                             snapshot,
                             slippage_stress_ticks=resolved_config.slippage_stress_ticks,
+                            gate_decision=gate_decision,
                         )
                         live_pairs[active_pair.pair_id] = state
+                        clone_gate.record_open(
+                            snapshot=snapshot,
+                            mode=mode.value,
+                            decision=gate_decision,
+                        )
                         learning_state.record_assignment(
                             active_pair.long_bot_id,
                             active_pair.short_bot_id,
@@ -1016,6 +1076,7 @@ def _new_live_pair_state(
     entry: BookSnapshot,
     *,
     slippage_stress_ticks: Decimal,
+    gate_decision: CloneGateDecision | None = None,
 ) -> _LivePairState:
     slippage = entry.slippage_ticks + slippage_stress_ticks
     return _LivePairState(
@@ -1026,6 +1087,7 @@ def _new_live_pair_state(
         short_entry=entry.best_bid - (slippage * entry.tick_size),
         stop=Decimal(pair.stop_loss_ticks),
         slippage=slippage,
+        gate_decision=gate_decision,
     )
 
 
@@ -1387,6 +1449,7 @@ def _label_payload(
         short_entry_price=None if state is None else state.short_entry,
         entry_bid=None if state is None else state.entry.best_bid,
         entry_ask=None if state is None else state.entry.best_ask,
+        gate_decision=None if state is None else state.gate_decision,
     )
     return {
         **enrichment,

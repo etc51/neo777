@@ -512,6 +512,106 @@ def test_live_paper_delays_wide_spread_exit_and_logs_avoidance(
     assert "panic_wait_hurt" in labels
 
 
+def test_first_bot_clone_rejects_wide_spread_before_pair_open(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("NEO_TRADER_LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_MODE", "readonly")
+    monkeypatch.setenv("NEO_TRADER_TRADING_MODE", "readonly")
+    provider = _FakeOrderBookProvider(
+        (
+            _tbank_book("100", "103"),
+            _tbank_book("100", "103"),
+            _tbank_book("100", "103"),
+        )
+    )
+
+    cycles = run_live_paper_swarm(
+        LivePaperSwarmConfig(
+            poll_interval_seconds=0.01,
+            reports_dir=tmp_path / "reports",
+            dashboard_state_path=tmp_path / "dashboard.json",
+            heartbeat_path=tmp_path / "heartbeat.txt",
+            instruments=(SwarmInstrument.NEOBITOK,),
+            max_cycles=3,
+        ),
+        provider=provider,
+        sleep=lambda _: None,
+        clock=_advancing_clock(),
+    )
+
+    assert cycles[-1].status == "OK"
+    assert cycles[-1].closed_pairs == 0
+    pair_events = (tmp_path / "reports" / "pair_events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    predictions = (tmp_path / "reports" / "model_predictions.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "PAIR_OPEN_REQUEST" not in pair_events
+    assert "SPREAD_ENTRY_GATE" in predictions
+    assert "REJECT_SPREAD_GT_1" in predictions
+
+
+def test_first_bot_clone_opens_only_once_per_decision_interval(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("NEO_TRADER_LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_MODE", "readonly")
+    monkeypatch.setenv("NEO_TRADER_TRADING_MODE", "readonly")
+    provider = _FakeOrderBookProvider(
+        (
+            _tbank_book("100", "101"),
+            _tbank_book("104", "105"),
+            _tbank_book("103", "104"),
+            _tbank_book("102", "103"),
+            _tbank_book("101", "102"),
+            _tbank_book("100", "101"),
+        )
+    )
+
+    run_live_paper_swarm(
+        LivePaperSwarmConfig(
+            poll_interval_seconds=0.01,
+            reports_dir=tmp_path / "reports",
+            dashboard_state_path=tmp_path / "dashboard.json",
+            heartbeat_path=tmp_path / "heartbeat.txt",
+            instruments=(SwarmInstrument.NEOBITOK,),
+            max_cycles=6,
+        ),
+        provider=provider,
+        sleep=lambda _: None,
+        clock=_advancing_clock(),
+    )
+
+    pair_events = [
+        json.loads(line)
+        for line in (tmp_path / "reports" / "pair_events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    open_requests = [
+        event for event in pair_events if event.get("event") == "PAIR_OPEN_REQUEST"
+    ]
+    assert len(open_requests) == 1
+    labels = [
+        json.loads(line)
+        for line in (tmp_path / "reports" / "pair_labels.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert labels
+    assert all(label["matched_first_bot_rule"] is True for label in labels)
+    assert all(label["clone_rule_missing"] is False for label in labels)
+    assert all(label["cadence_gate_status"] == "PASS_NEW_15M_INTERVAL" for label in labels)
+
+
 def test_live_paper_writes_dashboard_when_all_orderbooks_invalid(
     tmp_path: Path,
     monkeypatch,
