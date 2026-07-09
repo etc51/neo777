@@ -209,6 +209,46 @@ def test_dynamic_protection_never_closes_negative_after_activation(tmp_path: Pat
     assert Decimal(audit["estimated_exit_price"]) >= Decimal(audit["safe_exit_price"])
 
 
+def test_wide_spread_after_winner_activates_mode_without_immediate_close(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    resolver = DualBotNeobitcoinResolver(ResolverConfig(), journal)
+    base = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+
+    resolver.process_snapshot(_snapshot(timestamp=base, bid="10000", ask="10002"))
+    resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=1),
+            bid="10024",
+            ask="10026",
+            tick_velocity=Decimal("1.2"),
+        )
+    )
+    result = resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=2),
+            bid="10042",
+            ask="10048",
+            tick_velocity=Decimal("1.4"),
+        )
+    )
+
+    assert result.final_exit is False
+    assert result.protection_active is True
+    assert result.state == ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value
+    rows = journal.fetch_all(
+        "SELECT spread_at_protection, protection_audit_json "
+        "FROM protection_events ORDER BY id DESC LIMIT 1"
+    )
+    audit = json.loads(rows[0]["protection_audit_json"])
+    assert rows[0]["spread_at_protection"] == "6"
+    assert audit["mode"] == ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value
+    assert Decimal(audit["max_spread_after_entry"]) == Decimal("6")
+    assert Decimal(audit["avg_spread_after_entry"]) > Decimal("3")
+    assert Decimal(audit["pnl_if_exit_now"]) > 0
+
+
 def test_short_down_scenario_closes_long_and_protects_short(tmp_path: Path) -> None:
     journal = _journal(tmp_path)
     resolver = DualBotNeobitcoinResolver(ResolverConfig(), journal)
@@ -268,6 +308,54 @@ def test_short_down_scenario_closes_long_and_protects_short(tmp_path: Path) -> N
     audits = [json.loads(row["protection_audit_json"]) for row in audit_rows]
     assert audits[0]["exit_side"] == "ASK"
     assert Decimal(audits[-1]["would_exit_net_pnl"]) >= 0
+
+
+def test_short_winner_wide_spread_protection_keeps_positive_audit(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    resolver = DualBotNeobitcoinResolver(ResolverConfig(), journal)
+    base = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+
+    resolver.process_snapshot(_snapshot(timestamp=base, bid="10000", ask="10002"))
+    resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=1),
+            bid="9975",
+            ask="9977",
+            bid_qty="40",
+            ask_qty="220",
+            tick_velocity=Decimal("-1.2"),
+        )
+    )
+    protected = resolver.process_snapshot(
+        _snapshot(
+            timestamp=base + timedelta(seconds=2),
+            bid="9956",
+            ask="9962",
+            bid_qty="40",
+            ask_qty="240",
+            tick_velocity=Decimal("-1.4"),
+        )
+    )
+
+    assert protected.final_exit is False
+    assert protected.protection_active is True
+    assert protected.state == ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value
+    decisions = journal.fetch_all(
+        "SELECT loser_closed, winner_selected, spread_at_loser_close FROM resolver_decisions"
+    )
+    assert decisions[0]["loser_closed"] == "LONG"
+    assert decisions[0]["winner_selected"] == "SHORT"
+    assert decisions[0]["spread_at_loser_close"] == "2"
+    rows = journal.fetch_all(
+        "SELECT protection_audit_json FROM protection_events ORDER BY id DESC LIMIT 1"
+    )
+    audit = json.loads(rows[0]["protection_audit_json"])
+    assert audit["exit_side"] == "ASK"
+    assert audit["mode"] == ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value
+    assert Decimal(audit["would_exit_net_pnl"]) > 0
+    assert Decimal(audit["pnl_if_exit_now"]) > 0
 
 
 def test_storage_has_required_tables_and_smoke_writes_dashboard(tmp_path: Path) -> None:

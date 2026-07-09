@@ -45,6 +45,7 @@ class ResolverReason(StrEnum):
     CLOSE_LONG_LOSER = "CLOSE_LONG_LOSER"
     WINNER_TRAILING = "WINNER_TRAILING"
     NO_LOSS_OR_PROFIT_ONLY = "NO_LOSS_OR_PROFIT_ONLY"
+    WIDE_SPREAD_PROTECTION_MODE = "WIDE_SPREAD_PROTECTION_MODE"
     SAFE_EXIT = "SAFE_EXIT"
     CHAOTIC_SAFE_EXIT = "CHAOTIC_SAFE_EXIT"
 
@@ -129,6 +130,14 @@ class PairState:
     protection_trigger_reason: str | None = None
     safe_exit_price: Decimal | None = None
     protection_audit: dict[str, object] | None = None
+    max_spread_after_entry: Decimal = Decimal("0")
+    spread_sum_after_entry: Decimal = Decimal("0")
+    spread_observation_count: int = 0
+    spread_at_loser_close: Decimal | None = None
+    wide_spread_protection_mode: bool = False
+    wide_spread_started_at: datetime | None = None
+    wide_spread_duration_sec: int = 0
+    trailing_tightened: bool = False
     closed_at: datetime | None = None
 
     @property

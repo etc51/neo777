@@ -203,6 +203,15 @@ class ResolverJournal:
         winner_side = None
         if decision is not None and decision["winner_selected"] is not None:
             winner_side = PositionSide(str(decision["winner_selected"]))
+        spread_at_loser_close = (
+            None
+            if decision is None or "spread_at_loser_close" not in decision
+            else (
+                None
+                if decision["spread_at_loser_close"] is None
+                else Decimal(str(decision["spread_at_loser_close"]))
+            )
+        )
         protection_active = (
             protection is not None
             and int(protection["no_loss_mode_active"]) == 1
@@ -238,6 +247,7 @@ class ResolverJournal:
             protection_audit=None
             if protection is None
             else _json_loads_optional(protection["protection_audit_json"]),
+            spread_at_loser_close=spread_at_loser_close,
         )
 
     def record_orderbook(self, snapshot: GateSnapshot) -> None:
@@ -381,6 +391,7 @@ class ResolverJournal:
         loser_closed: str | None,
         winner_selected: str | None,
         reason: str,
+        spread_at_loser_close: Decimal | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -389,9 +400,9 @@ class ResolverJournal:
                     pair_id, timestamp, movement_percent, decision_zone,
                     trend_score, orderbook_score, microstructure_score,
                     continuation_up, continuation_down, loser_closed,
-                    winner_selected, reason
+                    winner_selected, reason, spread_at_loser_close
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pair.pair_id,
@@ -406,6 +417,7 @@ class ResolverJournal:
                     loser_closed,
                     winner_selected,
                     reason,
+                    _num(spread_at_loser_close),
                 ),
             )
             conn.commit()
@@ -521,6 +533,11 @@ class ResolverJournal:
         pair_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pair_entries)")}
         if "pair_total_pnl" not in pair_columns:
             conn.execute("ALTER TABLE pair_entries ADD COLUMN pair_total_pnl TEXT")
+        decision_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(resolver_decisions)")
+        }
+        if "spread_at_loser_close" not in decision_columns:
+            conn.execute("ALTER TABLE resolver_decisions ADD COLUMN spread_at_loser_close TEXT")
 
     def record_heartbeat(
         self,
@@ -730,7 +747,8 @@ CREATE TABLE IF NOT EXISTS resolver_decisions (
     continuation_down INTEGER NOT NULL,
     loser_closed TEXT,
     winner_selected TEXT,
-    reason TEXT NOT NULL
+    reason TEXT NOT NULL,
+    spread_at_loser_close TEXT
 );
 
 CREATE TABLE IF NOT EXISTS positions (

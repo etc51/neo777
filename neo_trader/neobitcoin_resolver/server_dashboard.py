@@ -81,7 +81,8 @@ def render_dashboard_html(state: dict[str, Any]) -> str:
       <thead>
         <tr>
           <th>Pair</th><th>Total</th><th>Winner</th><th>Loser</th>
-          <th>After Protection</th><th>Drawdown</th>
+          <th>After Protection</th><th>Max Spread</th><th>Wide Sec</th>
+          <th>PnL Now</th><th>Drawdown</th>
         </tr>
       </thead>
       <tbody>{_pair_metric_rows(pair_metric_rows)}</tbody>
@@ -193,10 +194,13 @@ def _pair_metric_rows(rows: list[object]) -> str:
             f"<td>{row.get('winner_pnl', '')}</td>"
             f"<td>{row.get('loser_pnl', '')}</td>"
             f"<td>{row.get('total_after_protection', '')}</td>"
+            f"<td>{row.get('max_spread_after_entry', '')}</td>"
+            f"<td>{row.get('wide_spread_duration_sec', '')}</td>"
+            f"<td>{row.get('pnl_if_exit_now', '')}</td>"
             f"<td>{row.get('max_pair_drawdown', '')}</td>"
             "</tr>"
         )
-    return "".join(html_rows) or '<tr><td colspan="6">No pair metrics</td></tr>'
+    return "".join(html_rows) or '<tr><td colspan="9">No pair metrics</td></tr>'
 
 
 def main(argv: list[str] | None = None) -> int:

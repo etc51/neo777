@@ -201,6 +201,8 @@ def _pair_metrics(journal: ResolverJournal) -> list[dict[str, Any]]:
         loser_pnl = _side_pnl(loser_side, long_pnl, short_pnl)
         entry = entries.get(pair_id, {})
         protection_event = protection.get(pair_id, {})
+        protection_audit = _protection_audit_from_row(protection_event)
+        spread_metrics = _spread_metrics_after_entry(journal, entry)
         metrics.append(
             {
                 "pair_id": pair_id,
@@ -219,6 +221,14 @@ def _pair_metrics(journal: ResolverJournal) -> list[dict[str, Any]]:
                 "max_pair_drawdown": str(min(_decimal_field(row, "mae") for row in rows)),
                 "mfe_before_resolver": str(max(_decimal_field(row, "mfe") for row in rows)),
                 "mae_before_resolver": str(min(_decimal_field(row, "mae") for row in rows)),
+                "max_spread_after_entry": spread_metrics["max_spread_after_entry"],
+                "avg_spread_after_entry": spread_metrics["avg_spread_after_entry"],
+                "wide_spread_duration_sec": spread_metrics["wide_spread_duration_sec"],
+                "spread_at_loser_close": decision.get("spread_at_loser_close"),
+                "spread_at_protection": protection_event.get("spread_at_protection"),
+                "pnl_if_exit_now": None
+                if protection_audit is None
+                else protection_audit.get("pnl_if_exit_now"),
                 "states": {
                     str(row["side"]): str(row["state"])
                     for row in rows
@@ -237,6 +247,54 @@ def _latest_protection_audit(journal: ResolverJournal) -> dict[str, Any] | None:
         return None
     loaded = json.loads(raw)
     return loaded if isinstance(loaded, dict) else None
+
+
+def _protection_audit_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    raw = row.get("protection_audit_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    loaded = json.loads(raw)
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _spread_metrics_after_entry(
+    journal: ResolverJournal,
+    entry: dict[str, Any],
+) -> dict[str, str]:
+    timestamp = entry.get("timestamp")
+    if timestamp is None:
+        return {
+            "max_spread_after_entry": "0",
+            "avg_spread_after_entry": "0",
+            "wide_spread_duration_sec": "0",
+        }
+    rows = journal.fetch_all(
+        """
+        SELECT spread_ticks, timestamp
+        FROM raw_orderbook_snapshots
+        WHERE timestamp >= ?
+        ORDER BY timestamp
+        """,
+        (str(timestamp),),
+    )
+    if not rows:
+        return {
+            "max_spread_after_entry": "0",
+            "avg_spread_after_entry": "0",
+            "wide_spread_duration_sec": "0",
+        }
+    spreads = [Decimal(str(row["spread_ticks"])) for row in rows]
+    wide_rows = [row for row in rows if Decimal(str(row["spread_ticks"])) > Decimal("3")]
+    duration = 0
+    if len(wide_rows) >= 2:
+        first = datetime.fromisoformat(str(wide_rows[0]["timestamp"]))
+        last = datetime.fromisoformat(str(wide_rows[-1]["timestamp"]))
+        duration = max(int((last - first).total_seconds()), 0)
+    return {
+        "max_spread_after_entry": str(max(spreads)),
+        "avg_spread_after_entry": str(sum(spreads, Decimal("0")) / Decimal(len(spreads))),
+        "wide_spread_duration_sec": str(duration),
+    }
 
 
 def _decimal_field(row: dict[str, Any] | None, field: str) -> Decimal:

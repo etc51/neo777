@@ -145,6 +145,9 @@ class DualBotNeobitcoinResolver:
                 mfi_context=book.mfi,
             ),
             gate_results=gates,
+            max_spread_after_entry=book.spread_ticks,
+            spread_sum_after_entry=book.spread_ticks,
+            spread_observation_count=1,
         )
 
     def _manage_pair(self, snapshot: GateSnapshot) -> ResolverCycleResult:
@@ -152,6 +155,8 @@ class DualBotNeobitcoinResolver:
         if pair is None:
             raise RuntimeError("pair management called without active pair")
         self._mark_pair(pair, snapshot)
+        previous_max_spread = pair.max_spread_after_entry
+        self._update_spread_tracking(pair, snapshot)
         movement = self._movement_percent(pair, snapshot)
         abs_movement = abs(movement)
         trend_score = self._trend_score(snapshot)
@@ -172,6 +177,7 @@ class DualBotNeobitcoinResolver:
                 self._close_loser(pair.short_leg, snapshot, ResolverReason.CLOSE_SHORT_LOSER.value)
                 pair.winner_side = PositionSide.LONG
                 pair.loser_closed = True
+                pair.spread_at_loser_close = snapshot.book.spread_ticks
                 pair.state = "WINNER_TRAILING"
                 loser_closed = PositionSide.SHORT.value
                 self.journal.record_resolver_decision(
@@ -187,11 +193,13 @@ class DualBotNeobitcoinResolver:
                     loser_closed=loser_closed,
                     winner_selected=PositionSide.LONG.value,
                     reason=ResolverReason.WINNER_TRAILING.value,
+                    spread_at_loser_close=snapshot.book.spread_ticks,
                 )
             elif in_zone and movement < 0 and continuation_down:
                 self._close_loser(pair.long_leg, snapshot, ResolverReason.CLOSE_LONG_LOSER.value)
                 pair.winner_side = PositionSide.SHORT
                 pair.loser_closed = True
+                pair.spread_at_loser_close = snapshot.book.spread_ticks
                 pair.state = "WINNER_TRAILING"
                 loser_closed = PositionSide.LONG.value
                 self.journal.record_resolver_decision(
@@ -207,12 +215,25 @@ class DualBotNeobitcoinResolver:
                     loser_closed=loser_closed,
                     winner_selected=PositionSide.SHORT.value,
                     reason=ResolverReason.WINNER_TRAILING.value,
+                    spread_at_loser_close=snapshot.book.spread_ticks,
                 )
             elif in_zone and self._market_deteriorating(snapshot):
                 self._close_both(pair, snapshot, ResolverReason.CHAOTIC_SAFE_EXIT.value)
                 self.activate_cooldown(timestamp=snapshot.timestamp)
                 final_exit = True
         else:
+            if snapshot.book.spread_ticks > self.config.max_entry_spread_ticks:
+                self._apply_wide_spread_protection(
+                    pair,
+                    snapshot,
+                    movement,
+                    spread_expanded=snapshot.book.spread_ticks > previous_max_spread
+                    or not pair.wide_spread_protection_mode,
+                )
+            elif pair.wide_spread_protection_mode:
+                pair.wide_spread_protection_mode = False
+                if pair.protection_active:
+                    pair.state = "NO_LOSS_OR_PROFIT_ONLY"
             if not pair.protection_active and (
                 abs_movement >= self.config.protection_trigger_pct
                 or (
@@ -221,7 +242,11 @@ class DualBotNeobitcoinResolver:
                 )
             ):
                 self._activate_protection(pair, snapshot, movement)
-            if pair.protection_active and self._safe_exit_touched(pair, snapshot):
+            if (
+                pair.protection_active
+                and not pair.wide_spread_protection_mode
+                and self._safe_exit_touched(pair, snapshot)
+            ):
                 self._close_winner_at_safe_exit(pair, snapshot)
                 final_exit = True
 
@@ -238,6 +263,17 @@ class DualBotNeobitcoinResolver:
             protection_active=pair.protection_active,
             final_exit=final_exit,
         )
+
+    def _update_spread_tracking(self, pair: PairState, snapshot: GateSnapshot) -> None:
+        spread = snapshot.book.spread_ticks
+        if pair.spread_observation_count <= 0:
+            pair.spread_sum_after_entry = spread
+            pair.spread_observation_count = 1
+            pair.max_spread_after_entry = spread
+            return
+        pair.spread_sum_after_entry += spread
+        pair.spread_observation_count += 1
+        pair.max_spread_after_entry = max(pair.max_spread_after_entry, spread)
 
     def _restore_active_pair(self) -> None:
         if self.config.multi_pair_mode:
@@ -351,8 +387,76 @@ class DualBotNeobitcoinResolver:
             protection_audit=audit,
         )
 
+    def _apply_wide_spread_protection(
+        self,
+        pair: PairState,
+        snapshot: GateSnapshot,
+        movement: Decimal,
+        *,
+        spread_expanded: bool,
+    ) -> None:
+        if pair.winner_side is None:
+            return
+        winner = pair.long_leg if pair.winner_side is PositionSide.LONG else pair.short_leg
+        spread_excess = max(
+            snapshot.book.spread_ticks - self.config.max_entry_spread_ticks,
+            Decimal("0"),
+        )
+        base_buffer_ticks = (
+            self.config.orderbook_risk_buffer_ticks
+            + self.config.microstructure_risk_buffer_ticks
+            + self.config.safety_buffer_ticks
+            + self.config.min_profit_buffer_ticks
+        )
+        slippage_buffer_ticks = (
+            base_buffer_ticks + self._expected_slippage_ticks(snapshot) + spread_excess
+        )
+        audit = self._protection_audit(
+            winner=winner,
+            snapshot=snapshot,
+            spread_cost=snapshot.book.spread_ticks * snapshot.book.tick_size,
+            expected_slippage=self._expected_slippage_ticks(snapshot) * snapshot.book.tick_size,
+            buffer_price=slippage_buffer_ticks * snapshot.book.tick_size,
+        )
+        audit.update(self._pair_spread_audit_metrics(pair, snapshot))
+        audit.update(
+            {
+                "mode": ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value,
+                "slippage_buffer": slippage_buffer_ticks,
+                "trailing_tightened": True,
+            }
+        )
+        if Decimal(str(audit["would_exit_net_pnl"])) >= 0:
+            self._tighten_safe_exit(pair, Decimal(str(audit["safe_exit_price"])))
+            pair.protection_active = True
+        pair.wide_spread_protection_mode = True
+        pair.trailing_tightened = True
+        pair.protection_trigger_reason = "wide_spread"
+        if pair.wide_spread_started_at is None:
+            pair.wide_spread_started_at = snapshot.timestamp
+        pair.wide_spread_duration_sec = int(
+            (snapshot.timestamp - pair.wide_spread_started_at).total_seconds()
+        )
+        pair.protection_audit = audit
+        pair.state = ResolverReason.WIDE_SPREAD_PROTECTION_MODE.value
+        if spread_expanded:
+            self.journal.record_protection_event(
+                timestamp=snapshot.timestamp,
+                pair=pair,
+                trigger_percent=movement,
+                spread_at_protection=snapshot.book.spread_ticks,
+                expected_slippage=self._expected_slippage_ticks(snapshot),
+                buffer=slippage_buffer_ticks,
+                protection_audit=audit,
+            )
+
     def _safe_exit_touched(self, pair: PairState, snapshot: GateSnapshot) -> bool:
         if pair.safe_exit_price is None:
+            return False
+        if (
+            pair.wide_spread_protection_mode
+            and snapshot.book.spread_ticks > self.config.max_entry_spread_ticks
+        ):
             return False
         if pair.winner_side is PositionSide.LONG:
             return snapshot.book.best_bid <= pair.safe_exit_price
@@ -412,7 +516,10 @@ class DualBotNeobitcoinResolver:
             safe_exit = winner.entry_price - spread_cost - expected_slippage - buffer_price
             estimated_exit = snapshot.book.best_ask
             would_exit_net_pnl = safe_exit - estimated_exit
+            pnl_if_exit_now = winner.entry_price - estimated_exit
             exit_side = "ASK"
+        if winner.side is PositionSide.LONG:
+            pnl_if_exit_now = estimated_exit - winner.entry_price
         return {
             "entry_price": winner.entry_price,
             "current_bid": snapshot.book.best_bid,
@@ -424,6 +531,7 @@ class DualBotNeobitcoinResolver:
             "expected_slippage": expected_slippage / snapshot.book.tick_size,
             "buffer": buffer_price / snapshot.book.tick_size,
             "would_exit_net_pnl": would_exit_net_pnl,
+            "pnl_if_exit_now": pnl_if_exit_now,
         }
 
     def _protection_audit_for_exit(
@@ -457,6 +565,40 @@ class DualBotNeobitcoinResolver:
             "expected_slippage": self._expected_slippage_ticks(snapshot),
             "buffer": buffer_ticks,
             "would_exit_net_pnl": would_exit_net_pnl,
+            "pnl_if_exit_now": would_exit_net_pnl,
+        }
+
+    def _tighten_safe_exit(self, pair: PairState, candidate: Decimal) -> None:
+        if pair.winner_side is PositionSide.LONG:
+            pair.safe_exit_price = (
+                candidate if pair.safe_exit_price is None else max(pair.safe_exit_price, candidate)
+            )
+        elif pair.winner_side is PositionSide.SHORT:
+            pair.safe_exit_price = (
+                candidate if pair.safe_exit_price is None else min(pair.safe_exit_price, candidate)
+            )
+
+    def _pair_spread_audit_metrics(
+        self,
+        pair: PairState,
+        snapshot: GateSnapshot,
+    ) -> dict[str, object]:
+        avg_spread = (
+            Decimal("0")
+            if pair.spread_observation_count <= 0
+            else pair.spread_sum_after_entry / Decimal(pair.spread_observation_count)
+        )
+        duration = (
+            0
+            if pair.wide_spread_started_at is None
+            else int((snapshot.timestamp - pair.wide_spread_started_at).total_seconds())
+        )
+        return {
+            "max_spread_after_entry": pair.max_spread_after_entry,
+            "avg_spread_after_entry": avg_spread,
+            "spread_at_loser_close": pair.spread_at_loser_close,
+            "spread_at_protection": snapshot.book.spread_ticks,
+            "wide_spread_duration_sec": duration,
         }
 
     def _session_gate(self, snapshot: GateSnapshot) -> GateResult:
