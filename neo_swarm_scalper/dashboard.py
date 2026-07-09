@@ -35,6 +35,14 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
             "performance_by_stop_ticks": [],
             "mfe_mae_distributions": [],
             "stop_comparison": [],
+            "entry_type_performance": [],
+            "mfe_hit_rate_by_entry_type": [],
+            "stop_comparison_by_entry_type": [],
+            "latest_shadow_signals": [],
+            "current_direction_scores": [],
+            "current_regime": [],
+            "reentry_series_summary": {},
+            "best_entry_type_today": None,
             "daily_summary": {},
             "errors": [],
             "health": [],
@@ -173,6 +181,14 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
         "performance_by_stop_ticks": _performance_by_stop_ticks(storage),
         "mfe_mae_distributions": _mfe_mae_distribution(storage),
         "stop_comparison": _stop_comparison(storage),
+        "entry_type_performance": _entry_type_performance(storage),
+        "mfe_hit_rate_by_entry_type": _mfe_hit_rate_by_entry_type(storage),
+        "stop_comparison_by_entry_type": _stop_comparison_by_entry_type(storage),
+        "latest_shadow_signals": _latest_shadow_signals(storage),
+        "current_direction_scores": _current_direction_scores(storage),
+        "current_regime": _current_regime(storage),
+        "reentry_series_summary": _reentry_series_summary(storage),
+        "best_entry_type_today": _best_entry_type_today(storage),
         "daily_summary": _daily_summary(storage),
         "errors": [
             _row_dict(row)
@@ -214,6 +230,22 @@ def main(argv: list[str] | None = None) -> int:
     st.dataframe(state["performance_by_stop_ticks"], use_container_width=True)
     st.subheader("Stop Comparison")
     st.dataframe(state["stop_comparison"], use_container_width=True)
+    st.subheader("Entry Type Performance")
+    st.dataframe(state["entry_type_performance"], use_container_width=True)
+    st.subheader("MFE Hit Rate by Entry Type")
+    st.dataframe(state["mfe_hit_rate_by_entry_type"], use_container_width=True)
+    st.subheader("Stop Comparison by Entry Type")
+    st.dataframe(state["stop_comparison_by_entry_type"], use_container_width=True)
+    st.subheader("Latest Shadow Signals")
+    st.dataframe(state["latest_shadow_signals"], use_container_width=True)
+    st.subheader("Current Direction Scores")
+    st.dataframe(state["current_direction_scores"], use_container_width=True)
+    st.subheader("Current Regime")
+    st.dataframe(state["current_regime"], use_container_width=True)
+    st.subheader("Re-entry Series")
+    st.json(state["reentry_series_summary"])
+    st.subheader("Best Entry Type Today")
+    st.json(state["best_entry_type_today"])
     st.subheader("MFE/MAE Distributions")
     st.dataframe(state["mfe_mae_distributions"], use_container_width=True)
     st.subheader("Daily Summary")
@@ -396,6 +428,152 @@ def _stop_comparison(storage: SQLiteJournal) -> list[dict[str, Any]]:
         """
     )
     return [_row_dict(row) for row in rows]
+
+
+def _entry_type_performance(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT *
+        FROM entry_type_performance
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM entry_type_performance
+            GROUP BY instrument, entry_type
+        )
+        ORDER BY instrument, entry_type
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _mfe_hit_rate_by_entry_type(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument, entry_type, mfe3_rate, mfe5_rate, mfe10_rate,
+               mfe_005pct_rate, mfe_010pct_rate, mfe_015pct_rate,
+               direction_correct_rate
+        FROM entry_type_performance
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM entry_type_performance
+            GROUP BY instrument, entry_type
+        )
+        ORDER BY mfe3_rate DESC, mfe5_rate DESC, mfe10_rate DESC
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _stop_comparison_by_entry_type(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT entry_type, instrument, stop_ticks,
+               COUNT(*) AS trades,
+               SUM(CASE WHEN exit_reason IN ('stop_loss', 'protected_stop') THEN 1 ELSE 0 END)
+                   AS stop_exits,
+               AVG(mfe_ticks) AS avg_mfe_ticks,
+               AVG(mae_ticks) AS avg_mae_ticks,
+               AVG(
+                   CASE
+                       WHEN exit_price IS NOT NULL AND exit_reason != 'spread_shock'
+                       THEN CASE
+                           WHEN side = 'LONG'
+                           THEN (exit_price - entry_price)
+                                / ((entry_price - stop_price) / stop_ticks)
+                           ELSE (entry_price - exit_price)
+                                / ((stop_price - entry_price) / stop_ticks)
+                       END
+                       ELSE NULL
+                   END
+               ) AS avg_pnl_ticks_non_spread
+        FROM shadow_trades
+        WHERE entry_type IS NOT NULL
+        GROUP BY entry_type, instrument, stop_ticks
+        ORDER BY entry_type, instrument, stop_ticks
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _latest_shadow_signals(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT timestamp_utc, instrument, side, confidence, reason, entry_type,
+               direction_model, direction_score, pressure_score, impulse_score,
+               pullback_score, book_flip_score, reversal_score, lead_lag_score,
+               expected_mfe_ticks, expected_stop_risk_ticks
+        FROM shadow_signals
+        ORDER BY timestamp_utc DESC
+        LIMIT 100
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _current_direction_scores(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument, entry_type, side, direction_model, direction_score,
+               pressure_score, impulse_score, pullback_score, book_flip_score,
+               reversal_score, lead_lag_score, expected_mfe_ticks,
+               expected_stop_risk_ticks, timestamp_utc
+        FROM entry_strategy_scores
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM entry_strategy_scores
+            GROUP BY instrument
+        )
+        ORDER BY instrument
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _current_regime(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument,
+               COALESCE(entry_type, 'no_trade') AS regime,
+               reason,
+               direction_score,
+               timestamp_utc
+        FROM shadow_signals
+        WHERE rowid IN (
+            SELECT MAX(rowid)
+            FROM shadow_signals
+            GROUP BY instrument
+        )
+        ORDER BY instrument
+        """
+    )
+    return [_row_dict(row) for row in rows]
+
+
+def _reentry_series_summary(storage: SQLiteJournal) -> dict[str, Any]:
+    rows = storage.fetch_all(
+        """
+        SELECT COUNT(*) AS series_count,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_series,
+               SUM(entries_count) AS entries_count,
+               SUM(stops_count) AS stops_count
+        FROM reentry_series
+        """
+    )
+    return _row_dict(rows[0]) if rows else {}
+
+
+def _best_entry_type_today(storage: SQLiteJournal) -> dict[str, Any] | None:
+    rows = storage.fetch_all(
+        """
+        SELECT entry_type, instrument, mfe3_rate, mfe5_rate, mfe10_rate,
+               best_stop_ticks, profit_factor, timestamp_utc
+        FROM entry_type_performance
+        WHERE date(timestamp_utc) = date('now')
+        ORDER BY mfe3_rate DESC, mfe5_rate DESC, mfe10_rate DESC, profit_factor DESC
+        LIMIT 1
+        """
+    )
+    return None if not rows else _row_dict(rows[0])
 
 
 def _daily_summary(storage: SQLiteJournal) -> dict[str, Any]:

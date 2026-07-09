@@ -35,6 +35,7 @@ class SQLiteJournal:
                 conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
             _migrate_account_column(conn)
+            _migrate_entry_engine(conn)
             conn.commit()
 
     def connect(self) -> sqlite3.Connection:
@@ -680,6 +681,11 @@ class SQLiteJournal:
             "shadow_trades",
             "shadow_trade_events",
             "shadow_stop_experiments",
+            "entry_research_labels",
+            "entry_strategy_scores",
+            "entry_type_performance",
+            "reentry_series",
+            "forward_outcome_labels",
             "mfe_mae_tracking",
             "baskets",
             "basket_legs",
@@ -796,6 +802,59 @@ def _migrate_account_column(conn: sqlite3.Connection) -> None:
         columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
         if "account_ref" in columns and ACCT_COL not in columns:
             conn.execute(f"ALTER TABLE {table} RENAME COLUMN account_ref TO {ACCT_COL}")
+
+
+def _migrate_entry_engine(conn: sqlite3.Connection) -> None:
+    _add_columns(
+        conn,
+        "shadow_signals",
+        {
+            "entry_type": "TEXT",
+            "direction_model": "TEXT",
+            "direction_score": "REAL NOT NULL DEFAULT 0",
+            "pressure_score": "REAL NOT NULL DEFAULT 0",
+            "impulse_score": "REAL NOT NULL DEFAULT 0",
+            "pullback_score": "REAL NOT NULL DEFAULT 0",
+            "book_flip_score": "REAL NOT NULL DEFAULT 0",
+            "reversal_score": "REAL NOT NULL DEFAULT 0",
+            "lead_lag_score": "REAL NOT NULL DEFAULT 0",
+            "expected_mfe_ticks": "REAL NOT NULL DEFAULT 0",
+            "expected_stop_risk_ticks": "REAL NOT NULL DEFAULT 0",
+        },
+    )
+    _add_columns(
+        conn,
+        "shadow_trades",
+        {
+            "entry_type": "TEXT",
+            "direction_model": "TEXT",
+            "direction_score": "REAL NOT NULL DEFAULT 0",
+            "pressure_score": "REAL NOT NULL DEFAULT 0",
+            "impulse_score": "REAL NOT NULL DEFAULT 0",
+            "pullback_score": "REAL NOT NULL DEFAULT 0",
+            "book_flip_score": "REAL NOT NULL DEFAULT 0",
+            "reversal_score": "REAL NOT NULL DEFAULT 0",
+            "lead_lag_score": "REAL NOT NULL DEFAULT 0",
+            "expected_mfe_ticks": "REAL NOT NULL DEFAULT 0",
+            "expected_stop_risk_ticks": "REAL NOT NULL DEFAULT 0",
+            "reentry_series_id": "TEXT",
+            "reentry_number": "INTEGER NOT NULL DEFAULT 0",
+            "reason_reentry_allowed": "TEXT",
+            "reason_reentry_blocked": "TEXT",
+            "trailing_reason": "TEXT",
+        },
+    )
+
+
+def _add_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: Mapping[str, str],
+) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 SCHEMA = f"""
@@ -996,6 +1055,17 @@ CREATE TABLE IF NOT EXISTS shadow_signals (
     side TEXT NOT NULL,
     confidence REAL NOT NULL,
     reason TEXT NOT NULL,
+    entry_type TEXT,
+    direction_model TEXT,
+    direction_score REAL NOT NULL DEFAULT 0,
+    pressure_score REAL NOT NULL DEFAULT 0,
+    impulse_score REAL NOT NULL DEFAULT 0,
+    pullback_score REAL NOT NULL DEFAULT 0,
+    book_flip_score REAL NOT NULL DEFAULT 0,
+    reversal_score REAL NOT NULL DEFAULT 0,
+    lead_lag_score REAL NOT NULL DEFAULT 0,
+    expected_mfe_ticks REAL NOT NULL DEFAULT 0,
+    expected_stop_risk_ticks REAL NOT NULL DEFAULT 0,
     gate_status_json TEXT NOT NULL,
     features_json TEXT NOT NULL
 );
@@ -1032,6 +1102,22 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     protection_activated INTEGER NOT NULL DEFAULT 0,
     protection_price REAL,
     protected_exit_reason TEXT,
+    entry_type TEXT,
+    direction_model TEXT,
+    direction_score REAL NOT NULL DEFAULT 0,
+    pressure_score REAL NOT NULL DEFAULT 0,
+    impulse_score REAL NOT NULL DEFAULT 0,
+    pullback_score REAL NOT NULL DEFAULT 0,
+    book_flip_score REAL NOT NULL DEFAULT 0,
+    reversal_score REAL NOT NULL DEFAULT 0,
+    lead_lag_score REAL NOT NULL DEFAULT 0,
+    expected_mfe_ticks REAL NOT NULL DEFAULT 0,
+    expected_stop_risk_ticks REAL NOT NULL DEFAULT 0,
+    reentry_series_id TEXT,
+    reentry_number INTEGER NOT NULL DEFAULT 0,
+    reason_reentry_allowed TEXT,
+    reason_reentry_blocked TEXT,
+    trailing_reason TEXT,
     reentry_index INTEGER NOT NULL DEFAULT 0,
     consecutive_stop_index INTEGER NOT NULL DEFAULT 0
 );
@@ -1071,6 +1157,121 @@ CREATE TABLE IF NOT EXISTS shadow_stop_experiments (
     protection_saved_count INTEGER NOT NULL,
     big_runner_count INTEGER NOT NULL,
     best_context_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entry_research_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    side TEXT NOT NULL,
+    stop_ticks INTEGER NOT NULL,
+    horizon_sec INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    direction_correct INTEGER NOT NULL,
+    stop_hit_before_mfe INTEGER NOT NULL,
+    mfe3_hit INTEGER NOT NULL,
+    mfe5_hit INTEGER NOT NULL,
+    mfe10_hit INTEGER NOT NULL,
+    mfe_005pct_hit INTEGER NOT NULL,
+    mfe_010pct_hit INTEGER NOT NULL,
+    mfe_015pct_hit INTEGER NOT NULL,
+    max_mfe_ticks REAL NOT NULL,
+    max_mae_ticks REAL NOT NULL,
+    time_to_mfe_sec REAL,
+    time_to_stop_sec REAL,
+    features_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entry_strategy_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    side TEXT NOT NULL,
+    direction_model TEXT NOT NULL,
+    direction_score REAL NOT NULL,
+    pressure_score REAL NOT NULL,
+    impulse_score REAL NOT NULL,
+    pullback_score REAL NOT NULL,
+    book_flip_score REAL NOT NULL,
+    reversal_score REAL NOT NULL,
+    lead_lag_score REAL NOT NULL,
+    expected_mfe_ticks REAL NOT NULL,
+    expected_stop_risk_ticks REAL NOT NULL,
+    diagnostics_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entry_type_performance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    signals_count INTEGER NOT NULL,
+    accepted_trades INTEGER NOT NULL,
+    stop_exits INTEGER NOT NULL,
+    protected_exits INTEGER NOT NULL,
+    trailing_exits INTEGER NOT NULL,
+    avg_pnl_ticks REAL NOT NULL,
+    avg_pnl_bps REAL NOT NULL,
+    avg_mfe_ticks REAL NOT NULL,
+    avg_mae_ticks REAL NOT NULL,
+    mfe3_rate REAL NOT NULL,
+    mfe5_rate REAL NOT NULL,
+    mfe10_rate REAL NOT NULL,
+    mfe_005pct_rate REAL NOT NULL,
+    mfe_010pct_rate REAL NOT NULL,
+    mfe_015pct_rate REAL NOT NULL,
+    stop_hit_rate REAL NOT NULL,
+    direction_correct_rate REAL NOT NULL,
+    best_stop_ticks INTEGER,
+    best_session_time TEXT,
+    max_consecutive_stops INTEGER NOT NULL,
+    profit_factor REAL NOT NULL,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reentry_series (
+    series_id TEXT PRIMARY KEY,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_signal_at TEXT NOT NULL,
+    entries_count INTEGER NOT NULL,
+    stops_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS forward_outcome_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    source_table TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    side TEXT NOT NULL,
+    stop_ticks INTEGER NOT NULL,
+    horizon_sec INTEGER NOT NULL,
+    stop_hit_before_mfe INTEGER NOT NULL,
+    mfe3_hit INTEGER NOT NULL,
+    mfe5_hit INTEGER NOT NULL,
+    mfe10_hit INTEGER NOT NULL,
+    mfe_005pct_hit INTEGER NOT NULL,
+    mfe_010pct_hit INTEGER NOT NULL,
+    mfe_015pct_hit INTEGER NOT NULL,
+    max_mfe_ticks REAL NOT NULL,
+    max_mae_ticks REAL NOT NULL,
+    time_to_mfe_sec REAL,
+    time_to_stop_sec REAL,
+    direction_correct INTEGER NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS mfe_mae_tracking (

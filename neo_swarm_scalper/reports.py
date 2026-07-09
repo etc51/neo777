@@ -105,6 +105,7 @@ def build_report_payload(
     )
     shadow_exit_summary = _shadow_exit_summary(storage)
     stop_comparison = _shadow_stop_comparison(storage)
+    entry_type_performance = _entry_type_performance(storage)
     total_pnl = sum((Decimal(str(row["net_pnl"])) for row in bot_rows), Decimal("0"))
     best_bot = max(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
     worst_bot = min(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
@@ -141,6 +142,11 @@ def build_report_payload(
             "shadow_trade_events",
             "mfe_mae_tracking",
             "shadow_stop_experiments",
+            "entry_research_labels",
+            "entry_strategy_scores",
+            "entry_type_performance",
+            "reentry_series",
+            "forward_outcome_labels",
             "curator_decisions",
             "system_health",
             "errors",
@@ -164,6 +170,7 @@ def build_report_payload(
         "shadow_experiments": [_row_dict(row) for row in latest_experiments],
         "shadow_exit_summary": shadow_exit_summary,
         "shadow_stop_comparison": stop_comparison,
+        "entry_type_performance": entry_type_performance,
         "next_steps": [
             "Watch data freshness and orderbook_missing warnings.",
             "Compare stop_ticks after at least 30 closed shadow trades per instrument.",
@@ -296,6 +303,26 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"{row['avg_pnl_ticks_non_spread']} | {row['stop_exits']} | "
             f"{row['protection_exits']} | {row['trailing_exits']} | {row['time_exits']} | "
             f"{row['spread_shock_exits']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Entry Type Performance",
+            "",
+            "| instrument | entry_type | signals | trades | stops | protected | trailing | "
+            "avg_pnl_ticks | avg_mfe_ticks | mfe3 | mfe5 | mfe10 | best_stop_ticks | "
+            "profit_factor |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+            "---: | ---: | ---: |",
+        ]
+    )
+    for row in payload["entry_type_performance"]:
+        lines.append(
+            f"| {row['instrument']} | {row['entry_type']} | {row['signals_count']} | "
+            f"{row['accepted_trades']} | {row['stop_exits']} | {row['protected_exits']} | "
+            f"{row['trailing_exits']} | {row['avg_pnl_ticks']} | {row['avg_mfe_ticks']} | "
+            f"{row['mfe3_rate']} | {row['mfe5_rate']} | {row['mfe10_rate']} | "
+            f"{row['best_stop_ticks']} | {row['profit_factor']} |"
         )
     lines.extend(
         [
@@ -518,6 +545,27 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
         "best_stop_ticks": best_stop_ticks,
         "rows": result_rows,
     }
+
+
+def _entry_type_performance(storage: SQLiteJournal) -> list[dict[str, Any]]:
+    rows = storage.fetch_all(
+        """
+        SELECT instrument, entry_type, signals_count, accepted_trades, stop_exits,
+               protected_exits, trailing_exits, avg_pnl_ticks, avg_pnl_bps,
+               avg_mfe_ticks, avg_mae_ticks, mfe3_rate, mfe5_rate, mfe10_rate,
+               mfe_005pct_rate, mfe_010pct_rate, mfe_015pct_rate, stop_hit_rate,
+               direction_correct_rate, best_stop_ticks, best_session_time,
+               max_consecutive_stops, profit_factor
+        FROM entry_type_performance
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM entry_type_performance
+            GROUP BY instrument, entry_type
+        )
+        ORDER BY instrument, entry_type
+        """
+    )
+    return [_row_dict(row) for row in rows]
 
 
 __all__ = ["build_report_payload", "render_markdown", "write_report"]

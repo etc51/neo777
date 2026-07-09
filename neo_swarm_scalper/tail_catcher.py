@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from neo_swarm_scalper.config import NeoSwarmScalperConfig
+from neo_swarm_scalper.entry_engine import EntryCandidate, EntryTypeEngine
 from neo_swarm_scalper.storage import SQLiteJournal
 from neo_swarm_scalper.types import FeatureSnapshot, MarketSnapshot, PositionSide
 
@@ -61,6 +62,22 @@ class _ShadowTrade:
     protection_activated: bool = False
     protection_price: Decimal | None = None
     protected_exit_reason: str | None = None
+    entry_type: str | None = None
+    direction_model: str | None = None
+    direction_score: Decimal = Decimal("0")
+    pressure_score: Decimal = Decimal("0")
+    impulse_score: Decimal = Decimal("0")
+    pullback_score: Decimal = Decimal("0")
+    book_flip_score: Decimal = Decimal("0")
+    reversal_score: Decimal = Decimal("0")
+    lead_lag_score: Decimal = Decimal("0")
+    expected_mfe_ticks: Decimal = Decimal("0")
+    expected_stop_risk_ticks: Decimal = Decimal("0")
+    reentry_series_id: str | None = None
+    reentry_number: int = 0
+    reason_reentry_allowed: str | None = None
+    reason_reentry_blocked: str | None = None
+    trailing_reason: str | None = None
     reentry_index: int = 0
     consecutive_stop_index: int = 0
     spread_bad_cycles: int = 0
@@ -74,6 +91,8 @@ class TailCatcherEngine:
         self.storage = storage
         self._states: dict[str, _InstrumentState] = {}
         self._open_trades: dict[str, _ShadowTrade] = {}
+        self._entry_engine = EntryTypeEngine(min_direction_score=Decimal("0.12"))
+        self._latest_contexts: dict[str, dict[str, Any]] = {}
         self._load_open_trades()
         self._backfill_missing_mfe_mae()
 
@@ -94,11 +113,17 @@ class TailCatcherEngine:
             self._record_market_detail(snapshot, micro)
             self._record_feature_tables(snapshot, micro, volatility, money_flow)
             self._update_open_trades(snapshot, micro, volatility, timestamp_utc)
-            allowed, side, confidence, reason, gates = self._curator_decision(
+            peer_contexts = {
+                **self._latest_contexts,
+                snapshot.instrument: {"micro": micro, "volatility": volatility},
+            }
+            allowed, side, confidence, reason, gates, entry = self._curator_decision(
                 snapshot,
                 micro,
                 volatility,
                 features.get(snapshot.instrument),
+                state=state,
+                peer_contexts=peer_contexts,
             )
             signal_id = self._record_signal(
                 timestamp_utc=timestamp_utc,
@@ -110,7 +135,10 @@ class TailCatcherEngine:
                 micro=micro,
                 volatility=volatility,
                 money_flow=money_flow,
+                entry=entry,
             )
+            if entry is not None:
+                self._record_live_entry_score(timestamp_utc, snapshot, entry)
             self._record_curator(
                 timestamp_utc=timestamp_utc,
                 instrument=snapshot.instrument,
@@ -120,16 +148,26 @@ class TailCatcherEngine:
                 reason=reason,
                 gates=gates,
             )
-            if allowed and side is not None and not self._has_open_matrix(snapshot.instrument):
+            if (
+                allowed
+                and side is not None
+                and entry is not None
+                and not self._has_open_matrix(snapshot.instrument)
+            ):
                 self._open_shadow_matrix(
                     signal_id=signal_id,
                     snapshot=snapshot,
                     side=side,
                     timestamp_utc=timestamp_utc,
                     micro=micro,
+                    volatility=volatility,
+                    entry=entry,
+                    spread_entry=gates["spread_entry"],
                 )
                 state.last_signal_time = timestamp_utc
             self._record_experiment_metrics(timestamp_utc, snapshot.instrument)
+            self._record_entry_type_performance(timestamp_utc, snapshot.instrument)
+            self._latest_contexts[snapshot.instrument] = {"micro": micro, "volatility": volatility}
 
     def _state(self, instrument: str) -> _InstrumentState:
         return self._states.setdefault(
@@ -183,6 +221,36 @@ class TailCatcherEngine:
                     None
                     if row["protected_exit_reason"] is None
                     else str(row["protected_exit_reason"])
+                ),
+                entry_type=None if row["entry_type"] is None else str(row["entry_type"]),
+                direction_model=(
+                    None if row["direction_model"] is None else str(row["direction_model"])
+                ),
+                direction_score=Decimal(str(row["direction_score"])),
+                pressure_score=Decimal(str(row["pressure_score"])),
+                impulse_score=Decimal(str(row["impulse_score"])),
+                pullback_score=Decimal(str(row["pullback_score"])),
+                book_flip_score=Decimal(str(row["book_flip_score"])),
+                reversal_score=Decimal(str(row["reversal_score"])),
+                lead_lag_score=Decimal(str(row["lead_lag_score"])),
+                expected_mfe_ticks=Decimal(str(row["expected_mfe_ticks"])),
+                expected_stop_risk_ticks=Decimal(str(row["expected_stop_risk_ticks"])),
+                reentry_series_id=(
+                    None if row["reentry_series_id"] is None else str(row["reentry_series_id"])
+                ),
+                reentry_number=int(row["reentry_number"]),
+                reason_reentry_allowed=(
+                    None
+                    if row["reason_reentry_allowed"] is None
+                    else str(row["reason_reentry_allowed"])
+                ),
+                reason_reentry_blocked=(
+                    None
+                    if row["reason_reentry_blocked"] is None
+                    else str(row["reason_reentry_blocked"])
+                ),
+                trailing_reason=(
+                    None if row["trailing_reason"] is None else str(row["trailing_reason"])
                 ),
                 reentry_index=int(row["reentry_index"]),
                 consecutive_stop_index=int(row["consecutive_stop_index"]),
@@ -422,20 +490,24 @@ class TailCatcherEngine:
         micro: dict[str, Any],
         volatility: dict[str, Any],
         features: FeatureSnapshot | None,
-    ) -> tuple[bool, PositionSide | None, Decimal, str, dict[str, Any]]:
+        *,
+        state: _InstrumentState,
+        peer_contexts: dict[str, dict[str, Any]],
+    ) -> tuple[bool, PositionSide | None, Decimal, str, dict[str, Any], EntryCandidate | None]:
         pressure = Decimal(str(micro["pressure_score"]))
-        side = PositionSide.LONG if pressure >= 0 else PositionSide.SHORT
+        fallback_side = PositionSide.LONG if pressure >= 0 else PositionSide.SHORT
         spread_entry = _spread_entry_assessment(self.config, micro)
         gates = {
             "session_gate": _session_open(snapshot),
             "spread_gate": spread_entry["entry_ok"],
+            "spread_entry": spread_entry,
             "spread_status": spread_entry["status"],
             "spread_no_entry_reason": spread_entry["no_entry_reason"],
             "spread_ticks": spread_entry["spread_ticks"],
             "spread_bps": spread_entry["spread_bps"],
             "orderbook_health_gate": not snapshot.orderbook_missing
             and not bool(micro["thin_book_flag"]),
-            "microstructure_gate": abs(pressure) >= self.config.tail_catcher.min_pressure_score,
+            "microstructure_min_pressure": self.config.tail_catcher.min_pressure_score,
             "volatility_chaos_gate": volatility["volatility_regime"] != "chaotic",
             "data_freshness_gate": not snapshot.stale,
             "momentum_is_context_only": True,
@@ -444,14 +516,45 @@ class TailCatcherEngine:
         allowed = all(bool(value) for key, value in gates.items() if key.endswith("_gate"))
         if not allowed:
             blocked = [key for key, value in gates.items() if key.endswith("_gate") and not value]
-            return False, side, Decimal("0"), "no_trade: " + ",".join(blocked), gates
-        confidence = min(
-            abs(pressure) + Decimal(str(volatility["impulse_score"])) / Decimal("20"),
-            Decimal("1"),
+            return (
+                False,
+                fallback_side,
+                Decimal("0"),
+                "no_trade: " + ",".join(blocked),
+                gates,
+                None,
+            )
+        entry = self._entry_engine.select(
+            snapshot=snapshot,
+            micro=micro,
+            volatility=volatility,
+            price_history=tuple(state.prices),
+            features=features,
+            peer_contexts=peer_contexts,
         )
-        if features is not None and features.values.get("market_regime") == "chaotic":
-            return False, side, Decimal("0"), "no_trade: feature_regime_chaotic", gates
-        return True, side, max(confidence, Decimal("0.10")), "tail_catcher_signal", gates
+        if entry is None:
+            gates["current_regime"] = "no_trade"
+            return (
+                False,
+                fallback_side,
+                Decimal("0"),
+                "no_trade: no_entry_type_active",
+                gates,
+                None,
+            )
+        gates["current_regime"] = entry.entry_type
+        gates["entry_reason"] = entry.reason
+        gates["direction_model"] = entry.direction_model
+        gates["direction_score"] = entry.direction_score
+        gates["entry_diagnostics"] = entry.diagnostics
+        return (
+            True,
+            entry.side,
+            max(entry.confidence, Decimal("0.10")),
+            f"entry_type:{entry.entry_type}",
+            gates,
+            entry,
+        )
 
     def _open_shadow_matrix(
         self,
@@ -461,6 +564,9 @@ class TailCatcherEngine:
         side: PositionSide,
         timestamp_utc: datetime,
         micro: dict[str, Any],
+        volatility: dict[str, Any],
+        entry: EntryCandidate,
+        spread_entry: dict[str, Any],
     ) -> None:
         entry_price = self._entry_price(snapshot, side)
         if entry_price is None:
@@ -477,16 +583,38 @@ class TailCatcherEngine:
         bid = _dec_or_none(micro.get("bid"))
         ask = _dec_or_none(micro.get("ask"))
         consecutive_stops = self._recent_consecutive_stops(snapshot.instrument, side)
-        if consecutive_stops >= self.config.tail_catcher.max_consecutive_stops:
+        reentry_plan = self._reentry_plan(
+            snapshot=snapshot,
+            side=side,
+            entry=entry,
+            micro=micro,
+            volatility=volatility,
+            spread_entry=spread_entry,
+            consecutive_stops=consecutive_stops,
+        )
+        if not reentry_plan["allowed"]:
             self._record_error(
                 timestamp_utc,
                 "tail_catcher",
                 snapshot.instrument,
                 "bad_stop_series_cooldown",
-                "Max consecutive stops reached; new shadow entries skipped.",
-                {"side": side.value, "consecutive_stops": consecutive_stops},
+                "Re-entry rules blocked the new shadow matrix.",
+                {
+                    "side": side.value,
+                    "entry_type": entry.entry_type,
+                    "consecutive_stops": consecutive_stops,
+                    "reason": reentry_plan["reason_reentry_blocked"],
+                },
             )
             return
+        self._record_reentry_series_signal(
+            timestamp_utc=timestamp_utc,
+            series_id=str(reentry_plan["reentry_series_id"]),
+            instrument=snapshot.instrument,
+            side=side,
+            entry_type=entry.entry_type,
+            reason=str(reentry_plan["reason_reentry_allowed"]),
+        )
         reentry_index = min(
             consecutive_stops,
             self.config.tail_catcher.max_reentries_per_direction_per_instrument,
@@ -515,6 +643,21 @@ class TailCatcherEngine:
                         stop_price=stop_price,
                         best_price_after_entry=entry_price,
                         worst_price_after_entry=entry_price,
+                        entry_type=entry.entry_type,
+                        direction_model=entry.direction_model,
+                        direction_score=entry.direction_score,
+                        pressure_score=entry.pressure_score,
+                        impulse_score=entry.impulse_score,
+                        pullback_score=entry.pullback_score,
+                        book_flip_score=entry.book_flip_score,
+                        reversal_score=entry.reversal_score,
+                        lead_lag_score=entry.lead_lag_score,
+                        expected_mfe_ticks=entry.expected_mfe_ticks,
+                        expected_stop_risk_ticks=entry.expected_stop_risk_ticks,
+                        reentry_series_id=str(reentry_plan["reentry_series_id"]),
+                        reentry_number=int(reentry_plan["reentry_number"]),
+                        reason_reentry_allowed=str(reentry_plan["reason_reentry_allowed"]),
+                        reason_reentry_blocked=reentry_plan["reason_reentry_blocked"],
                         reentry_index=reentry_index,
                         consecutive_stop_index=consecutive_stops,
                     )
@@ -529,6 +672,10 @@ class TailCatcherEngine:
                             "stop_ticks": stop_ticks,
                             "protection_trigger_bps": str(trigger),
                             "trailing_mode": trailing_mode,
+                            "entry_type": entry.entry_type,
+                            "direction_score": str(entry.direction_score),
+                            "reentry_series_id": trade.reentry_series_id,
+                            "reentry_number": trade.reentry_number,
                             "fill_model": "BUY=ask+slippage SELL=bid-slippage",
                         },
                     )
@@ -578,14 +725,17 @@ class TailCatcherEngine:
                 reason = "stale_data_close"
             elif _stop_hit(trade, exit_price):
                 reason = "protected_stop" if trade.protection_activated else "stop_loss"
-            elif trade.protection_activated and self._trailing_exit(
-                trade,
-                exit_price,
-                micro,
-                volatility,
-                tick,
-            ):
-                reason = "trailing_runner"
+            elif trade.protection_activated and trade.mfe_ticks > 0:
+                trailing_reason = self._trailing_exit_reason(
+                    trade,
+                    exit_price,
+                    micro,
+                    volatility,
+                    tick,
+                )
+                if trailing_reason is not None:
+                    trade.trailing_reason = trailing_reason
+                    reason = "trailing_runner"
             elif _time_exit(trade, timestamp_utc, self.config.scalping.time_stop_sec_max):
                 reason = "time_exit"
             elif spread_exit["market_bad"]:
@@ -673,14 +823,14 @@ class TailCatcherEngine:
         trade.max_runup_before_exit = max(trade.max_runup_before_exit, trade.mfe_abs)
         trade.max_drawdown_before_exit = min(trade.max_drawdown_before_exit, trade.mae_abs)
 
-    def _trailing_exit(
+    def _trailing_exit_reason(
         self,
         trade: _ShadowTrade,
         exit_price: Decimal,
         micro: dict[str, Any],
         volatility: dict[str, Any],
         tick: Decimal,
-    ) -> bool:
+    ) -> str | None:
         trail_ticks = {
             "tight": Decimal("3"),
             "normal": Decimal("5"),
@@ -695,7 +845,20 @@ class TailCatcherEngine:
             pressure_lost = Decimal(str(micro["pressure_score"])) > Decimal("0")
         spread_expanded = bool(micro["spread_expansion_flag"])
         volatility_compressed = Decimal(str(volatility["chop_score"])) >= Decimal("0.85")
-        return pullback >= trail_ticks or pressure_lost or spread_expanded or volatility_compressed
+        book_flip_against = bool(micro["orderbook_flip_flag"]) and pressure_lost
+        if bool(micro["thin_book_flag"]):
+            return "microstructure_deterioration"
+        if book_flip_against:
+            return "book_flip_against_runner"
+        if pullback >= trail_ticks:
+            return "MFE_pullback"
+        if pressure_lost:
+            return "pressure_loss"
+        if spread_expanded:
+            return "spread_expansion"
+        if volatility_compressed:
+            return "volatility_compression"
+        return None
 
     def _entry_price(self, snapshot: MarketSnapshot, side: PositionSide) -> Decimal | None:
         tick = snapshot.tick_size or Decimal("1")
@@ -730,6 +893,139 @@ class TailCatcherEngine:
     def _has_open_matrix(self, instrument: str) -> bool:
         return any(trade.instrument == instrument for trade in self._open_trades.values())
 
+    def _reentry_plan(
+        self,
+        *,
+        snapshot: MarketSnapshot,
+        side: PositionSide,
+        entry: EntryCandidate,
+        micro: dict[str, Any],
+        volatility: dict[str, Any],
+        spread_entry: dict[str, Any],
+        consecutive_stops: int,
+    ) -> dict[str, Any]:
+        blocked: list[str] = []
+        signed_pressure = _side_signed(side, Decimal(str(micro["pressure_score"])))
+        signed_micro = _side_signed(side, Decimal(str(micro["microprice_deviation"])))
+        if consecutive_stops >= self.config.tail_catcher.max_consecutive_stops:
+            blocked.append("max_consecutive_stops")
+        if consecutive_stops > self.config.tail_catcher.max_reentries_per_direction_per_instrument:
+            blocked.append("max_reentries")
+        if consecutive_stops > 0:
+            if entry.direction_score < self._entry_engine.min_direction_score:
+                blocked.append("direction_score_deteriorated")
+            if signed_micro < Decimal("-0.25"):
+                blocked.append("microprice_flipped_against")
+            if bool(micro["orderbook_flip_flag"]) and signed_pressure < Decimal("0.10"):
+                blocked.append("orderbook_flip_against")
+            if not bool(spread_entry["entry_ok"]):
+                blocked.append("spread_not_normal")
+            if volatility["volatility_regime"] == "chaotic":
+                blocked.append("volatility_chaotic")
+        series_id = (
+            self._latest_reentry_series_id(snapshot.instrument, side, entry.entry_type)
+            if consecutive_stops > 0
+            else None
+        )
+        if series_id is None:
+            series_id = f"REENTRY_SERIES_{uuid4().hex}"
+        if blocked:
+            return {
+                "allowed": False,
+                "reentry_series_id": series_id,
+                "reentry_number": consecutive_stops,
+                "reason_reentry_allowed": None,
+                "reason_reentry_blocked": ",".join(blocked),
+            }
+        reason = (
+            "initial_entry"
+            if consecutive_stops == 0
+            else "reentry_allowed: direction_score/book/spread still aligned"
+        )
+        return {
+            "allowed": True,
+            "reentry_series_id": series_id,
+            "reentry_number": consecutive_stops,
+            "reason_reentry_allowed": reason,
+            "reason_reentry_blocked": None,
+        }
+
+    def _latest_reentry_series_id(
+        self,
+        instrument: str,
+        side: PositionSide,
+        entry_type: str,
+    ) -> str | None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT reentry_series_id
+            FROM shadow_trades
+            WHERE instrument = ?
+              AND side = ?
+              AND entry_type = ?
+              AND reentry_series_id IS NOT NULL
+            ORDER BY COALESCE(exit_time, entry_time) DESC
+            LIMIT 1
+            """,
+            (instrument, side.value, entry_type),
+        )
+        if not rows:
+            return None
+        return None if rows[0]["reentry_series_id"] is None else str(rows[0]["reentry_series_id"])
+
+    def _record_reentry_series_signal(
+        self,
+        *,
+        timestamp_utc: datetime,
+        series_id: str,
+        instrument: str,
+        side: PositionSide,
+        entry_type: str,
+        reason: str,
+    ) -> None:
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reentry_series(
+                    series_id, instrument, side, entry_type, started_at, last_signal_at,
+                    entries_count, stops_count, status, reason_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1, 0, 'OPEN', ?)
+                ON CONFLICT(series_id) DO UPDATE SET
+                    last_signal_at = excluded.last_signal_at,
+                    entries_count = entries_count + 1,
+                    status = 'OPEN',
+                    reason_json = excluded.reason_json
+                """,
+                (
+                    series_id,
+                    instrument,
+                    side.value,
+                    entry_type,
+                    timestamp_utc.isoformat(),
+                    timestamp_utc.isoformat(),
+                    _json({"reason": reason}),
+                ),
+            )
+            conn.commit()
+
+    def _update_reentry_series_on_close(self, trade: _ShadowTrade, reason: str) -> None:
+        if trade.reentry_series_id is None:
+            return
+        stop_like = reason in {"stop_loss", "protected_stop", "protected_exit"}
+        status = "STOPPED" if stop_like else "CLOSED"
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                UPDATE reentry_series
+                SET stops_count = stops_count + ?,
+                    status = ?
+                WHERE series_id = ?
+                """,
+                (1 if stop_like else 0, status, trade.reentry_series_id),
+            )
+            conn.commit()
+
     def _insert_shadow_trade(self, trade: _ShadowTrade) -> None:
         with self.storage.connect() as conn:
             conn.execute(
@@ -739,11 +1035,15 @@ class TailCatcherEngine:
                     trailing_mode, status, entry_time, entry_price, theoretical_bid,
                     theoretical_ask, stop_price, best_price_after_entry, worst_price_after_entry,
                     mfe_abs, mfe_pct, mfe_ticks, mae_abs, mae_pct, mae_ticks,
-                    max_runup_before_exit, max_drawdown_before_exit, reentry_index,
-                    consecutive_stop_index
+                    max_runup_before_exit, max_drawdown_before_exit, entry_type,
+                    direction_model, direction_score, pressure_score, impulse_score,
+                    pullback_score, book_flip_score, reversal_score, lead_lag_score,
+                    expected_mfe_ticks, expected_stop_risk_ticks, reentry_series_id,
+                    reentry_number, reason_reentry_allowed, reason_reentry_blocked,
+                    reentry_index, consecutive_stop_index
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0,
-                        0, 0, ?, ?)
+                        0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.trade_id,
@@ -760,6 +1060,21 @@ class TailCatcherEngine:
                     _num(trade.stop_price),
                     _num(trade.best_price_after_entry),
                     _num(trade.worst_price_after_entry),
+                    trade.entry_type,
+                    trade.direction_model,
+                    _num(trade.direction_score),
+                    _num(trade.pressure_score),
+                    _num(trade.impulse_score),
+                    _num(trade.pullback_score),
+                    _num(trade.book_flip_score),
+                    _num(trade.reversal_score),
+                    _num(trade.lead_lag_score),
+                    _num(trade.expected_mfe_ticks),
+                    _num(trade.expected_stop_risk_ticks),
+                    trade.reentry_series_id,
+                    trade.reentry_number,
+                    trade.reason_reentry_allowed,
+                    trade.reason_reentry_blocked,
                     trade.reentry_index,
                     trade.consecutive_stop_index,
                 ),
@@ -786,7 +1101,8 @@ class TailCatcherEngine:
                     max_drawdown_before_exit = ?,
                     protection_activated = ?,
                     protection_price = ?,
-                    protected_exit_reason = ?
+                    protected_exit_reason = ?,
+                    trailing_reason = ?
                 WHERE trade_id = ?
                 """,
                 (
@@ -806,6 +1122,7 @@ class TailCatcherEngine:
                     int(trade.protection_activated),
                     _num(trade.protection_price),
                     trade.protected_exit_reason,
+                    trade.trailing_reason,
                     trade.trade_id,
                 ),
             )
@@ -828,7 +1145,8 @@ class TailCatcherEngine:
                     exit_time = ?,
                     exit_price = ?,
                     exit_reason = ?,
-                    protected_exit_reason = ?
+                    protected_exit_reason = ?,
+                    trailing_reason = ?
                 WHERE trade_id = ?
                 """,
                 (
@@ -836,10 +1154,12 @@ class TailCatcherEngine:
                     _num(exit_price),
                     reason,
                     trade.protected_exit_reason,
+                    trade.trailing_reason,
                     trade.trade_id,
                 ),
             )
             conn.commit()
+        self._update_reentry_series_on_close(trade, reason)
         self._record_trade_event(
             trade.trade_id,
             timestamp_utc,
@@ -849,6 +1169,8 @@ class TailCatcherEngine:
                 "mfe_ticks": str(trade.mfe_ticks),
                 "mae_ticks": str(trade.mae_ticks),
                 "protection_activated": trade.protection_activated,
+                "entry_type": trade.entry_type,
+                "trailing_reason": trade.trailing_reason,
             },
         )
         self._open_trades.pop(trade.trade_id, None)
@@ -865,21 +1187,26 @@ class TailCatcherEngine:
         micro: dict[str, Any],
         volatility: dict[str, Any],
         money_flow: dict[str, Any],
+        entry: EntryCandidate | None,
     ) -> str:
         signal_id = f"SHADOW_SIGNAL_{uuid4().hex}"
         features = {
             "microstructure": _jsonable(micro),
             "volatility": _jsonable(volatility),
             "money_flow": _jsonable(money_flow),
+            "entry": None if entry is None else _jsonable(entry.diagnostics),
         }
         with self.storage.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO shadow_signals(
                     signal_id, timestamp_utc, instrument, side, confidence, reason,
+                    entry_type, direction_model, direction_score, pressure_score,
+                    impulse_score, pullback_score, book_flip_score, reversal_score,
+                    lead_lag_score, expected_mfe_ticks, expected_stop_risk_ticks,
                     gate_status_json, features_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -888,12 +1215,61 @@ class TailCatcherEngine:
                     "NONE" if side is None else side.value,
                     _num(confidence),
                     reason,
+                    None if entry is None else entry.entry_type,
+                    None if entry is None else entry.direction_model,
+                    _num(Decimal("0") if entry is None else entry.direction_score),
+                    _num(Decimal("0") if entry is None else entry.pressure_score),
+                    _num(Decimal("0") if entry is None else entry.impulse_score),
+                    _num(Decimal("0") if entry is None else entry.pullback_score),
+                    _num(Decimal("0") if entry is None else entry.book_flip_score),
+                    _num(Decimal("0") if entry is None else entry.reversal_score),
+                    _num(Decimal("0") if entry is None else entry.lead_lag_score),
+                    _num(Decimal("0") if entry is None else entry.expected_mfe_ticks),
+                    _num(Decimal("0") if entry is None else entry.expected_stop_risk_ticks),
                     _json(gates),
                     _json(features),
                 ),
             )
             conn.commit()
         return signal_id
+
+    def _record_live_entry_score(
+        self,
+        timestamp_utc: datetime,
+        snapshot: MarketSnapshot,
+        entry: EntryCandidate,
+    ) -> None:
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO entry_strategy_scores(
+                    run_id, timestamp_utc, instrument, entry_type, side, direction_model,
+                    direction_score, pressure_score, impulse_score, pullback_score,
+                    book_flip_score, reversal_score, lead_lag_score, expected_mfe_ticks,
+                    expected_stop_risk_ticks, diagnostics_json, created_at
+                )
+                VALUES ('LIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    snapshot.instrument,
+                    entry.entry_type,
+                    entry.side.value,
+                    entry.direction_model,
+                    _num(entry.direction_score),
+                    _num(entry.pressure_score),
+                    _num(entry.impulse_score),
+                    _num(entry.pullback_score),
+                    _num(entry.book_flip_score),
+                    _num(entry.reversal_score),
+                    _num(entry.lead_lag_score),
+                    _num(entry.expected_mfe_ticks),
+                    _num(entry.expected_stop_risk_ticks),
+                    _json(entry.diagnostics),
+                    timestamp_utc.isoformat(),
+                ),
+            )
+            conn.commit()
 
     def _record_curator(
         self,
@@ -1236,6 +1612,85 @@ class TailCatcherEngine:
                         )
             conn.commit()
 
+    def _record_entry_type_performance(self, timestamp_utc: datetime, instrument: str) -> None:
+        with self.storage.connect() as conn:
+            entry_types = [
+                str(row["entry_type"])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT entry_type
+                    FROM shadow_signals
+                    WHERE instrument = ? AND entry_type IS NOT NULL
+                    """,
+                    (instrument,),
+                )
+            ]
+            for entry_type in entry_types:
+                signals_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM shadow_signals
+                        WHERE instrument = ? AND entry_type = ?
+                        """,
+                        (instrument, entry_type),
+                    ).fetchone()[0]
+                )
+                rows = list(
+                    conn.execute(
+                        """
+                        SELECT *
+                        FROM shadow_trades
+                        WHERE instrument = ? AND entry_type = ?
+                        """,
+                        (instrument, entry_type),
+                    )
+                )
+                metrics = _entry_type_metrics(rows, signals_count)
+                conn.execute(
+                    """
+                    INSERT INTO entry_type_performance(
+                        timestamp_utc, instrument, entry_type, signals_count,
+                        accepted_trades, stop_exits, protected_exits, trailing_exits,
+                        avg_pnl_ticks, avg_pnl_bps, avg_mfe_ticks, avg_mae_ticks,
+                        mfe3_rate, mfe5_rate, mfe10_rate, mfe_005pct_rate,
+                        mfe_010pct_rate, mfe_015pct_rate, stop_hit_rate,
+                        direction_correct_rate, best_stop_ticks, best_session_time,
+                        max_consecutive_stops, profit_factor, details_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?)
+                    """,
+                    (
+                        timestamp_utc.isoformat(),
+                        instrument,
+                        entry_type,
+                        signals_count,
+                        metrics["accepted_trades"],
+                        metrics["stop_exits"],
+                        metrics["protected_exits"],
+                        metrics["trailing_exits"],
+                        _num(metrics["avg_pnl_ticks"]),
+                        _num(metrics["avg_pnl_bps"]),
+                        _num(metrics["avg_mfe_ticks"]),
+                        _num(metrics["avg_mae_ticks"]),
+                        _num(metrics["mfe3_rate"]),
+                        _num(metrics["mfe5_rate"]),
+                        _num(metrics["mfe10_rate"]),
+                        _num(metrics["mfe_005pct_rate"]),
+                        _num(metrics["mfe_010pct_rate"]),
+                        _num(metrics["mfe_015pct_rate"]),
+                        _num(metrics["stop_hit_rate"]),
+                        _num(metrics["direction_correct_rate"]),
+                        metrics["best_stop_ticks"],
+                        metrics["best_session_time"],
+                        metrics["max_consecutive_stops"],
+                        _num(metrics["profit_factor"]),
+                        _json(metrics["details"]),
+                    ),
+                )
+            conn.commit()
+
     def _record_health(self, timestamp_utc: datetime, status: str, details: dict[str, Any]) -> None:
         with self.storage.connect() as conn:
             conn.execute(
@@ -1466,6 +1921,10 @@ def _pnl_abs(side: PositionSide, entry: Decimal, exit_price: Decimal) -> Decimal
     return entry - exit_price
 
 
+def _side_signed(side: PositionSide, value: Decimal) -> Decimal:
+    return value if side is PositionSide.LONG else -value
+
+
 def _protection_price(side: PositionSide, entry: Decimal, tick: Decimal) -> Decimal:
     if side is PositionSide.LONG:
         return entry + tick
@@ -1549,6 +2008,114 @@ def _experiment_metrics(rows: list[Any], *, big_runner_bps: Decimal) -> dict[str
     }
 
 
+def _entry_type_metrics(rows: list[Any], signals_count: int) -> dict[str, Any]:
+    if not rows:
+        return {
+            "accepted_trades": 0,
+            "stop_exits": 0,
+            "protected_exits": 0,
+            "trailing_exits": 0,
+            "avg_pnl_ticks": Decimal("0"),
+            "avg_pnl_bps": Decimal("0"),
+            "avg_mfe_ticks": Decimal("0"),
+            "avg_mae_ticks": Decimal("0"),
+            "mfe3_rate": Decimal("0"),
+            "mfe5_rate": Decimal("0"),
+            "mfe10_rate": Decimal("0"),
+            "mfe_005pct_rate": Decimal("0"),
+            "mfe_010pct_rate": Decimal("0"),
+            "mfe_015pct_rate": Decimal("0"),
+            "stop_hit_rate": Decimal("0"),
+            "direction_correct_rate": Decimal("0"),
+            "best_stop_ticks": None,
+            "best_session_time": None,
+            "max_consecutive_stops": 0,
+            "profit_factor": Decimal("0"),
+            "details": {"signals_count": signals_count},
+        }
+    closed = [row for row in rows if row["exit_price"] is not None]
+    pnl_ticks = [_row_pnl_ticks(row) for row in closed]
+    pnl_bps = [_row_pnl_bps(row) for row in closed]
+    wins = [item for item in pnl_ticks if item > 0]
+    losses = [item for item in pnl_ticks if item < 0]
+    denominator = Decimal(len(rows))
+    stop_exits = sum(
+        1 for row in closed if str(row["exit_reason"]) in {"stop_loss", "protected_stop"}
+    )
+    protected_exits = sum(1 for row in closed if str(row["exit_reason"]) == "protected_exit")
+    trailing_exits = sum(1 for row in closed if str(row["exit_reason"]) == "trailing_runner")
+    gross_win = sum(wins, Decimal("0"))
+    gross_loss = abs(sum(losses, Decimal("0")))
+    return {
+        "accepted_trades": len(rows),
+        "stop_exits": stop_exits,
+        "protected_exits": protected_exits,
+        "trailing_exits": trailing_exits,
+        "avg_pnl_ticks": _avg(pnl_ticks),
+        "avg_pnl_bps": _avg(pnl_bps),
+        "avg_mfe_ticks": _avg([Decimal(str(row["mfe_ticks"])) for row in rows]),
+        "avg_mae_ticks": _avg([Decimal(str(row["mae_ticks"])) for row in rows]),
+        "mfe3_rate": _rate(rows, lambda row: Decimal(str(row["mfe_ticks"])) >= Decimal("3")),
+        "mfe5_rate": _rate(rows, lambda row: Decimal(str(row["mfe_ticks"])) >= Decimal("5")),
+        "mfe10_rate": _rate(rows, lambda row: Decimal(str(row["mfe_ticks"])) >= Decimal("10")),
+        "mfe_005pct_rate": _rate(
+            rows,
+            lambda row: Decimal(str(row["mfe_pct"])) >= Decimal("0.0005"),
+        ),
+        "mfe_010pct_rate": _rate(
+            rows,
+            lambda row: Decimal(str(row["mfe_pct"])) >= Decimal("0.0010"),
+        ),
+        "mfe_015pct_rate": _rate(
+            rows,
+            lambda row: Decimal(str(row["mfe_pct"])) >= Decimal("0.0015"),
+        ),
+        "stop_hit_rate": Decimal(stop_exits) / denominator,
+        "direction_correct_rate": _rate(
+            rows,
+            lambda row: Decimal(str(row["mfe_ticks"])) > Decimal("0"),
+        ),
+        "best_stop_ticks": _best_stop_ticks(closed),
+        "best_session_time": _best_session_time(rows),
+        "max_consecutive_stops": _max_consecutive_stops(closed),
+        "profit_factor": (
+            gross_win / gross_loss
+            if gross_loss
+            else (Decimal("999") if gross_win else Decimal("0"))
+        ),
+        "details": {"signals_count": signals_count, "closed_trades": len(closed)},
+    }
+
+
+def _avg(values: list[Decimal]) -> Decimal:
+    return sum(values, Decimal("0")) / Decimal(len(values)) if values else Decimal("0")
+
+
+def _rate(rows: list[Any], predicate: Any) -> Decimal:
+    if not rows:
+        return Decimal("0")
+    return Decimal(sum(1 for row in rows if predicate(row))) / Decimal(len(rows))
+
+
+def _best_stop_ticks(rows: list[Any]) -> int | None:
+    by_stop: dict[int, list[Decimal]] = {}
+    for row in rows:
+        if str(row["exit_reason"]) == "spread_shock":
+            continue
+        by_stop.setdefault(int(row["stop_ticks"]), []).append(_row_pnl_ticks(row))
+    if not by_stop:
+        return None
+    return max(by_stop.items(), key=lambda item: _avg(item[1]))[0]
+
+
+def _best_session_time(rows: list[Any]) -> str | None:
+    if not rows:
+        return None
+    best = max(rows, key=lambda row: Decimal(str(row["mfe_ticks"])))
+    raw = str(best["entry_time"])
+    return raw[:13] + ":00" if len(raw) >= 13 else raw
+
+
 def _row_pnl_ticks(row: Any) -> Decimal:
     entry = Decimal(str(row["entry_price"]))
     exit_price = Decimal(str(row["exit_price"]))
@@ -1557,6 +2124,15 @@ def _row_pnl_ticks(row: Any) -> Decimal:
     tick = abs(entry - stop_price) / stop_ticks if stop_ticks else Decimal("1")
     pnl = _pnl_abs(PositionSide(str(row["side"])), entry, exit_price)
     return pnl / tick if tick else Decimal("0")
+
+
+def _row_pnl_bps(row: Any) -> Decimal:
+    entry = Decimal(str(row["entry_price"]))
+    exit_price = Decimal(str(row["exit_price"]))
+    if entry == 0:
+        return Decimal("0")
+    pnl = _pnl_abs(PositionSide(str(row["side"])), entry, exit_price)
+    return (pnl / entry) * Decimal("10000")
 
 
 def _duration_seconds(row: Any) -> Decimal:
