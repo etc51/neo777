@@ -95,7 +95,7 @@ tail_catcher:
   control_stop_ticks_min: 10
   control_stop_ticks_max: 80
   control_time_exit_sec: 120
-  stop_confirmation_cycles: 2
+  stop_confirmation_cycles: 1
   protection_confirmation_cycles: 1
   trailing_confirmation_cycles: 2
   time_exit_spread_grace_cycles: 6

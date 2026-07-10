@@ -84,6 +84,7 @@ def test_config_matches_tail_catcher_tz() -> None:
     assert config.tail_catcher.expected_mfe_atr_capture == Decimal("0.65")
     assert config.tail_catcher.control_stop_bps == Decimal("0.25")
     assert config.tail_catcher.control_stop_ticks_max == 80
+    assert config.tail_catcher.stop_confirmation_cycles == 1
     assert config.real_orders_enabled is False
     assert config.paper_trading_enabled is True
 

@@ -129,7 +129,7 @@ class TailCatcherConfig:
     control_stop_ticks_min: int = 10
     control_stop_ticks_max: int = 80
     control_time_exit_sec: int = 120
-    stop_confirmation_cycles: int = 2
+    stop_confirmation_cycles: int = 1
     protection_confirmation_cycles: int = 1
     trailing_confirmation_cycles: int = 2
     time_exit_spread_grace_cycles: int = 6
@@ -246,8 +246,8 @@ class NeoSwarmScalperConfig:
             raise ValueError("default trailing mode must be part of trailing_modes.")
         if self.tail_catcher.entry_confirmation_cycles < 2:
             raise ValueError("entry_confirmation_cycles must be at least 2.")
-        if self.tail_catcher.stop_confirmation_cycles < 2:
-            raise ValueError("stop_confirmation_cycles must be at least 2.")
+        if self.tail_catcher.stop_confirmation_cycles < 1:
+            raise ValueError("stop_confirmation_cycles must be positive.")
         if self.tail_catcher.protection_confirmation_cycles < 1:
             raise ValueError("protection_confirmation_cycles must be positive.")
         if not Decimal("0") < self.tail_catcher.pressure_confirmation_ratio <= Decimal("1"):
@@ -519,7 +519,7 @@ def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
             "tail_catcher.control_time_exit_sec",
         ),
         stop_confirmation_cycles=_int(
-            raw.get("stop_confirmation_cycles", 2),
+            raw.get("stop_confirmation_cycles", 1),
             "tail_catcher.stop_confirmation_cycles",
         ),
         protection_confirmation_cycles=_int(
