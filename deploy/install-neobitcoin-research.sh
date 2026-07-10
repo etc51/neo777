@@ -40,7 +40,7 @@ python3 -m venv "${stage}/.venv"
 "${stage}/.venv/bin/python" -m pip install --upgrade pip
 "${stage}/.venv/bin/python" -m pip install \
   --extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple \
-  "${stage}"
+  "${stage}[dev]"
 "${stage}/.venv/bin/python" -m pytest -q \
   "${stage}"/tests/test_neobitcoin_research_*.py
 
