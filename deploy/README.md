@@ -75,3 +75,26 @@ systemctl status neo-universal-swarm-dashboard.service
 
 Live trading remains blocked until a separate manual approval changes the
 architecture and configuration.
+
+## Neobitcoin directional-edge research
+
+`neobitcoin-research.service` is a separate read-only collector and shadow
+execution simulator. It has no order RPCs and does not import the existing
+resolver or swarm runtimes.
+
+Server paths:
+
+- code: `/opt/neobitcoin-research`;
+- token: `/etc/neobitcoin-research/tbank.token` (root-owned, never committed);
+- env: `/etc/neobitcoin-research/research.env`;
+- raw WAL, Parquet, DuckDB, SQLite and reports: `/var/lib/neobitcoin-research`.
+
+Install after securely placing the read-only token:
+
+```bash
+sudo bash deploy/install-neobitcoin-research.sh /home/codex/neo777
+systemctl status neobitcoin-research.service
+```
+
+The installer only manages `neobitcoin-research.service`; it does not stop or
+restart resolver, swarm, universal, production, or paper services.

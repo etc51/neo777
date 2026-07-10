@@ -10,6 +10,7 @@ configs/accounts.local.yaml
 dist/
 build/
 data/raw/
+data/neobitcoin_research*/
 data/cache/
 data/features/
 data/reports/

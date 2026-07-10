@@ -1,0 +1,16 @@
+mode: readonly_shadow_research
+instrument_query: Neo Bitcoin
+requested_orderbook_depth: 50
+minimum_usable_depth: 20
+snapshot_interval_seconds: 1
+position_sizes_rub: [10000, 50000, 100000]
+latencies_ms: [0, 100, 250, 500, 1000]
+horizons_seconds: [5, 30, 60, 180, 300, 900]
+execution_models:
+  - IDEAL_TOP_OF_BOOK
+  - AGGRESSIVE_SWEEP
+  - PASSIVE_OPTIMISTIC
+  - PASSIVE_BASE
+  - PASSIVE_PESSIMISTIC
+real_orders_enabled: false
+strategy_optimization_enabled: false
