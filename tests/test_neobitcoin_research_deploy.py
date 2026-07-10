@@ -34,7 +34,6 @@ def test_systemd_service_is_isolated_and_readonly() -> None:
 def test_installer_manages_only_the_new_service() -> None:
     installer = (ROOT / "deploy" / "install-neobitcoin-research.sh").read_text(encoding="utf-8")
     assert "SERVICE=neobitcoin-research.service" in installer
-    assert "systemctl stop" not in installer
     assert "neo-swarm" not in installer
     assert "neobitcoin-resolver.service" not in installer
     assert "mv -Tf" in installer

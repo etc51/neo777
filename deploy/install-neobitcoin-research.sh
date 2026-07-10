@@ -48,6 +48,7 @@ release="${RELEASES_DIR}/$(date -u +%Y%m%dT%H%M%SZ)"
 mv "${stage}" "${release}"
 trap - EXIT
 chown -R root:root "${release}"
+chmod 0755 "${release}"
 chown -R "${USER_NAME}:${USER_NAME}" "${DATA_DIR}" "${LOG_DIR}"
 
 if [[ ! -f "${CONFIG_DIR}/research.env" ]]; then
@@ -71,18 +72,24 @@ fi
 ln -s "${release}" "${TARGET_DIR}.new"
 mv -Tf "${TARGET_DIR}.new" "${TARGET_DIR}"
 
-if ! systemctl restart "${SERVICE}" || ! systemctl is-active --quiet "${SERVICE}"; then
+deployment_ok=true
+systemctl restart "${SERVICE}" || deployment_ok=false
+sleep 8
+systemctl is-active --quiet "${SERVICE}" || deployment_ok=false
+test -f "${DATA_DIR}/state.sqlite" || deployment_ok=false
+
+if [[ "${deployment_ok}" != true ]]; then
   if [[ -n "${previous_target}" ]]; then
     ln -s "${previous_target}" "${TARGET_DIR}.rollback"
     mv -Tf "${TARGET_DIR}.rollback" "${TARGET_DIR}"
     systemctl restart "${SERVICE}" || true
+  else
+    systemctl stop "${SERVICE}" || true
+    rm -f "${TARGET_DIR}"
   fi
   echo "deployment failed; previous release restored" >&2
   exit 30
 fi
 
-sleep 8
-systemctl is-active --quiet "${SERVICE}"
-test -f "${DATA_DIR}/state.sqlite"
 echo "${SERVICE}=active"
 echo "release=${release}"
