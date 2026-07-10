@@ -1,5 +1,5 @@
 [Unit]
-Description=neo_swarm_scalper NEOBITOK/NEOEFIR dashboard
+Description=neo_swarm_scalper NEOBITOK dashboard
 After=network-online.target neo-swarm-bot.service
 Wants=network-online.target
 StartLimitIntervalSec=0

@@ -1,5 +1,5 @@
 [Unit]
-Description=neo_swarm_scalper NEOBITOK/NEOEFIR tail-catcher paper bot
+Description=neo_swarm_scalper NEOBITOK tail-catcher paper bot
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0

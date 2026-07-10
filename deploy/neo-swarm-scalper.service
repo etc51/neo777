@@ -1,5 +1,5 @@
 [Unit]
-Description=neo_swarm_scalper NEOBITOK/NEOEFIR tail-catcher paper daemon
+Description=neo_swarm_scalper NEOBITOK tail-catcher paper daemon
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
