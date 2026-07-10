@@ -9,15 +9,14 @@ from uuid import uuid4
 from neo_swarm_scalper.config import NeoSwarmScalperConfig
 from neo_swarm_scalper.types import BotAction, BotDecision, BotParams, FeatureSnapshot, PositionSide
 
-ACTIVE_BOT_IDS = ("tail_neobitcoin", "tail_neoether")
+ACTIVE_BOT_IDS = ("tail_neobitcoin",)
 
 
 def build_default_bots(config: NeoSwarmScalperConfig) -> list[BotParams]:
     """Create one paper account heartbeat per enabled neoasset."""
 
     return [
-        _bot("tail_neobitcoin", "paper_neobitcoin", ("neobitcoin",), Decimal("0.50")),
-        _bot("tail_neoether", "paper_neoether", ("neoether",), Decimal("0.50")),
+        _bot("tail_neobitcoin", "paper_neobitcoin", ("neobitcoin",), Decimal("1.00")),
     ]
 
 

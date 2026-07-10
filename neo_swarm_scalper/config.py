@@ -205,23 +205,22 @@ class NeoSwarmScalperConfig:
         if self.token_env != "TBANK_TOKEN":
             raise ValueError("token_env must be TBANK_TOKEN.")
         enabled_names = {item.name for item in self.enabled_instruments}
-        if enabled_names != {"neobitcoin", "neoether"}:
-            raise ValueError("neo_swarm_scalper must run only neobitcoin and neoether.")
+        if enabled_names != {"neobitcoin"}:
+            raise ValueError("neo_swarm_scalper must run only neobitcoin.")
         allowed_tickers = {
             "neobitcoin": {"AUTO_DISCOVER", "BTCUSDperpA"},
-            "neoether": {"AUTO_DISCOVER", "ETHUSDperpA"},
         }
         for item in self.enabled_instruments:
             if item.ticker not in allowed_tickers[item.name]:
                 raise ValueError(f"{item.name} must use its T-Bank neoasset ticker only.")
-        if self.simulation.virtual_accounts_count != 2:
-            raise ValueError("virtual_accounts_count must be 2.")
+        if self.simulation.virtual_accounts_count != 1:
+            raise ValueError("virtual_accounts_count must be 1.")
         if self.simulation.total_capital != Decimal("500000"):
             raise ValueError("total_capital must be 500000.")
         if self.simulation.working_capital != Decimal("500000"):
             raise ValueError("working_capital must be 500000.")
-        if self.simulation.initial_cash_per_account != Decimal("250000"):
-            raise ValueError("each instrument paper account must reference 250000 equity.")
+        if self.simulation.initial_cash_per_account != Decimal("500000"):
+            raise ValueError("the neobitcoin paper account must reference 500000 equity.")
         if self.simulation.paper_leverage != Decimal("3"):
             raise ValueError("paper leverage must be x3.")
         if self.simulation.leg_notional != Decimal("750000"):

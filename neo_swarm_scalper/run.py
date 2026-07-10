@@ -1,4 +1,4 @@
-"""Runtime loop for the NEOBITOK/NEOEFIR paper tail-catcher."""
+"""Runtime loop for the NEOBITOK paper tail-catcher."""
 
 from __future__ import annotations
 

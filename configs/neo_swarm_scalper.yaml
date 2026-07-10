@@ -10,12 +10,6 @@ instruments:
     figi: AUTO_DISCOVER
     class_code: AUTO_DISCOVER
     enabled: true
-  - name: neoether
-    display_name: Neoether
-    ticker: AUTO_DISCOVER
-    figi: AUTO_DISCOVER
-    class_code: AUTO_DISCOVER
-    enabled: true
 
 data:
   use_real_market_data: true
@@ -29,11 +23,11 @@ data:
   stale_data_sec: 10
 
 simulation:
-  virtual_accounts_count: 2
+  virtual_accounts_count: 1
   total_capital: 500000
   reserve_cash: 0
   working_capital: 500000
-  initial_cash_per_account: 250000
+  initial_cash_per_account: 500000
   paper_leverage: 3
   leg_notional: 750000
   base_lot: 1
@@ -77,7 +71,7 @@ scalping:
   stop_loss_ticks_max: 10
   time_stop_sec_min: 120
   time_stop_sec_max: 120
-  spread_max_ticks: 3
+  spread_max_ticks: 100
   min_impulse_ticks: 3
 
 tail_catcher:
@@ -107,7 +101,7 @@ tail_catcher:
   max_reentries_per_direction_per_instrument: 2
   max_consecutive_stops: 3
   cooldown_after_bad_series_sec: 300
-  spread_max_ticks: 3
+  spread_max_ticks: 100
   spread_hard_bps: 12
   min_pressure_score: 0.12
   min_depth_top5: 10

@@ -76,7 +76,9 @@ def test_env_not_committed_and_safety_flags() -> None:
 
 def test_config_matches_tail_catcher_tz() -> None:
     config = load_config()
-    assert {item.name for item in config.enabled_instruments} == {"neobitcoin", "neoether"}
+    assert {item.name for item in config.enabled_instruments} == {"neobitcoin"}
+    assert config.scalping.spread_max_ticks == Decimal("100")
+    assert config.tail_catcher.spread_max_ticks == Decimal("100")
     assert config.tail_catcher.stop_ticks == (10, 20, 40, 80, 160, 320)
     assert config.tail_catcher.default_protection_trigger_bps == Decimal("2")
     assert config.real_orders_enabled is False
@@ -86,8 +88,9 @@ def test_config_matches_tail_catcher_tz() -> None:
 def test_component_accounts_created() -> None:
     bots = build_default_bots(load_config())
     assert tuple(bot.bot_id for bot in bots) == ACTIVE_BOT_IDS
-    assert len(bots) == 2
-    assert {bot.allowed_instruments[0] for bot in bots} == {"neobitcoin", "neoether"}
+    assert len(bots) == 1
+    assert bots[0].allowed_instruments == ("neobitcoin",)
+    assert bots[0].weight == Decimal("1.00")
 
 
 def test_runtime_writes_required_tables(smoke_storage: SQLiteJournal) -> None:
@@ -113,7 +116,7 @@ def test_runtime_writes_required_tables(smoke_storage: SQLiteJournal) -> None:
     instruments = {
         row["name"] for row in smoke_storage.fetch_all("SELECT name FROM instruments ORDER BY name")
     }
-    assert instruments == {"neobitcoin", "neoether"}
+    assert instruments == {"neobitcoin"}
 
 
 def test_shadow_stop_matrix(smoke_storage: SQLiteJournal) -> None:

@@ -27,8 +27,8 @@ class GraceWideSpreadProvider(MockNeoMarketDataProvider):
             ask = mid + tick
         elif count in {5, 6}:
             mid = base - (tick * Decimal(6 if count == 5 else 8))
-            bid = mid - (tick * Decimal("5"))
-            ask = mid + (tick * Decimal("5"))
+            bid = mid - (tick * Decimal("70"))
+            ask = mid + (tick * Decimal("70"))
         else:
             bid = base - (tick * Decimal("9"))
             ask = base - (tick * Decimal("7"))
@@ -72,8 +72,8 @@ class SymmetricSpreadExpansionProvider(MockNeoMarketDataProvider):
             bid = mid - tick
             ask = mid + tick
         else:
-            bid = mid - (tick * Decimal("20"))
-            ask = mid + (tick * Decimal("20"))
+            bid = mid - (tick * Decimal("70"))
+            ask = mid + (tick * Decimal("70"))
         return _book(instrument_id, depth, bid, ask)
 
     def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
