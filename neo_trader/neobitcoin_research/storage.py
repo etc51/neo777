@@ -412,7 +412,10 @@ class ResearchStorage:
         event_id: str | None = None,
         recorded_at: datetime | str | None = None,
     ) -> DerivedAppendResult:
-        """Durably append one derived record to SQLite before Parquet export."""
+        """Write derived data directly to immutable ZSTD Parquet.
+
+        SQLite retains only a compact deduplication key and file location.
+        """
 
         normalized_dataset = _dataset_name(dataset)
         normalized_record = _json_compatible(dict(record))
@@ -429,7 +432,8 @@ class ResearchStorage:
             self.derived_parquet_root
             / normalized_dataset
             / f"date={timestamp.date().isoformat()}"
-            / f"hour={timestamp.strftime('%H')}.parquet"
+            / f"hour={timestamp.strftime('%H')}"
+            / f"part-{uuid4().hex}.parquet"
         )
 
         with self._lock:
@@ -451,12 +455,19 @@ class ResearchStorage:
                         parquet_path=Path(existing["parquet_path"]),
                     )
 
+                self._write_derived_part(
+                    target,
+                    dataset=normalized_dataset,
+                    event_id=normalized_event_id,
+                    recorded_at=timestamp,
+                    record=normalized_record,
+                )
                 self._connection.execute(
                     """
                     INSERT INTO derived_event_index(
                         dataset, event_id, recorded_at, parquet_path,
                         stored_at, record_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         normalized_dataset,
@@ -464,7 +475,6 @@ class ResearchStorage:
                         timestamp.isoformat(),
                         str(target),
                         _utc_now().isoformat(),
-                        _json_text(normalized_record),
                     ),
                 )
                 self._connection.commit()
@@ -485,7 +495,9 @@ class ResearchStorage:
         dataset: str,
         records: Iterable[JsonMapping],
     ) -> tuple[DerivedAppendResult, ...]:
-        """Append several records in one durable SQLite transaction."""
+        """Append several records without retaining payload JSON in SQLite."""
+
+        return tuple(self.append_derived(dataset, record) for record in records)
 
         normalized_dataset = _dataset_name(dataset)
         prepared: list[tuple[str, datetime, dict[str, Any], Path]] = []
@@ -735,22 +747,24 @@ class ResearchStorage:
         dataset: str,
         partition_date: date | str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        """Iterate deserialized records from the durable SQLite append log."""
+        """Iterate derived records from authoritative immutable Parquet parts."""
 
         normalized_dataset = _dataset_name(dataset)
-        query = """
-            SELECT record_json FROM derived_event_index
-            WHERE dataset = ? AND record_json IS NOT NULL
-        """
+        query = "SELECT parquet_path FROM derived_event_index WHERE dataset = ?"
         parameters: list[object] = [normalized_dataset]
         if partition_date is not None:
             query += " AND substr(recorded_at, 1, 10) = ?"
             parameters.append(_partition_date(partition_date))
         query += " ORDER BY recorded_at, event_id"
+        pq = cast(Any, importlib.import_module("pyarrow.parquet"))
         for row in self._connection.execute(query, parameters):
-            loaded = json.loads(row["record_json"])
-            if isinstance(loaded, dict):
-                yield loaded
+            path = Path(row["parquet_path"])
+            if not path.is_file():
+                continue
+            for stored in pq.read_table(path).to_pylist():
+                loaded = json.loads(stored["record_json"])
+                if isinstance(loaded, dict):
+                    yield loaded
 
     def daily_control_metrics(self, partition_date: date | str) -> dict[str, Any]:
         """Return session/subscription/gap counts used by daily reporting."""
@@ -816,14 +830,16 @@ class ResearchStorage:
                 file_count=len(raw_files),
             )
             for dataset in DERIVED_DATASETS:
-                files = sorted((self.derived_parquet_root / dataset).glob("date=*/hour=*.parquet"))
+                files = sorted(
+                    (self.derived_parquet_root / dataset).glob("date=*/hour=*/*.parquet")
+                )
                 _create_duckdb_view(connection, dataset, files, raw=False)
                 self._upsert_catalog_row(
                     connection,
                     dataset=dataset,
                     kind="derived",
                     path_glob=str(
-                        self.derived_parquet_root / dataset / "date=*" / "hour=*.parquet"
+                        self.derived_parquet_root / dataset / "date=*" / "hour=*" / "*.parquet"
                     ),
                     file_count=len(files),
                 )
@@ -978,10 +994,13 @@ class ResearchStorage:
                 }
             ]
         )
-        pq.write_table(table, path, compression="zstd")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        pq.write_table(table, temporary, compression="zstd")
         if self.fsync:
-            with path.open("r+b") as stream:
+            with temporary.open("r+b") as stream:
                 os.fsync(stream.fileno())
+        os.replace(temporary, path)
 
     @staticmethod
     def _upsert_catalog_row(
