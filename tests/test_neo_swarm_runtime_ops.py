@@ -37,6 +37,9 @@ def test_runtime_units_use_persistent_state_and_health_timer() -> None:
     assert "/var/lib/neo-swarm-scalper/neo_swarm_scalper.sqlite" in dashboard_unit
     assert "neo-swarm-healthcheck.timer" in deploy_script
     assert "neo-swarm-backup.timer" in deploy_script
+    assert "disable --now neo-swarm-scalper.service neo-swarm-scalper-dashboard.service" in (
+        deploy_script
+    )
     assert "tr -d '\\r' | bash -s" in deploy_script
 
 

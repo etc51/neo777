@@ -70,6 +70,7 @@ set -euo pipefail
 sudo useradd --system --home "$RemoteDir" --shell /usr/sbin/nologin "$ServiceUser" 2>/dev/null || true
 sudo install -d -m 0755 "$RemoteDir" /etc/neo-trader /var/backups/neo-swarm-scalper
 sudo install -d -o "$ServiceUser" -g "$ServiceUser" -m 0700 "$DataDir" "$DataDir/reports"
+sudo systemctl disable --now neo-swarm-scalper.service neo-swarm-scalper-dashboard.service 2>/dev/null || true
 sudo systemctl stop neo-swarm-healthcheck.timer neo-swarm-backup.timer neo-swarm-dashboard.service neo-swarm-bot.service 2>/dev/null || true
 if [ -f "$RemoteDir/data/neo_swarm_scalper.sqlite" ] && [ ! -f "$DataDir/neo_swarm_scalper.sqlite" ]; then
   sudo cp -a "$RemoteDir/data/neo_swarm_scalper.sqlite" "$DataDir/neo_swarm_scalper.sqlite"
