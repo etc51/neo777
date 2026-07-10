@@ -68,10 +68,6 @@ def evaluate_entry_candidate(
         reasons.append("pressure_not_persistent")
     if candidate.expected_mfe_ticks < required_mfe:
         reasons.append("edge_below_execution_cost")
-    if candidate.expected_stop_risk_ticks > (
-        candidate.expected_mfe_ticks * config.max_stop_to_mfe_ratio
-    ):
-        reasons.append("stop_risk_too_high")
     return EntryPolicyDecision(
         allowed=not reasons,
         reasons=tuple(reasons),
@@ -102,13 +98,13 @@ def adaptive_control_stop_ticks(
     if tick <= 0:
         return config.control_stop_ticks_max
     bps_ticks = (trigger_entry_price * config.control_stop_bps) / (Decimal("10000") * tick)
-    volatility_ticks = max(atr_range / tick, Decimal("0")) * Decimal("0.25")
-    cost_floor = execution_cost_ticks * Decimal("3")
+    volatility_ticks = (
+        max(atr_range / tick, Decimal("0")) * config.control_stop_atr_fraction
+    )
     raw = max(
         Decimal(config.control_stop_ticks_min),
         bps_ticks,
         volatility_ticks,
-        cost_floor,
     )
     bounded = min(raw, Decimal(config.control_stop_ticks_max))
     return int(bounded.to_integral_value(rounding=ROUND_CEILING))

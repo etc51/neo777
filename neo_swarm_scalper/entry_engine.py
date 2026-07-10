@@ -59,8 +59,20 @@ class EntryTypeEngine:
     researched offline in ``entry_research.py`` and are intentionally not imported here.
     """
 
-    def __init__(self, *, min_direction_score: Decimal = Decimal("0.45")) -> None:
+    def __init__(
+        self,
+        *,
+        min_direction_score: Decimal = Decimal("0.45"),
+        expected_mfe_atr_capture: Decimal = Decimal("0.65"),
+        stop_atr_fraction: Decimal = Decimal("0.10"),
+        stop_ticks_min: int = 10,
+        stop_ticks_max: int = 80,
+    ) -> None:
         self.min_direction_score = min_direction_score
+        self.expected_mfe_atr_capture = expected_mfe_atr_capture
+        self.stop_atr_fraction = stop_atr_fraction
+        self.stop_ticks_min = stop_ticks_min
+        self.stop_ticks_max = stop_ticks_max
 
     def select(
         self,
@@ -450,14 +462,19 @@ class EntryTypeEngine:
             "lead_lag_confirmed": Decimal("2"),
         }.get(entry_type, Decimal("2"))
         expected_mfe_ticks = _clamp(
-            type_prior + (score * Decimal("5")) + (tick_velocity * Decimal("0.10")),
+            max(
+                type_prior + (score * Decimal("5")) + (tick_velocity * Decimal("0.10")),
+                abs(_dec(volatility.get("atr_range_ticks")))
+                * score
+                * self.expected_mfe_atr_capture,
+            ),
             Decimal("3"),
-            Decimal("15"),
+            Decimal("1200"),
         )
         expected_stop_risk_ticks = _clamp(
-            Decimal("8") - (score * Decimal("5")),
-            Decimal("2"),
-            Decimal("10"),
+            abs(_dec(volatility.get("atr_range_ticks"))) * self.stop_atr_fraction,
+            Decimal(self.stop_ticks_min),
+            Decimal(self.stop_ticks_max),
         )
         return EntryCandidate(
             entry_type=entry_type,

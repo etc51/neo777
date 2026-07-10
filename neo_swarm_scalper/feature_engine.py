@@ -62,10 +62,9 @@ class NeoFeatureEngine:
         realized_300 = _realized_volatility(state.history, 300)
         micro_atr_1m = _micro_atr(state.history, 60)
         micro_atr_5m = _micro_atr(state.history, 300)
-        volatility_regime = _volatility_regime(realized_60, tick_size)
+        volatility_regime = _volatility_regime(realized_60)
         market_regime = _market_regime(
             impulse_ticks=impulse_ticks,
-            spread_ticks=spread_ticks,
             volatility_regime=volatility_regime,
             imbalance=snapshot.imbalance(3),
         )
@@ -204,13 +203,12 @@ def _micro_atr(history: Iterable[MarketSnapshot], seconds: int) -> Decimal:
     return sum(moves, Decimal("0")) / Decimal(len(moves))
 
 
-def _volatility_regime(realized: Decimal, tick: Decimal) -> str:
-    scaled = realized / tick if tick else realized
-    if scaled <= Decimal("0.00001"):
+def _volatility_regime(realized: Decimal) -> str:
+    if realized <= Decimal("0.00001"):
         return "dead"
-    if scaled <= Decimal("0.0001"):
+    if realized <= Decimal("0.0001"):
         return "normal"
-    if scaled <= Decimal("0.001"):
+    if realized <= Decimal("0.001"):
         return "fast"
     return "chaotic"
 
@@ -218,11 +216,10 @@ def _volatility_regime(realized: Decimal, tick: Decimal) -> str:
 def _market_regime(
     *,
     impulse_ticks: Decimal,
-    spread_ticks: Decimal | None,
     volatility_regime: str,
     imbalance: Decimal,
 ) -> str:
-    if volatility_regime == "chaotic" or (spread_ticks is not None and spread_ticks > 8):
+    if volatility_regime == "chaotic":
         return "chaotic"
     if abs(impulse_ticks) < Decimal("0.1"):
         return "dead" if volatility_regime == "dead" else "range"

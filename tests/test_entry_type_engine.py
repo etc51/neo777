@@ -35,6 +35,23 @@ def test_impulse_continuation_long_short() -> None:
     assert ("impulse_continuation", PositionSide.SHORT) in short
 
 
+def test_bitcoin_candidate_scales_mfe_and_stop_to_observed_range() -> None:
+    candidates = EntryTypeEngine().score_candidates(
+        snapshot=_snapshot(Decimal("100")),
+        micro=_micro(pressure="0.35", micro_dev="1.2"),
+        volatility=_vol(
+            tick_velocity="3",
+            range_position="0.90",
+            breakout=True,
+            atr_range_ticks="200",
+        ),
+        price_history=_history("99.95", "100.00"),
+    )
+    impulse = next(item for item in candidates if item.entry_type == "impulse_continuation")
+    assert impulse.expected_mfe_ticks > Decimal("90")
+    assert impulse.expected_stop_risk_ticks == Decimal("20")
+
+
 def test_pullback_continuation_long_short() -> None:
     engine = EntryTypeEngine()
     long = _types(
@@ -286,6 +303,7 @@ def _vol(
     acceleration: str = "0",
     range_position: str = "0.5",
     breakout: bool = False,
+    atr_range_ticks: str = "0",
 ) -> dict[str, object]:
     return {
         "tick_velocity": Decimal(tick_velocity),
@@ -296,6 +314,7 @@ def _vol(
         "impulse_score": abs(Decimal(tick_velocity)),
         "chop_score": Decimal("0.4"),
         "volatility_regime": "normal",
+        "atr_range_ticks": Decimal(atr_range_ticks),
     }
 
 

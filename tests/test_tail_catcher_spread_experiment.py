@@ -232,7 +232,7 @@ def test_protection_floor_has_its_own_exit_reason(tmp_path: Path) -> None:
         """
         SELECT exit_reason, protected_exit_reason, exit_price, entry_price
         FROM shadow_trades
-        WHERE is_control = 1
+        WHERE is_control = 1 AND status = 'CLOSED'
         """
     )
     assert controls

@@ -81,6 +81,9 @@ def test_config_matches_tail_catcher_tz() -> None:
     assert config.tail_catcher.spread_max_ticks == Decimal("100")
     assert config.tail_catcher.stop_ticks == (10, 20, 40, 80, 160, 320)
     assert config.tail_catcher.default_protection_trigger_bps == Decimal("2")
+    assert config.tail_catcher.expected_mfe_atr_capture == Decimal("0.65")
+    assert config.tail_catcher.control_stop_bps == Decimal("0.25")
+    assert config.tail_catcher.control_stop_ticks_max == 80
     assert config.real_orders_enabled is False
     assert config.paper_trading_enabled is True
 

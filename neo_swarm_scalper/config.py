@@ -123,9 +123,11 @@ class TailCatcherConfig:
     min_signed_velocity: Decimal = Decimal("0.02")
     min_edge_to_cost_ratio: Decimal = Decimal("1.25")
     max_stop_to_mfe_ratio: Decimal = Decimal("0.85")
-    control_stop_bps: Decimal = Decimal("5")
+    expected_mfe_atr_capture: Decimal = Decimal("0.65")
+    control_stop_atr_fraction: Decimal = Decimal("0.10")
+    control_stop_bps: Decimal = Decimal("0.25")
     control_stop_ticks_min: int = 10
-    control_stop_ticks_max: int = 600
+    control_stop_ticks_max: int = 80
     control_time_exit_sec: int = 120
     stop_confirmation_cycles: int = 2
     protection_confirmation_cycles: int = 1
@@ -252,6 +254,10 @@ class NeoSwarmScalperConfig:
             raise ValueError("pressure_confirmation_ratio must be in (0, 1].")
         if self.tail_catcher.control_stop_ticks_min > self.tail_catcher.control_stop_ticks_max:
             raise ValueError("control stop tick bounds are inverted.")
+        if not Decimal("0") < self.tail_catcher.expected_mfe_atr_capture <= Decimal("1"):
+            raise ValueError("expected_mfe_atr_capture must be in (0, 1].")
+        if not Decimal("0") < self.tail_catcher.control_stop_atr_fraction <= Decimal("1"):
+            raise ValueError("control_stop_atr_fraction must be in (0, 1].")
 
     @property
     def enabled_instruments(self) -> tuple[InstrumentConfig, ...]:
@@ -488,8 +494,16 @@ def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
             raw.get("max_stop_to_mfe_ratio", "0.85"),
             "tail_catcher.max_stop_to_mfe_ratio",
         ),
+        expected_mfe_atr_capture=_decimal(
+            raw.get("expected_mfe_atr_capture", "0.65"),
+            "tail_catcher.expected_mfe_atr_capture",
+        ),
+        control_stop_atr_fraction=_decimal(
+            raw.get("control_stop_atr_fraction", "0.10"),
+            "tail_catcher.control_stop_atr_fraction",
+        ),
         control_stop_bps=_decimal(
-            raw.get("control_stop_bps", "5"),
+            raw.get("control_stop_bps", "0.25"),
             "tail_catcher.control_stop_bps",
         ),
         control_stop_ticks_min=_int(
@@ -497,7 +511,7 @@ def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
             "tail_catcher.control_stop_ticks_min",
         ),
         control_stop_ticks_max=_int(
-            raw.get("control_stop_ticks_max", 600),
+            raw.get("control_stop_ticks_max", 80),
             "tail_catcher.control_stop_ticks_max",
         ),
         control_time_exit_sec=_int(

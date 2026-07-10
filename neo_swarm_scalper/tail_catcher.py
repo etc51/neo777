@@ -108,7 +108,7 @@ class _ShadowTrade:
 
 
 class TailCatcherEngine:
-    """Runs the NEOBITOK/NEOEFIR shadow strategy on each market-data cycle."""
+    """Runs the NEOBITOK shadow strategy on each market-data cycle."""
 
     def __init__(self, config: NeoSwarmScalperConfig, storage: SQLiteJournal) -> None:
         self.config = config
@@ -116,7 +116,11 @@ class TailCatcherEngine:
         self._states: dict[str, _InstrumentState] = {}
         self._open_trades: dict[str, _ShadowTrade] = {}
         self._entry_engine = EntryTypeEngine(
-            min_direction_score=config.tail_catcher.control_min_direction_score
+            min_direction_score=config.tail_catcher.control_min_direction_score,
+            expected_mfe_atr_capture=config.tail_catcher.expected_mfe_atr_capture,
+            stop_atr_fraction=config.tail_catcher.control_stop_atr_fraction,
+            stop_ticks_min=config.tail_catcher.control_stop_ticks_min,
+            stop_ticks_max=config.tail_catcher.control_stop_ticks_max,
         )
         self._latest_contexts: dict[str, dict[str, Any]] = {}
         self._load_open_trades()
@@ -516,6 +520,7 @@ class TailCatcherEngine:
             "realized_volatility_5m": rv["5m"],
             "realized_volatility_15m": rv["15m"],
             "atr_range": atr_range,
+            "atr_range_ticks": atr_range / tick if tick else Decimal("0"),
             "tick_velocity": tick_velocity,
             "price_velocity": price_velocity,
             "acceleration": acceleration,

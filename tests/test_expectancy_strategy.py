@@ -51,6 +51,20 @@ def test_entry_policy_rejects_conflicting_or_transient_pressure() -> None:
     assert "pressure_not_persistent" in decision.reasons
 
 
+def test_short_stop_experiment_is_not_blocked_by_uncalibrated_risk_prior() -> None:
+    config = load_config().tail_catcher
+    decision = evaluate_entry_candidate(
+        candidate=_candidate(expected_mfe_ticks="8", expected_stop_risk_ticks="10"),
+        opposite_score=Decimal("0.20"),
+        pressure_history=(Decimal("0.3"),) * 3,
+        tick_velocity=Decimal("1"),
+        spread_ticks=Decimal("2"),
+        slippage_ticks=Decimal("1"),
+        config=config,
+    )
+    assert decision.allowed is True
+
+
 def test_adaptive_stop_covers_execution_cost() -> None:
     stop_ticks = adaptive_control_stop_ticks(
         trigger_entry_price=Decimal("100"),
@@ -59,7 +73,18 @@ def test_adaptive_stop_covers_execution_cost() -> None:
         execution_cost_ticks=Decimal("4"),
         config=load_config().tail_catcher,
     )
-    assert stop_ticks == 12
+    assert stop_ticks == 10
+
+
+def test_adaptive_stop_is_not_widened_by_bitcoin_spread_cost() -> None:
+    stop_ticks = adaptive_control_stop_ticks(
+        trigger_entry_price=Decimal("64000"),
+        tick=Decimal("0.1"),
+        atr_range=Decimal("20"),
+        execution_cost_ticks=Decimal("70"),
+        config=load_config().tail_catcher,
+    )
+    assert stop_ticks == 20
 
 
 def test_promotion_requires_forward_sample_and_positive_confidence_bound() -> None:
