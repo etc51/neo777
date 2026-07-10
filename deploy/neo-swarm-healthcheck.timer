@@ -1,0 +1,12 @@
+[Unit]
+Description=Check neo_swarm_scalper paper heartbeat every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=neo-swarm-healthcheck.service
+
+[Install]
+WantedBy=timers.target

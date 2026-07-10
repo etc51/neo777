@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart neo_swarm_scalper after failed heartbeat check
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart neo-swarm-bot.service

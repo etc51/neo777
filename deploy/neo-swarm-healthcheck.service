@@ -1,0 +1,12 @@
+[Unit]
+Description=Validate neo_swarm_scalper paper heartbeat
+After=neo-swarm-bot.service
+OnFailure=neo-swarm-recover.service
+
+[Service]
+Type=oneshot
+User=neo-trader
+Group=neo-trader
+ExecStart=/opt/neo_trader/.venv/bin/python /opt/neo_trader/scripts/check_neo_swarm_scalper_health.py --db /var/lib/neo-swarm-scalper/neo_swarm_scalper.sqlite --max-age-seconds 90
+NoNewPrivileges=true
+PrivateTmp=true
