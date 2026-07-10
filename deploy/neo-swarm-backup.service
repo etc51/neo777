@@ -1,0 +1,13 @@
+[Unit]
+Description=Back up neo_swarm_scalper SQLite state
+After=neo-swarm-bot.service
+
+[Service]
+Type=oneshot
+User=neo-trader
+Group=neo-trader
+StateDirectory=neo-swarm-scalper
+UMask=0077
+ExecStart=/opt/neo_trader/.venv/bin/python /opt/neo_trader/scripts/backup_neo_swarm_scalper.py --db /var/lib/neo-swarm-scalper/neo_swarm_scalper.sqlite --backup-dir /var/lib/neo-swarm-scalper/backups --keep 28
+NoNewPrivileges=true
+PrivateTmp=true

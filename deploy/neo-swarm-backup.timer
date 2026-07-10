@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up neo_swarm_scalper every six hours
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 00,06,12,18:15:00
+Persistent=true
+Unit=neo-swarm-backup.service
+
+[Install]
+WantedBy=timers.target

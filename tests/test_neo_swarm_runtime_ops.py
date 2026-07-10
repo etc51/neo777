@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.backup_neo_swarm_scalper import create_backup
 from scripts.check_neo_swarm_scalper_health import HealthCheckError, check_health
 
 
@@ -35,6 +36,7 @@ def test_runtime_units_use_persistent_state_and_health_timer() -> None:
     assert "/var/lib/neo-swarm-scalper/neo_swarm_scalper.sqlite" in bot_unit
     assert "/var/lib/neo-swarm-scalper/neo_swarm_scalper.sqlite" in dashboard_unit
     assert "neo-swarm-healthcheck.timer" in deploy_script
+    assert "neo-swarm-backup.timer" in deploy_script
     assert "tr -d '\\r' | bash -s" in deploy_script
 
 
@@ -43,6 +45,34 @@ def test_resolver_installer_never_moves_shared_source_tree() -> None:
     installer = (root / "deploy" / "install-neobitcoin-resolver-v2.sh").read_text(encoding="utf-8")
     assert 'mv "${SOURCE_ROOT}"' not in installer
     assert 'mv "${STAGE_ROOT}" "${TARGET_ROOT}"' in installer
+
+
+def test_sqlite_backup_is_consistent_and_rotated(tmp_path: Path) -> None:
+    db = _health_db(tmp_path, datetime(2026, 7, 10, 16, 30, tzinfo=UTC))
+    backup_dir = tmp_path / "backups"
+    first = create_backup(
+        db,
+        backup_dir,
+        keep=2,
+        now=datetime(2026, 7, 10, 16, 31, tzinfo=UTC),
+    )
+    create_backup(
+        db,
+        backup_dir,
+        keep=2,
+        now=datetime(2026, 7, 10, 16, 32, tzinfo=UTC),
+    )
+    latest = create_backup(
+        db,
+        backup_dir,
+        keep=2,
+        now=datetime(2026, 7, 10, 16, 33, tzinfo=UTC),
+    )
+    assert not first.exists()
+    assert latest.is_file()
+    assert len(list(backup_dir.glob("*.sqlite"))) == 2
+    with sqlite3.connect(latest) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
 
 
 def _health_db(tmp_path: Path, heartbeat: datetime) -> Path:

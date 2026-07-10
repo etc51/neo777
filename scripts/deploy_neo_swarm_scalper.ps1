@@ -49,6 +49,10 @@ if ($SshKey) {
 }
 
 $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+$revision = (& git rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to resolve deployment revision"
+}
 $archive = Join-Path $env:TEMP "neo_swarm_scalper_$timestamp.tar"
 
 Invoke-Checked git archive "--format=tar" "--output=$archive" "HEAD"
@@ -66,7 +70,7 @@ set -euo pipefail
 sudo useradd --system --home "$RemoteDir" --shell /usr/sbin/nologin "$ServiceUser" 2>/dev/null || true
 sudo install -d -m 0755 "$RemoteDir" /etc/neo-trader /var/backups/neo-swarm-scalper
 sudo install -d -o "$ServiceUser" -g "$ServiceUser" -m 0700 "$DataDir" "$DataDir/reports"
-sudo systemctl stop neo-swarm-healthcheck.timer neo-swarm-dashboard.service neo-swarm-bot.service || true
+sudo systemctl stop neo-swarm-healthcheck.timer neo-swarm-backup.timer neo-swarm-dashboard.service neo-swarm-bot.service 2>/dev/null || true
 if [ -f "$RemoteDir/data/neo_swarm_scalper.sqlite" ] && [ ! -f "$DataDir/neo_swarm_scalper.sqlite" ]; then
   sudo cp -a "$RemoteDir/data/neo_swarm_scalper.sqlite" "$DataDir/neo_swarm_scalper.sqlite"
 fi
@@ -74,9 +78,10 @@ if [ -f "$DataDir/neo_swarm_scalper.sqlite" ]; then
   sudo cp -a "$DataDir/neo_swarm_scalper.sqlite" "/var/backups/neo-swarm-scalper/neo_swarm_scalper-$timestamp.sqlite"
 fi
 if [ -d "$RemoteDir/reports/neo_swarm_scalper" ]; then
-  sudo cp -an "$RemoteDir/reports/neo_swarm_scalper/." "$DataDir/reports/"
+  sudo cp -a --update=none "$RemoteDir/reports/neo_swarm_scalper/." "$DataDir/reports/"
 fi
 sudo tar -xf /tmp/neo_swarm_scalper_deploy.tar -C "$RemoteDir"
+echo "$revision" | sudo tee "$RemoteDir/REVISION" >/dev/null
 sudo python3 -m venv "$RemoteDir/.venv"
 sudo "$RemoteDir/.venv/bin/python" -m pip install -U pip
 sudo "$RemoteDir/.venv/bin/python" -m pip install -e "$RemoteDir[dashboard]"
@@ -92,7 +97,9 @@ sudo cp "$RemoteDir/deploy/neo-swarm-dashboard.service" /etc/systemd/system/neo-
 sudo cp "$RemoteDir/deploy/neo-swarm-healthcheck.service" /etc/systemd/system/neo-swarm-healthcheck.service
 sudo cp "$RemoteDir/deploy/neo-swarm-healthcheck.timer" /etc/systemd/system/neo-swarm-healthcheck.timer
 sudo cp "$RemoteDir/deploy/neo-swarm-recover.service" /etc/systemd/system/neo-swarm-recover.service
-sudo sed -i "s#/opt/neo_trader#$RemoteDir#g; s#/var/lib/neo-swarm-scalper#$DataDir#g; s#User=neo-trader#User=$ServiceUser#g; s#Group=neo-trader#Group=$ServiceUser#g" /etc/systemd/system/neo-swarm-bot.service /etc/systemd/system/neo-swarm-dashboard.service /etc/systemd/system/neo-swarm-healthcheck.service
+sudo cp "$RemoteDir/deploy/neo-swarm-backup.service" /etc/systemd/system/neo-swarm-backup.service
+sudo cp "$RemoteDir/deploy/neo-swarm-backup.timer" /etc/systemd/system/neo-swarm-backup.timer
+sudo sed -i "s#/opt/neo_trader#$RemoteDir#g; s#/var/lib/neo-swarm-scalper#$DataDir#g; s#User=neo-trader#User=$ServiceUser#g; s#Group=neo-trader#Group=$ServiceUser#g" /etc/systemd/system/neo-swarm-bot.service /etc/systemd/system/neo-swarm-dashboard.service /etc/systemd/system/neo-swarm-healthcheck.service /etc/systemd/system/neo-swarm-backup.service
 sudo sed -i "s#--server.port 8025#--server.port $DashboardPort#g" /etc/systemd/system/neo-swarm-dashboard.service
 sudo chown -R root:root "$RemoteDir"
 sudo chmod -R a+rX,go-w "$RemoteDir"
@@ -100,18 +107,22 @@ sudo chown -R "${ServiceUser}:${ServiceUser}" "$DataDir"
 sudo pkill -u "$ServiceUser" -f "neo_swarm_scalper/dashboard.py.*$DashboardPort" || true
 sudo systemctl daemon-reload
 sudo systemctl reset-failed neo-swarm-bot.service neo-swarm-dashboard.service || true
-sudo systemctl enable neo-swarm-bot.service neo-swarm-dashboard.service neo-swarm-healthcheck.timer
+sudo systemctl enable neo-swarm-bot.service neo-swarm-dashboard.service neo-swarm-healthcheck.timer neo-swarm-backup.timer
 sudo systemctl restart neo-swarm-bot.service
 sudo systemctl restart neo-swarm-dashboard.service
 sudo systemctl restart neo-swarm-healthcheck.timer
+sudo systemctl restart neo-swarm-backup.timer
 sleep 12
 sudo systemctl is-active --quiet neo-swarm-bot.service
 sudo systemctl is-active --quiet neo-swarm-dashboard.service
 sudo systemctl is-active --quiet neo-swarm-healthcheck.timer
+sudo systemctl is-active --quiet neo-swarm-backup.timer
 sudo systemctl start neo-swarm-healthcheck.service
+sudo systemctl start neo-swarm-backup.service
 sudo systemctl --no-pager --lines=20 status neo-swarm-bot.service || true
 sudo systemctl --no-pager --lines=20 status neo-swarm-dashboard.service || true
 sudo systemctl --no-pager --lines=10 status neo-swarm-healthcheck.timer || true
+sudo systemctl --no-pager --lines=10 status neo-swarm-backup.timer || true
 "@
 
 $remoteArgs = @()
