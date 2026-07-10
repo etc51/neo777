@@ -21,15 +21,17 @@ class GraceWideSpreadProvider(MockNeoMarketDataProvider):
         count = self._per_instrument_counter.get(instrument_id, 0) + 1
         self._per_instrument_counter[instrument_id] = count
         base, tick = _base_tick(instrument_id)
-        if count == 1:
-            bid = base - tick
-            ask = base + tick
-        elif count in {2, 3}:
-            bid = base + (tick * Decimal("3"))
-            ask = bid + (tick * Decimal("10"))
+        if count <= 4:
+            mid = base + (tick * Decimal((count - 1) * 2))
+            bid = mid - tick
+            ask = mid + tick
+        elif count in {5, 6}:
+            mid = base - (tick * Decimal(6 if count == 5 else 8))
+            bid = mid - (tick * Decimal("5"))
+            ask = mid + (tick * Decimal("5"))
         else:
-            bid = base - (tick * Decimal("4"))
-            ask = base - (tick * Decimal("2"))
+            bid = base - (tick * Decimal("9"))
+            ask = base - (tick * Decimal("7"))
         return _book(instrument_id, depth, bid, ask)
 
     def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
@@ -46,13 +48,51 @@ class StableTimeExitProvider(MockNeoMarketDataProvider):
         count = self._per_instrument_counter.get(instrument_id, 0) + 1
         self._per_instrument_counter[instrument_id] = count
         base, tick = _base_tick(instrument_id)
-        if count == 1:
-            bid = base - tick
-            ask = base + tick
-        else:
-            bid = base + (tick * Decimal("3"))
-            ask = base + (tick * Decimal("5"))
+        mid = base + (tick * Decimal(min(count - 1, 3) * 2))
+        bid = mid - tick
+        ask = mid + tick
         return _book(instrument_id, depth, bid, ask)
+
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        base, _ = _base_tick(instrument_id)
+        return [{"price": str(base), "quantity": "1", "side": "BUY"}]
+
+
+class SymmetricSpreadExpansionProvider(MockNeoMarketDataProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._per_instrument_counter: dict[str, int] = {}
+
+    def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
+        count = self._per_instrument_counter.get(instrument_id, 0) + 1
+        self._per_instrument_counter[instrument_id] = count
+        base, tick = _base_tick(instrument_id)
+        mid = base + (tick * Decimal(min(count - 1, 3) * 2))
+        if count <= 4:
+            bid = mid - tick
+            ask = mid + tick
+        else:
+            bid = mid - (tick * Decimal("20"))
+            ask = mid + (tick * Decimal("20"))
+        return _book(instrument_id, depth, bid, ask)
+
+    def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
+        base, _ = _base_tick(instrument_id)
+        return [{"price": str(base), "quantity": "1", "side": "BUY"}]
+
+
+class ProtectionFloorProvider(MockNeoMarketDataProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._per_instrument_counter: dict[str, int] = {}
+
+    def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
+        count = self._per_instrument_counter.get(instrument_id, 0) + 1
+        self._per_instrument_counter[instrument_id] = count
+        base, tick = _base_tick(instrument_id)
+        path_ticks = (0, 2, 4, 6, 12, 10, 10)
+        mid = base + (tick * Decimal(path_ticks[min(count - 1, len(path_ticks) - 1)]))
+        return _book(instrument_id, depth, mid - tick, mid + tick)
 
     def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
         base, _ = _base_tick(instrument_id)
@@ -64,11 +104,12 @@ def test_wide_spread_grace_logs_avoided_exit_without_uniform_spread_close(
 ) -> None:
     result = run_swarm(
         load_config(),
-        max_cycles=4,
+        max_cycles=7,
         poll_interval_sec=0,
         provider=GraceWideSpreadProvider(),
         db_path=tmp_path / "spread_grace.sqlite",
         reports_dir=tmp_path / "reports",
+        clock=_advancing_clock(datetime(2026, 7, 10, tzinfo=UTC)),
         sleep=lambda _: None,
     )
     storage = SQLiteJournal(result.db_path)
@@ -110,16 +151,20 @@ def test_stop_comparison_invalid_when_all_stop_ticks_share_one_exit_reason(
         [
             start,
             start,
-            start + timedelta(seconds=3700),
+            start + timedelta(seconds=1),
+            start + timedelta(seconds=2),
+            start + timedelta(seconds=3),
+            start + timedelta(seconds=4),
+            start + timedelta(seconds=130),
         ]
     )
 
     def clock() -> datetime:
-        return next(timestamps, start + timedelta(seconds=3700))
+        return next(timestamps, start + timedelta(seconds=131))
 
     result = run_swarm(
         load_config(),
-        max_cycles=2,
+        max_cycles=6,
         poll_interval_sec=0,
         provider=StableTimeExitProvider(),
         db_path=tmp_path / "time_exit.sqlite",
@@ -137,9 +182,62 @@ def test_stop_comparison_invalid_when_all_stop_ticks_share_one_exit_reason(
     assert payload["shadow_exit_summary"]["time_exits"] > 0
     assert payload["shadow_stop_comparison"]["status"] == "INVALID"
     assert (
-        payload["shadow_stop_comparison"]["reason"]
-        == "all stop_ticks closed with one exit_reason"
+        payload["shadow_stop_comparison"]["reason"] == "all stop_ticks closed with one exit_reason"
     )
+
+
+def test_symmetric_spread_expansion_does_not_trigger_stop_or_panic(tmp_path: Path) -> None:
+    result = run_swarm(
+        load_config(),
+        max_cycles=7,
+        poll_interval_sec=0,
+        provider=SymmetricSpreadExpansionProvider(),
+        db_path=tmp_path / "symmetric_spread.sqlite",
+        reports_dir=tmp_path / "reports",
+        clock=_advancing_clock(datetime(2026, 7, 10, tzinfo=UTC)),
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
+    closed = storage.fetch_all(
+        "SELECT COUNT(*) AS count FROM shadow_trades WHERE status = 'CLOSED'"
+    )[0]["count"]
+    stop_cycles = storage.fetch_all("SELECT MAX(stop_trigger_cycles) AS cycles FROM shadow_trades")[
+        0
+    ]["cycles"]
+    avoided = storage.fetch_all(
+        """
+        SELECT COUNT(*) AS count
+        FROM shadow_trade_events
+        WHERE event_type = 'avoided_spread_shock_exit'
+        """
+    )[0]["count"]
+    assert closed == 0
+    assert stop_cycles == 0
+    assert avoided > 0
+
+
+def test_protection_floor_has_its_own_exit_reason(tmp_path: Path) -> None:
+    result = run_swarm(
+        load_config(),
+        max_cycles=7,
+        poll_interval_sec=0,
+        provider=ProtectionFloorProvider(),
+        db_path=tmp_path / "protection.sqlite",
+        reports_dir=tmp_path / "reports",
+        clock=_advancing_clock(datetime(2026, 7, 10, tzinfo=UTC)),
+        sleep=lambda _: None,
+    )
+    storage = SQLiteJournal(result.db_path)
+    controls = storage.fetch_all(
+        """
+        SELECT exit_reason, protected_exit_reason, exit_price, entry_price
+        FROM shadow_trades
+        WHERE is_control = 1
+        """
+    )
+    assert controls
+    assert all(row["exit_reason"] == "protected_exit" for row in controls)
+    assert all(row["protected_exit_reason"] == "protection_floor" for row in controls)
 
 
 def _base_tick(instrument_id: str) -> tuple[Decimal, Decimal]:
@@ -168,3 +266,15 @@ def _book(
         ],
         "lastPrice": str(mid),
     }
+
+
+def _advancing_clock(start: datetime) -> Any:
+    current = start
+
+    def clock() -> datetime:
+        nonlocal current
+        value = current
+        current += timedelta(seconds=1)
+        return value
+
+    return clock

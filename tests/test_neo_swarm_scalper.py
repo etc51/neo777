@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,7 @@ def smoke_storage(tmp_path_factory: pytest.TempPathFactory) -> SQLiteJournal:
     tmp_path = tmp_path_factory.mktemp("neo_tail_catcher")
     result = run_swarm(
         load_config(),
-        max_cycles=4,
+        max_cycles=12,
         poll_interval_sec=0,
         provider=MockNeoMarketDataProvider(),
         db_path=tmp_path / "neo_swarm_scalper.sqlite",
@@ -77,8 +77,8 @@ def test_env_not_committed_and_safety_flags() -> None:
 def test_config_matches_tail_catcher_tz() -> None:
     config = load_config()
     assert {item.name for item in config.enabled_instruments} == {"neobitcoin", "neoether"}
-    assert config.tail_catcher.stop_ticks == (2, 3, 4, 5, 7, 10)
-    assert config.tail_catcher.default_protection_trigger_bps == Decimal("15")
+    assert config.tail_catcher.stop_ticks == (10, 20, 40, 80, 160, 320)
+    assert config.tail_catcher.default_protection_trigger_bps == Decimal("2")
     assert config.real_orders_enabled is False
     assert config.paper_trading_enabled is True
 
@@ -105,6 +105,7 @@ def test_runtime_writes_required_tables(smoke_storage: SQLiteJournal) -> None:
         "shadow_trade_events",
         "mfe_mae_tracking",
         "shadow_stop_experiments",
+        "market_opportunities",
         "system_health",
     )
     for table in required:
@@ -118,21 +119,34 @@ def test_runtime_writes_required_tables(smoke_storage: SQLiteJournal) -> None:
 def test_shadow_stop_matrix(smoke_storage: SQLiteJournal) -> None:
     stop_ticks = {
         row["stop_ticks"]
-        for row in smoke_storage.fetch_all("SELECT DISTINCT stop_ticks FROM shadow_trades")
+        for row in smoke_storage.fetch_all(
+            "SELECT DISTINCT stop_ticks FROM shadow_trades WHERE is_control = 0"
+        )
     }
     triggers = {
         Decimal(str(row["protection_trigger_bps"]))
         for row in smoke_storage.fetch_all(
-            "SELECT DISTINCT protection_trigger_bps FROM shadow_trades"
+            "SELECT DISTINCT protection_trigger_bps FROM shadow_trades WHERE is_control = 0"
         )
     }
     trailing = {
         row["trailing_mode"]
-        for row in smoke_storage.fetch_all("SELECT DISTINCT trailing_mode FROM shadow_trades")
+        for row in smoke_storage.fetch_all(
+            "SELECT DISTINCT trailing_mode FROM shadow_trades WHERE is_control = 0"
+        )
     }
-    assert stop_ticks == {2, 3, 4, 5, 7, 10}
-    assert triggers == {Decimal("10.0"), Decimal("15.0"), Decimal("20.0")}
-    assert trailing == {"tight", "normal", "loose", "microstructure_adaptive"}
+    opportunity_rows = smoke_storage.fetch_all(
+        """
+        SELECT opportunity_id, SUM(is_control) AS controls, COUNT(*) AS arms
+        FROM shadow_trades
+        GROUP BY opportunity_id
+        """
+    )
+    assert stop_ticks == {10, 20, 40, 80, 160, 320}
+    assert triggers == {Decimal("2.0")}
+    assert trailing == {"expectancy_adaptive"}
+    assert opportunity_rows
+    assert all(row["controls"] == 1 and row["arms"] == 7 for row in opportunity_rows)
 
 
 def test_paper_fill_uses_bid_ask(smoke_storage: SQLiteJournal) -> None:
@@ -161,37 +175,54 @@ def test_protection_and_trailing(smoke_storage: SQLiteJournal) -> None:
     assert trailing_count > 0
     rows = smoke_storage.fetch_all(
         """
-        SELECT side, entry_price, exit_price
-        FROM shadow_trades
-        WHERE exit_reason IN ('protected_exit', 'protected_panic_exit')
+        SELECT st.side, st.entry_price, st.exit_price, st.execution_shortfall_ticks,
+               ob.best_bid, ob.best_ask, i.tick_size
+        FROM shadow_trades st
+        JOIN orderbook_snapshots ob
+          ON ob.instrument = st.instrument AND ob.timestamp_utc = st.exit_time
+        JOIN instruments i ON i.name = st.instrument
+        WHERE st.protection_activated = 1 AND st.status = 'CLOSED'
         """
     )
+    assert rows
+    assert all(_paper_pnl(row) > 0 for row in rows)
+    assert all(Decimal(str(row["execution_shortfall_ticks"])) >= 0 for row in rows)
     for row in rows:
-        if row["side"] == "LONG":
-            assert Decimal(str(row["exit_price"])) >= Decimal(str(row["entry_price"]))
-        else:
-            assert Decimal(str(row["exit_price"])) <= Decimal(str(row["entry_price"]))
+        tick = Decimal(str(row["tick_size"]))
+        expected = (
+            Decimal(str(row["best_bid"])) - tick
+            if row["side"] == "LONG"
+            else Decimal(str(row["best_ask"])) + tick
+        )
+        assert Decimal(str(row["exit_price"])) == expected
 
 
-def test_reentry_after_stop(tmp_path: Path) -> None:
+def test_control_stop_updates_reentry_series_once(tmp_path: Path) -> None:
     result = run_swarm(
         load_config(),
-        max_cycles=2,
+        max_cycles=7,
         poll_interval_sec=0,
         provider=StopThenRecoverProvider(),
         db_path=tmp_path / "reentry.sqlite",
         reports_dir=tmp_path / "reports",
+        clock=_advancing_clock(),
         sleep=lambda _: None,
     )
     storage = SQLiteJournal(result.db_path)
-    max_reentry = storage.fetch_all("SELECT MAX(reentry_index) AS max_reentry FROM shadow_trades")[
-        0
-    ]["max_reentry"]
     stop_count = storage.fetch_all(
-        "SELECT COUNT(*) AS count FROM shadow_trades WHERE exit_reason = 'stop_loss'"
+        """
+        SELECT COUNT(*) AS count
+        FROM shadow_trades
+        WHERE exit_reason = 'stop_loss' AND is_control = 1
+        """
     )[0]["count"]
+    series = storage.fetch_all(
+        "SELECT entries_count, stops_count FROM reentry_series ORDER BY series_id"
+    )
     assert stop_count > 0
-    assert max_reentry > 0
+    assert series
+    assert all(row["entries_count"] == 1 for row in series)
+    assert all(row["stops_count"] == 1 for row in series)
 
 
 def test_dashboard_import(smoke_storage: SQLiteJournal) -> None:
@@ -215,7 +246,8 @@ def test_report_created(smoke_storage: SQLiteJournal, tmp_path: Path) -> None:
     assert path.exists()
     assert "real orders disabled: True" in text
     assert "token masked: True" in text
-    assert "stop ticks: 2, 3, 4, 5, 7, 10" in text
+    assert "stop ticks: 10, 20, 40, 80, 160, 320" in text
+    assert "Control Expectancy" in text
     assert "raw_orderbook_snapshots" in text
     assert "shadow_trades" in text
 
@@ -231,7 +263,8 @@ class StopThenRecoverProvider(MockNeoMarketDataProvider):
         is_btc = "4eff" in instrument_id or "BTC" in instrument_id.upper()
         base = Decimal("1000") if is_btc else Decimal("100")
         tick = Decimal("0.1") if is_btc else Decimal("0.01")
-        mid = base if count == 1 else base - (tick * Decimal("12"))
+        path_ticks = (0, 2, 4, 6, -8, -18, -24, -20, -10, 0, 4, 8, 12, 16, 20)
+        mid = base + (tick * Decimal(path_ticks[min(count - 1, len(path_ticks) - 1)]))
         bid = mid - tick
         ask = mid + tick
         return {
@@ -251,3 +284,21 @@ class StopThenRecoverProvider(MockNeoMarketDataProvider):
     def get_recent_trades(self, instrument_id: str) -> Sequence[Mapping[str, Any]]:
         del instrument_id
         return [{"price": "100", "quantity": "1", "side": "BUY"}]
+
+
+def _advancing_clock() -> Any:
+    current = datetime(2026, 7, 10, tzinfo=UTC)
+
+    def clock() -> datetime:
+        nonlocal current
+        value = current
+        current += timedelta(seconds=1)
+        return value
+
+    return clock
+
+
+def _paper_pnl(row: Mapping[str, Any]) -> Decimal:
+    entry = Decimal(str(row["entry_price"]))
+    exit_price = Decimal(str(row["exit_price"]))
+    return exit_price - entry if row["side"] == "LONG" else entry - exit_price

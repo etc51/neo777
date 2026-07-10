@@ -85,7 +85,7 @@ def test_failed_push_reversal_long_short() -> None:
         engine.score_candidates(
             snapshot=_snapshot(Decimal("100")),
             micro=_micro(pressure="0.22", micro_dev="0.7"),
-            volatility=_vol(tick_velocity="-2", acceleration="1", range_position="0.10"),
+            volatility=_vol(tick_velocity="0.2", acceleration="1", range_position="0.10"),
             price_history=_history("100.05", "100.00"),
         )
     )
@@ -93,12 +93,23 @@ def test_failed_push_reversal_long_short() -> None:
         engine.score_candidates(
             snapshot=_snapshot(Decimal("100")),
             micro=_micro(pressure="-0.22", micro_dev="-0.7"),
-            volatility=_vol(tick_velocity="2", acceleration="-1", range_position="0.90"),
+            volatility=_vol(tick_velocity="-0.2", acceleration="-1", range_position="0.90"),
             price_history=_history("99.95", "100.00"),
         )
     )
     assert ("failed_push_reversal", PositionSide.LONG) in long
     assert ("failed_push_reversal", PositionSide.SHORT) in short
+
+
+def test_failed_push_rejects_move_that_has_not_turned() -> None:
+    engine = EntryTypeEngine()
+    candidates = engine.score_candidates(
+        snapshot=_snapshot(Decimal("100")),
+        micro=_micro(pressure="0.22", micro_dev="0.7"),
+        volatility=_vol(tick_velocity="-2", acceleration="1", range_position="0.10"),
+        price_history=_history("100.05", "100.00"),
+    )
+    assert ("failed_push_reversal", PositionSide.LONG) not in _types(candidates)
 
 
 def test_lead_lag_confirmed() -> None:
@@ -108,7 +119,12 @@ def test_lead_lag_confirmed() -> None:
         micro=_micro(pressure="0.25", micro_dev="0.8"),
         volatility=_vol(tick_velocity="1"),
         price_history=_history("99.99", "100.00"),
-        peer_contexts={"neobitcoin": {"volatility": {"tick_velocity": Decimal("5")}}},
+        peer_contexts={
+            "neobitcoin": {
+                "timestamp_utc": _snapshot(Decimal("100")).timestamp_utc,
+                "volatility": {"tick_velocity": Decimal("5")},
+            }
+        },
     )
     assert ("lead_lag_confirmed", PositionSide.LONG) in _types(candidates)
 
@@ -116,7 +132,7 @@ def test_lead_lag_confirmed() -> None:
 def test_live_shadow_writes_entry_fields_and_matrix(tmp_path: Path) -> None:
     result = run_swarm(
         load_config(),
-        max_cycles=4,
+        max_cycles=12,
         poll_interval_sec=0,
         provider=MockNeoMarketDataProvider(),
         db_path=tmp_path / "entry_live.sqlite",
@@ -131,14 +147,31 @@ def test_live_shadow_writes_entry_fields_and_matrix(tmp_path: Path) -> None:
         WHERE entry_type IS NOT NULL
         """
     )
-    stop_ticks = {
+    research_stop_ticks = {
         row["stop_ticks"]
-        for row in storage.fetch_all("SELECT DISTINCT stop_ticks FROM shadow_trades")
+        for row in storage.fetch_all(
+            "SELECT DISTINCT stop_ticks FROM shadow_trades WHERE is_control = 0"
+        )
     }
+    opportunities = storage.fetch_all(
+        """
+        SELECT opportunity_id,
+               SUM(CASE WHEN is_control = 1 THEN 1 ELSE 0 END) AS controls,
+               SUM(CASE WHEN is_control = 0 THEN 1 ELSE 0 END) AS research_arms
+        FROM shadow_trades
+        GROUP BY opportunity_id
+        """
+    )
     counts = storage.table_counts()
     assert {row["entry_type"] for row in rows} <= set(ENTRY_TYPES)
     assert rows
-    assert stop_ticks == {2, 3, 4, 5, 7, 10}
+    assert research_stop_ticks == set(load_config().tail_catcher.stop_ticks)
+    assert opportunities
+    assert all(row["controls"] == 1 for row in opportunities)
+    assert all(
+        row["research_arms"] == len(load_config().tail_catcher.stop_ticks) for row in opportunities
+    )
+    assert counts["market_opportunities"] == len(opportunities)
     assert counts["entry_strategy_scores"] > 0
     assert counts["entry_type_performance"] > 0
     assert counts["reentry_series"] > 0
@@ -156,10 +189,9 @@ def test_forward_labeler_is_offline_only_and_writes_labels(tmp_path: Path) -> No
     )
     summary = run_entry_research(SQLiteJournal(result.db_path), limit_per_instrument=20)
     package_root = Path(__file__).resolve().parents[1] / "neo_swarm_scalper"
-    live_sources = (
-        (package_root / "tail_catcher.py").read_text(encoding="utf-8")
-        + (package_root / "run.py").read_text(encoding="utf-8")
-    )
+    live_sources = (package_root / "tail_catcher.py").read_text(encoding="utf-8") + (
+        package_root / "run.py"
+    ).read_text(encoding="utf-8")
     assert "entry_research" not in live_sources
     assert summary.candidates_scored > 0
     assert summary.labels_written > 0
@@ -270,8 +302,7 @@ def _vol(
 def _history(*prices: str) -> tuple[tuple[datetime, Decimal], ...]:
     start = datetime(2026, 7, 9, tzinfo=UTC)
     return tuple(
-        (start + timedelta(seconds=index), Decimal(price))
-        for index, price in enumerate(prices)
+        (start + timedelta(seconds=index), Decimal(price)) for index, price in enumerate(prices)
     )
 
 

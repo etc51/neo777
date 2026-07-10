@@ -75,23 +75,41 @@ scalping:
   take_profit_ticks_max: 8
   stop_loss_ticks_min: 2
   stop_loss_ticks_max: 10
-  time_stop_sec_min: 3600
-  time_stop_sec_max: 3600
+  time_stop_sec_min: 120
+  time_stop_sec_max: 120
   spread_max_ticks: 3
   min_impulse_ticks: 3
 
 tail_catcher:
-  stop_ticks: [2, 3, 4, 5, 7, 10]
-  protection_trigger_bps: [10, 15, 20]
-  trailing_modes: [tight, normal, loose, microstructure_adaptive]
-  default_protection_trigger_bps: 15
-  default_trailing_mode: microstructure_adaptive
-  max_reentries_per_direction_per_instrument: 5
-  max_consecutive_stops: 5
+  stop_ticks: [10, 20, 40, 80, 160, 320]
+  protection_trigger_bps: [1, 2, 3, 5]
+  trailing_modes: [tight, normal, loose, expectancy_adaptive]
+  default_protection_trigger_bps: 2
+  default_trailing_mode: expectancy_adaptive
+  control_entry_types: [book_flip_entry, impulse_continuation, pullback_continuation]
+  control_min_direction_score: 0.45
+  min_direction_margin: 0.10
+  entry_confirmation_cycles: 2
+  pressure_confirmation_window: 3
+  pressure_confirmation_ratio: 0.67
+  min_signed_velocity: 0.02
+  min_edge_to_cost_ratio: 1.25
+  max_stop_to_mfe_ratio: 0.85
+  control_stop_bps: 5
+  control_stop_ticks_min: 10
+  control_stop_ticks_max: 600
+  control_time_exit_sec: 120
+  stop_confirmation_cycles: 2
+  protection_confirmation_cycles: 1
+  trailing_confirmation_cycles: 2
+  time_exit_spread_grace_cycles: 6
+  panic_stop_multiple: 2
+  max_reentries_per_direction_per_instrument: 2
+  max_consecutive_stops: 3
   cooldown_after_bad_series_sec: 300
   spread_max_ticks: 3
   spread_hard_bps: 12
-  min_pressure_score: 0.08
+  min_pressure_score: 0.12
   min_depth_top5: 10
   thin_book_depth_top5: 5
   protection_activation_pct_hint: 0.0015

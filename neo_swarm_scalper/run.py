@@ -207,7 +207,7 @@ class MockNeoMarketDataProvider:
     """Deterministic read-only provider used by tests and smoke runs."""
 
     def __init__(self) -> None:
-        self._cycle = 0
+        self._per_instrument_cycle: dict[str, int] = {}
 
     def find_instruments(self, query: str) -> Sequence[Mapping[str, Any]]:
         normalized = query.upper()
@@ -247,24 +247,19 @@ class MockNeoMarketDataProvider:
         return {"instrumentUid": instrument_id, "tradingStatus": "normal_trading"}
 
     def get_orderbook_snapshot(self, instrument_id: str, *, depth: int) -> Mapping[str, Any]:
-        self._cycle += 1
+        cycle = self._per_instrument_cycle.get(instrument_id, 0) + 1
+        self._per_instrument_cycle[instrument_id] = cycle
         is_btc = "4eff" in instrument_id or "BTC" in instrument_id.upper()
         base = Decimal("1000") if is_btc else Decimal("100")
         tick = Decimal("0.1") if is_btc else Decimal("0.01")
-        path = [
-            base,
-            base * Decimal("1.0020"),
-            base * Decimal("1.0040"),
-            base * Decimal("1.0010"),
-            base * Decimal("0.9980"),
-            base * Decimal("0.9965"),
-            base * Decimal("0.9995"),
-        ]
-        mid = path[(self._cycle - 1) % len(path)]
+        path_ticks = (0, 2, 4, 6, 9, 12, 16, 20, 15, 10, 5, 0, -5, -10)
+        path_tick = Decimal(path_ticks[(cycle - 1) % len(path_ticks)])
+        direction = Decimal("1") if is_btc else Decimal("-1")
+        mid = base + (direction * path_tick * tick)
         bid = mid - tick
         ask = mid + tick
-        bid_qty = 180 if self._cycle % 2 else 75
-        ask_qty = 70 if self._cycle % 2 else 170
+        bid_qty = 180 if is_btc else 75
+        ask_qty = 70 if is_btc else 170
         return {
             "instrumentUid": instrument_id,
             "depth": depth,
@@ -304,8 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reports-dir", default=None)
     parser.add_argument("--mock-data", action="store_true")
     args = parser.parse_args(argv)
+    config = load_config(args.config)
     result = run_swarm(
-        load_config(args.config),
+        config,
         max_cycles=args.max_cycles,
         poll_interval_sec=args.poll_interval,
         provider=MockNeoMarketDataProvider() if args.mock_data else None,
@@ -319,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     print("real_orders_disabled=true")
     print("token_masked=true")
     print(f"active_bots={','.join(ACTIVE_BOT_IDS)}")
-    print("stop_ticks=2,3,4,5,7,10")
+    print("stop_ticks=" + ",".join(str(item) for item in config.tail_catcher.stop_ticks))
     return 0
 
 

@@ -18,6 +18,12 @@ from uuid import uuid4
 
 from neo_swarm_scalper.config import NeoSwarmScalperConfig
 from neo_swarm_scalper.entry_engine import EntryCandidate, EntryTypeEngine
+from neo_swarm_scalper.expectancy import (
+    POLICY_VERSION,
+    adaptive_control_stop_ticks,
+    evaluate_entry_candidate,
+    protection_threshold_ticks,
+)
 from neo_swarm_scalper.storage import SQLiteJournal
 from neo_swarm_scalper.types import FeatureSnapshot, MarketSnapshot, PositionSide
 
@@ -27,10 +33,13 @@ SPREAD_SHOCK_GRACE_CYCLES = 3
 @dataclass
 class _InstrumentState:
     prices: deque[tuple[datetime, Decimal]]
+    pressure_history: deque[Decimal]
     previous_spread_ticks: Decimal | None = None
     previous_imbalance: Decimal | None = None
     previous_velocity: Decimal = Decimal("0")
     last_signal_time: datetime | None = None
+    pending_side: PositionSide | None = None
+    pending_confirmation_cycles: int = 0
 
 
 @dataclass
@@ -81,6 +90,21 @@ class _ShadowTrade:
     reentry_index: int = 0
     consecutive_stop_index: int = 0
     spread_bad_cycles: int = 0
+    opportunity_id: str | None = None
+    is_control: bool = False
+    experiment_role: str = "research"
+    policy_version: str = POLICY_VERSION
+    trigger_entry_price: Decimal | None = None
+    execution_cost_ticks: Decimal = Decimal("0")
+    direction_margin: Decimal = Decimal("0")
+    confirmation_cycles: int = 0
+    max_hold_sec: int = 120
+    stop_trigger_cycles: int = 0
+    protection_trigger_cycles: int = 0
+    trailing_bad_cycles: int = 0
+    time_exit_bad_spread_cycles: int = 0
+    exit_trigger_price: Decimal | None = None
+    execution_shortfall_ticks: Decimal = Decimal("0")
 
 
 class TailCatcherEngine:
@@ -91,7 +115,9 @@ class TailCatcherEngine:
         self.storage = storage
         self._states: dict[str, _InstrumentState] = {}
         self._open_trades: dict[str, _ShadowTrade] = {}
-        self._entry_engine = EntryTypeEngine(min_direction_score=Decimal("0.12"))
+        self._entry_engine = EntryTypeEngine(
+            min_direction_score=config.tail_catcher.control_min_direction_score
+        )
         self._latest_contexts: dict[str, dict[str, Any]] = {}
         self._load_open_trades()
         self._backfill_missing_mfe_mae()
@@ -115,7 +141,11 @@ class TailCatcherEngine:
             self._update_open_trades(snapshot, micro, volatility, timestamp_utc)
             peer_contexts = {
                 **self._latest_contexts,
-                snapshot.instrument: {"micro": micro, "volatility": volatility},
+                snapshot.instrument: {
+                    "micro": micro,
+                    "volatility": volatility,
+                    "timestamp_utc": timestamp_utc,
+                },
             }
             allowed, side, confidence, reason, gates, entry = self._curator_decision(
                 snapshot,
@@ -154,7 +184,7 @@ class TailCatcherEngine:
                 and entry is not None
                 and not self._has_open_matrix(snapshot.instrument)
             ):
-                self._open_shadow_matrix(
+                opened = self._open_shadow_matrix(
                     signal_id=signal_id,
                     snapshot=snapshot,
                     side=side,
@@ -163,16 +193,30 @@ class TailCatcherEngine:
                     volatility=volatility,
                     entry=entry,
                     spread_entry=gates["spread_entry"],
+                    entry_policy=gates["entry_policy"],
+                    confirmation_cycles=int(gates["confirmation_cycles"]),
                 )
-                state.last_signal_time = timestamp_utc
+                if opened:
+                    state.last_signal_time = timestamp_utc
+                    state.pending_side = None
+                    state.pending_confirmation_cycles = 0
             self._record_experiment_metrics(timestamp_utc, snapshot.instrument)
             self._record_entry_type_performance(timestamp_utc, snapshot.instrument)
-            self._latest_contexts[snapshot.instrument] = {"micro": micro, "volatility": volatility}
+            self._latest_contexts[snapshot.instrument] = {
+                "micro": micro,
+                "volatility": volatility,
+                "timestamp_utc": timestamp_utc,
+            }
 
     def _state(self, instrument: str) -> _InstrumentState:
         return self._states.setdefault(
             instrument,
-            _InstrumentState(prices=deque(maxlen=2000)),
+            _InstrumentState(
+                prices=deque(maxlen=2000),
+                pressure_history=deque(
+                    maxlen=self.config.tail_catcher.pressure_confirmation_window
+                ),
+            ),
         )
 
     def _load_open_trades(self) -> None:
@@ -254,6 +298,32 @@ class TailCatcherEngine:
                 ),
                 reentry_index=int(row["reentry_index"]),
                 consecutive_stop_index=int(row["consecutive_stop_index"]),
+                opportunity_id=(
+                    str(row["opportunity_id"])
+                    if row["opportunity_id"] is not None
+                    else f"OPPORTUNITY_{row['signal_id']}"
+                ),
+                is_control=bool(row["is_control"]),
+                experiment_role=str(row["experiment_role"]),
+                policy_version=(
+                    POLICY_VERSION if row["policy_version"] is None else str(row["policy_version"])
+                ),
+                trigger_entry_price=(
+                    Decimal(str(row["trigger_entry_price"]))
+                    if row["trigger_entry_price"] is not None
+                    else Decimal(str(row["entry_price"]))
+                ),
+                execution_cost_ticks=Decimal(str(row["execution_cost_ticks"])),
+                direction_margin=Decimal(str(row["direction_margin"])),
+                confirmation_cycles=int(row["confirmation_cycles"]),
+                max_hold_sec=int(row["max_hold_sec"]),
+                spread_bad_cycles=int(row["spread_bad_cycles"]),
+                stop_trigger_cycles=int(row["stop_trigger_cycles"]),
+                protection_trigger_cycles=int(row["protection_trigger_cycles"]),
+                trailing_bad_cycles=int(row["trailing_bad_cycles"]),
+                time_exit_bad_spread_cycles=int(row["time_exit_bad_spread_cycles"]),
+                exit_trigger_price=_dec_or_none(row["exit_trigger_price"]),
+                execution_shortfall_ticks=Decimal(str(row["execution_shortfall_ticks"])),
             )
             self._open_trades[trade.trade_id] = trade
 
@@ -339,8 +409,10 @@ class TailCatcherEngine:
         microprice_deviation = Decimal("0")
         if microprice is not None and mid is not None and tick:
             microprice_deviation = (microprice - mid) / tick
-        pressure_score = (imbalance_3 * Decimal("0.50")) + (imbalance_5 * Decimal("0.35")) + (
-            imbalance_10 * Decimal("0.15")
+        pressure_score = (
+            (imbalance_3 * Decimal("0.50"))
+            + (imbalance_5 * Decimal("0.35"))
+            + (imbalance_10 * Decimal("0.15"))
         )
         liquidity_score = depth_bid_5 + depth_ask_5
         book_slope = _book_slope(snapshot)
@@ -368,6 +440,7 @@ class TailCatcherEngine:
         thin_book = liquidity_score <= self.config.tail_catcher.thin_book_depth_top5
         state.previous_spread_ticks = spread_ticks
         state.previous_imbalance = imbalance_3
+        state.pressure_history.append(pressure_score)
         return {
             "bid": bid,
             "ask": ask,
@@ -498,6 +571,7 @@ class TailCatcherEngine:
         fallback_side = PositionSide.LONG if pressure >= 0 else PositionSide.SHORT
         spread_entry = _spread_entry_assessment(self.config, micro)
         gates = {
+            "position_gate": not self._has_open_matrix(snapshot.instrument),
             "session_gate": _session_open(snapshot),
             "spread_gate": spread_entry["entry_ok"],
             "spread_entry": spread_entry,
@@ -510,11 +584,14 @@ class TailCatcherEngine:
             "microstructure_min_pressure": self.config.tail_catcher.min_pressure_score,
             "volatility_chaos_gate": volatility["volatility_regime"] != "chaotic",
             "data_freshness_gate": not snapshot.stale,
-            "momentum_is_context_only": True,
+            "momentum_is_context_only": False,
             "external_btc_eth_is_context_only": True,
+            "policy_version": POLICY_VERSION,
         }
         allowed = all(bool(value) for key, value in gates.items() if key.endswith("_gate"))
         if not allowed:
+            state.pending_side = None
+            state.pending_confirmation_cycles = 0
             blocked = [key for key, value in gates.items() if key.endswith("_gate") and not value]
             return (
                 False,
@@ -524,7 +601,7 @@ class TailCatcherEngine:
                 gates,
                 None,
             )
-        entry = self._entry_engine.select(
+        candidates = self._entry_engine.score_candidates(
             snapshot=snapshot,
             micro=micro,
             volatility=volatility,
@@ -532,7 +609,14 @@ class TailCatcherEngine:
             features=features,
             peer_contexts=peer_contexts,
         )
-        if entry is None:
+        control_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.entry_type in self.config.tail_catcher.control_entry_types
+        ]
+        if not control_candidates:
+            state.pending_side = None
+            state.pending_confirmation_cycles = 0
             gates["current_regime"] = "no_trade"
             return (
                 False,
@@ -541,6 +625,71 @@ class TailCatcherEngine:
                 "no_trade: no_entry_type_active",
                 gates,
                 None,
+            )
+        entry = max(
+            control_candidates,
+            key=lambda item: (
+                item.direction_score,
+                item.expected_mfe_ticks,
+                -item.expected_stop_risk_ticks,
+            ),
+        )
+        opposite_score = max(
+            (
+                candidate.direction_score
+                for candidate in candidates
+                if candidate.side is not entry.side
+            ),
+            default=Decimal("0"),
+        )
+        policy = evaluate_entry_candidate(
+            candidate=entry,
+            opposite_score=opposite_score,
+            pressure_history=tuple(state.pressure_history),
+            tick_velocity=Decimal(str(volatility["tick_velocity"])),
+            spread_ticks=_dec_or_none(micro.get("spread_ticks")),
+            slippage_ticks=self.config.simulation.fallback_slippage_ticks,
+            config=self.config.tail_catcher,
+        )
+        gates["entry_policy"] = {
+            "allowed": policy.allowed,
+            "reasons": list(policy.reasons),
+            "direction_margin": policy.direction_margin,
+            "pressure_persistence": policy.pressure_persistence,
+            "execution_cost_ticks": policy.execution_cost_ticks,
+            "required_mfe_ticks": policy.required_mfe_ticks,
+        }
+        gates["direction_margin"] = policy.direction_margin
+        gates["pressure_persistence"] = policy.pressure_persistence
+        gates["execution_cost_ticks"] = policy.execution_cost_ticks
+        gates["required_mfe_ticks"] = policy.required_mfe_ticks
+        if not policy.allowed:
+            state.pending_side = None
+            state.pending_confirmation_cycles = 0
+            gates["current_regime"] = "no_trade"
+            return (
+                False,
+                entry.side,
+                Decimal("0"),
+                "no_trade: " + ",".join(policy.reasons),
+                gates,
+                entry,
+            )
+        if state.pending_side is entry.side:
+            state.pending_confirmation_cycles += 1
+        else:
+            state.pending_side = entry.side
+            state.pending_confirmation_cycles = 1
+        gates["confirmation_cycles"] = state.pending_confirmation_cycles
+        if state.pending_confirmation_cycles < self.config.tail_catcher.entry_confirmation_cycles:
+            gates["current_regime"] = "confirming"
+            return (
+                False,
+                entry.side,
+                entry.confidence,
+                "no_trade: entry_confirmation_pending",
+                gates,
+                entry,
             )
         gates["current_regime"] = entry.entry_type
         gates["entry_reason"] = entry.reason
@@ -567,7 +716,9 @@ class TailCatcherEngine:
         volatility: dict[str, Any],
         entry: EntryCandidate,
         spread_entry: dict[str, Any],
-    ) -> None:
+        entry_policy: dict[str, Any],
+        confirmation_cycles: int,
+    ) -> bool:
         entry_price = self._entry_price(snapshot, side)
         if entry_price is None:
             self._record_error(
@@ -578,10 +729,18 @@ class TailCatcherEngine:
                 "No executable bid/ask or last price for shadow entry.",
                 {"side": side.value},
             )
-            return
+            return False
         tick = snapshot.tick_size or Decimal("1")
         bid = _dec_or_none(micro.get("bid"))
         ask = _dec_or_none(micro.get("ask"))
+        trigger_entry_price = (
+            snapshot.mid_price
+            or snapshot.last_price
+            or _dec_or_none(micro.get("microprice"))
+            or entry_price
+        )
+        execution_cost_ticks = Decimal(str(entry_policy["execution_cost_ticks"]))
+        direction_margin = Decimal(str(entry_policy["direction_margin"]))
         consecutive_stops = self._recent_consecutive_stops(snapshot.instrument, side)
         reentry_plan = self._reentry_plan(
             snapshot=snapshot,
@@ -606,7 +765,7 @@ class TailCatcherEngine:
                     "reason": reentry_plan["reason_reentry_blocked"],
                 },
             )
-            return
+            return False
         self._record_reentry_series_signal(
             timestamp_utc=timestamp_utc,
             series_id=str(reentry_plan["reentry_series_id"]),
@@ -615,71 +774,128 @@ class TailCatcherEngine:
             entry_type=entry.entry_type,
             reason=str(reentry_plan["reason_reentry_allowed"]),
         )
+        effective_consecutive_stops = int(reentry_plan["effective_consecutive_stops"])
         reentry_index = min(
-            consecutive_stops,
+            effective_consecutive_stops,
             self.config.tail_catcher.max_reentries_per_direction_per_instrument,
         )
+        opportunity_id = f"OPPORTUNITY_{uuid4().hex}"
+        control_stop_ticks = adaptive_control_stop_ticks(
+            trigger_entry_price=trigger_entry_price,
+            tick=tick,
+            atr_range=Decimal(str(volatility["atr_range"])),
+            execution_cost_ticks=execution_cost_ticks,
+            config=self.config.tail_catcher,
+        )
+        configurations: list[tuple[int, Decimal, str, bool]] = [
+            (
+                control_stop_ticks,
+                self.config.tail_catcher.default_protection_trigger_bps,
+                self.config.tail_catcher.default_trailing_mode,
+                True,
+            )
+        ]
         for stop_ticks in self.config.tail_catcher.stop_ticks:
+            configurations.append(
+                (
+                    stop_ticks,
+                    self.config.tail_catcher.default_protection_trigger_bps,
+                    self.config.tail_catcher.default_trailing_mode,
+                    False,
+                )
+            )
+
+        control_trade_id = f"SHADOW_TRADE_{uuid4().hex}"
+        for index, (stop_ticks, trigger, trailing_mode, is_control) in enumerate(configurations):
             stop_distance = Decimal(stop_ticks) * tick
             stop_price = (
-                entry_price - stop_distance
+                trigger_entry_price - stop_distance
                 if side is PositionSide.LONG
-                else entry_price + stop_distance
+                else trigger_entry_price + stop_distance
             )
-            for trigger in self.config.tail_catcher.protection_trigger_bps:
-                for trailing_mode in self.config.tail_catcher.trailing_modes:
-                    trade = _ShadowTrade(
-                        trade_id=f"SHADOW_TRADE_{uuid4().hex}",
-                        signal_id=signal_id,
-                        instrument=snapshot.instrument,
-                        side=side,
-                        stop_ticks=stop_ticks,
-                        protection_trigger_bps=trigger,
-                        trailing_mode=trailing_mode,
-                        entry_time=timestamp_utc,
-                        entry_price=entry_price,
-                        theoretical_bid=bid,
-                        theoretical_ask=ask,
-                        stop_price=stop_price,
-                        best_price_after_entry=entry_price,
-                        worst_price_after_entry=entry_price,
-                        entry_type=entry.entry_type,
-                        direction_model=entry.direction_model,
-                        direction_score=entry.direction_score,
-                        pressure_score=entry.pressure_score,
-                        impulse_score=entry.impulse_score,
-                        pullback_score=entry.pullback_score,
-                        book_flip_score=entry.book_flip_score,
-                        reversal_score=entry.reversal_score,
-                        lead_lag_score=entry.lead_lag_score,
-                        expected_mfe_ticks=entry.expected_mfe_ticks,
-                        expected_stop_risk_ticks=entry.expected_stop_risk_ticks,
-                        reentry_series_id=str(reentry_plan["reentry_series_id"]),
-                        reentry_number=int(reentry_plan["reentry_number"]),
-                        reason_reentry_allowed=str(reentry_plan["reason_reentry_allowed"]),
-                        reason_reentry_blocked=reentry_plan["reason_reentry_blocked"],
-                        reentry_index=reentry_index,
-                        consecutive_stop_index=consecutive_stops,
-                    )
-                    self._insert_shadow_trade(trade)
-                    self._record_mfe_mae(trade, timestamp_utc, entry_price)
-                    self._record_trade_event(
-                        trade.trade_id,
-                        timestamp_utc,
-                        "shadow_entry",
-                        entry_price,
-                        {
-                            "stop_ticks": stop_ticks,
-                            "protection_trigger_bps": str(trigger),
-                            "trailing_mode": trailing_mode,
-                            "entry_type": entry.entry_type,
-                            "direction_score": str(entry.direction_score),
-                            "reentry_series_id": trade.reentry_series_id,
-                            "reentry_number": trade.reentry_number,
-                            "fill_model": "BUY=ask+slippage SELL=bid-slippage",
-                        },
-                    )
-                    self._open_trades[trade.trade_id] = trade
+            trade_id = control_trade_id if index == 0 else f"SHADOW_TRADE_{uuid4().hex}"
+            trade = _ShadowTrade(
+                trade_id=trade_id,
+                signal_id=signal_id,
+                instrument=snapshot.instrument,
+                side=side,
+                stop_ticks=stop_ticks,
+                protection_trigger_bps=trigger,
+                trailing_mode=trailing_mode,
+                entry_time=timestamp_utc,
+                entry_price=entry_price,
+                theoretical_bid=bid,
+                theoretical_ask=ask,
+                stop_price=stop_price,
+                best_price_after_entry=trigger_entry_price,
+                worst_price_after_entry=trigger_entry_price,
+                entry_type=entry.entry_type,
+                direction_model=entry.direction_model,
+                direction_score=entry.direction_score,
+                pressure_score=entry.pressure_score,
+                impulse_score=entry.impulse_score,
+                pullback_score=entry.pullback_score,
+                book_flip_score=entry.book_flip_score,
+                reversal_score=entry.reversal_score,
+                lead_lag_score=entry.lead_lag_score,
+                expected_mfe_ticks=entry.expected_mfe_ticks,
+                expected_stop_risk_ticks=entry.expected_stop_risk_ticks,
+                reentry_series_id=str(reentry_plan["reentry_series_id"]),
+                reentry_number=int(reentry_plan["reentry_number"]),
+                reason_reentry_allowed=str(reentry_plan["reason_reentry_allowed"]),
+                reason_reentry_blocked=reentry_plan["reason_reentry_blocked"],
+                reentry_index=reentry_index,
+                consecutive_stop_index=consecutive_stops,
+                opportunity_id=opportunity_id,
+                is_control=is_control,
+                experiment_role="control" if is_control else "research",
+                trigger_entry_price=trigger_entry_price,
+                execution_cost_ticks=execution_cost_ticks,
+                direction_margin=direction_margin,
+                confirmation_cycles=confirmation_cycles,
+                max_hold_sec=self.config.tail_catcher.control_time_exit_sec,
+            )
+            self._insert_shadow_trade(trade)
+            self._record_mfe_mae(trade, timestamp_utc, trigger_entry_price)
+            self._record_trade_event(
+                trade.trade_id,
+                timestamp_utc,
+                "shadow_entry",
+                entry_price,
+                {
+                    "opportunity_id": opportunity_id,
+                    "experiment_role": trade.experiment_role,
+                    "stop_ticks": stop_ticks,
+                    "protection_trigger_bps": str(trigger),
+                    "trailing_mode": trailing_mode,
+                    "entry_type": entry.entry_type,
+                    "direction_score": str(entry.direction_score),
+                    "direction_margin": str(direction_margin),
+                    "confirmation_cycles": confirmation_cycles,
+                    "execution_cost_ticks": str(execution_cost_ticks),
+                    "trigger_entry_price": str(trigger_entry_price),
+                    "reentry_series_id": trade.reentry_series_id,
+                    "reentry_number": trade.reentry_number,
+                    "fill_model": "BUY=ask+slippage SELL=bid-slippage",
+                },
+            )
+            self._open_trades[trade.trade_id] = trade
+        self._record_opportunity(
+            opportunity_id=opportunity_id,
+            signal_id=signal_id,
+            timestamp_utc=timestamp_utc,
+            instrument=snapshot.instrument,
+            side=side,
+            entry=entry,
+            control_trade_id=control_trade_id,
+            direction_margin=direction_margin,
+            confirmation_cycles=confirmation_cycles,
+            pressure_persistence=Decimal(str(entry_policy["pressure_persistence"])),
+            execution_cost_ticks=execution_cost_ticks,
+            required_mfe_ticks=Decimal(str(entry_policy["required_mfe_ticks"])),
+            control_stop_ticks=control_stop_ticks,
+        )
+        return True
 
     def _update_open_trades(
         self,
@@ -695,53 +911,109 @@ class TailCatcherEngine:
             if exit_price is None:
                 continue
             tick = snapshot.tick_size or Decimal("1")
-            pnl_abs = _pnl_abs(trade.side, trade.entry_price, exit_price)
-            pnl_pct = pnl_abs / trade.entry_price if trade.entry_price else Decimal("0")
-            pnl_ticks = pnl_abs / tick if tick else Decimal("0")
+            trigger_price = (
+                snapshot.mid_price
+                or snapshot.last_price
+                or _dec_or_none(micro.get("microprice"))
+                or exit_price
+            )
+            trigger_entry = trade.trigger_entry_price or trade.entry_price
+            trigger_pnl_abs = _pnl_abs(trade.side, trigger_entry, trigger_price)
+            trigger_pnl_pct = trigger_pnl_abs / trigger_entry if trigger_entry else Decimal("0")
+            trigger_pnl_ticks = trigger_pnl_abs / tick if tick else Decimal("0")
+            executable_pnl_abs = _pnl_abs(trade.side, trade.entry_price, exit_price)
+            executable_pnl_ticks = executable_pnl_abs / tick if tick else Decimal("0")
             self._update_trade_extremes(
                 trade,
-                exit_price,
-                pnl_abs,
-                pnl_pct,
-                pnl_ticks,
+                trigger_price,
+                trigger_pnl_abs,
+                trigger_pnl_pct,
+                trigger_pnl_ticks,
                 timestamp_utc,
             )
-            protection_trigger = trade.protection_trigger_bps / Decimal("10000")
-            if not trade.protection_activated and pnl_pct >= protection_trigger:
+            protection_ticks = protection_threshold_ticks(
+                trigger_entry_price=trigger_entry,
+                tick=tick,
+                trigger_bps=trade.protection_trigger_bps,
+                execution_cost_ticks=trade.execution_cost_ticks,
+            )
+            if not trade.protection_activated and trigger_pnl_ticks >= protection_ticks:
                 trade.protection_activated = True
-                trade.protection_price = _protection_price(trade.side, trade.entry_price, tick)
+                trade.protection_price = _protection_price(
+                    trade.side,
+                    trigger_entry,
+                    tick * max(trade.execution_cost_ticks, Decimal("1")),
+                )
                 self._record_trade_event(
                     trade.trade_id,
                     timestamp_utc,
                     "protection_activated",
                     trade.protection_price,
-                    {"trigger_bps": str(trade.protection_trigger_bps), "pnl_pct": str(pnl_pct)},
+                    {
+                        "trigger_bps": str(trade.protection_trigger_bps),
+                        "trigger_pnl_ticks": str(trigger_pnl_ticks),
+                        "required_ticks": str(protection_ticks),
+                    },
                 )
 
             reason: str | None = None
-            raw_exit = exit_price
             spread_exit = _spread_exit_assessment(self.config, micro)
-            if snapshot.stale:
-                reason = "stale_data_close"
-            elif _stop_hit(trade, exit_price):
-                reason = "protected_stop" if trade.protection_activated else "stop_loss"
-            elif trade.protection_activated and trade.mfe_ticks > 0:
+            if spread_exit["market_bad"]:
+                trade.spread_bad_cycles += 1
+            else:
+                trade.spread_bad_cycles = 0
+                trade.time_exit_bad_spread_cycles = 0
+            stop_triggered = _stop_hit(trade, trigger_price)
+            if stop_triggered:
+                trade.stop_trigger_cycles += 1
+            else:
+                trade.stop_trigger_cycles = 0
+            protection_triggered = (
+                trade.protection_activated
+                and trade.protection_price is not None
+                and _protection_hit(trade, trigger_price)
+            )
+            if protection_triggered:
+                trade.protection_trigger_cycles += 1
+            else:
+                trade.protection_trigger_cycles = 0
+            time_due = _time_exit(trade, timestamp_utc, trade.max_hold_sec)
+            trailing_reason = None
+            if trade.protection_activated and trade.mfe_ticks > 0:
                 trailing_reason = self._trailing_exit_reason(
                     trade,
-                    exit_price,
+                    trigger_price,
                     micro,
                     volatility,
                     tick,
                 )
-                if trailing_reason is not None:
-                    trade.trailing_reason = trailing_reason
-                    reason = "trailing_runner"
-            elif _time_exit(trade, timestamp_utc, self.config.scalping.time_stop_sec_max):
-                reason = "time_exit"
-            elif spread_exit["market_bad"]:
-                trade.spread_bad_cycles += 1
+            panic_threshold = -(
+                Decimal(trade.stop_ticks) * self.config.tail_catcher.panic_stop_multiple
+            )
+            normal_exit_reason: str | None = None
+            if (
+                stop_triggered
+                and trade.stop_trigger_cycles >= self.config.tail_catcher.stop_confirmation_cycles
+            ):
+                normal_exit_reason = "protected_stop" if trade.protection_activated else "stop_loss"
+            elif trailing_reason is not None:
+                trade.trailing_reason = trailing_reason
+                normal_exit_reason = "trailing_runner"
+            elif (
+                protection_triggered
+                and trade.protection_trigger_cycles
+                >= self.config.tail_catcher.protection_confirmation_cycles
+            ):
+                trade.protected_exit_reason = "protection_floor"
+                normal_exit_reason = "protected_exit"
+            elif time_due:
+                normal_exit_reason = "time_exit"
+
+            if snapshot.stale:
+                reason = "stale_data_close"
+            elif spread_exit["market_bad"] and spread_exit["exit_infeasible"]:
                 grace_met = trade.spread_bad_cycles >= SPREAD_SHOCK_GRACE_CYCLES
-                if spread_exit["exit_infeasible"] and grace_met:
+                if grace_met and trigger_pnl_ticks <= panic_threshold:
                     reason = "spread_shock"
                     self._record_trade_event(
                         trade.trade_id,
@@ -752,9 +1024,14 @@ class TailCatcherEngine:
                             **spread_exit,
                             "spread_bad_cycles": trade.spread_bad_cycles,
                             "grace_cycles_required": SPREAD_SHOCK_GRACE_CYCLES,
+                            "trigger_pnl_ticks": str(trigger_pnl_ticks),
+                            "panic_threshold_ticks": str(panic_threshold),
                         },
                     )
                 else:
+                    pending_reasons = []
+                    if normal_exit_reason is not None:
+                        pending_reasons.append(normal_exit_reason)
                     self._record_trade_event(
                         trade.trade_id,
                         timestamp_utc,
@@ -765,10 +1042,38 @@ class TailCatcherEngine:
                             "spread_bad_cycles": trade.spread_bad_cycles,
                             "grace_cycles_required": SPREAD_SHOCK_GRACE_CYCLES,
                             "kept_open": True,
+                            "pending_reasons": pending_reasons,
+                            "trigger_pnl_ticks": str(trigger_pnl_ticks),
                         },
                     )
+                    if time_due:
+                        trade.time_exit_bad_spread_cycles += 1
+                        if (
+                            trade.time_exit_bad_spread_cycles
+                            >= self.config.tail_catcher.time_exit_spread_grace_cycles
+                        ):
+                            reason = "time_exit_spread_timeout"
             else:
-                trade.spread_bad_cycles = 0
+                reason = normal_exit_reason
+
+            if (
+                spread_exit["market_bad"]
+                and not spread_exit["exit_infeasible"]
+                and reason != "spread_shock"
+            ):
+                self._record_trade_event(
+                    trade.trade_id,
+                    timestamp_utc,
+                    "avoided_spread_shock_exit",
+                    exit_price,
+                    {
+                        **spread_exit,
+                        "spread_bad_cycles": trade.spread_bad_cycles,
+                        "kept_open": reason is None,
+                        "normal_exit_reason": reason,
+                        "trigger_pnl_ticks": str(trigger_pnl_ticks),
+                    },
+                )
 
             if spread_exit["market_bad"] and reason is not None and reason != "spread_shock":
                 self._record_trade_event(
@@ -781,18 +1086,11 @@ class TailCatcherEngine:
 
             if reason is None:
                 self._update_shadow_trade(trade, status="OPEN")
-                self._record_mfe_mae(trade, timestamp_utc, exit_price)
+                self._record_mfe_mae(trade, timestamp_utc, trigger_price)
                 continue
 
-            protected_exit_reason = None
-            if reason == "spread_shock" and trade.protection_activated and pnl_abs < 0:
-                exit_price = _protected_exit_price(trade.side, trade.entry_price, raw_exit)
-                protected_exit_reason = "spread_shock"
-            elif trade.protection_activated and pnl_abs < 0:
-                exit_price = _protected_exit_price(trade.side, trade.entry_price, raw_exit)
-                protected_exit_reason = reason
-                reason = "protected_exit"
-            trade.protected_exit_reason = protected_exit_reason
+            trade.exit_trigger_price = trigger_price
+            trade.execution_shortfall_ticks = trigger_pnl_ticks - executable_pnl_ticks
             self._close_trade(trade, timestamp_utc, exit_price, reason)
 
     def _update_trade_extremes(
@@ -826,39 +1124,54 @@ class TailCatcherEngine:
     def _trailing_exit_reason(
         self,
         trade: _ShadowTrade,
-        exit_price: Decimal,
+        trigger_price: Decimal,
         micro: dict[str, Any],
         volatility: dict[str, Any],
         tick: Decimal,
     ) -> str | None:
-        trail_ticks = {
-            "tight": Decimal("3"),
-            "normal": Decimal("5"),
-            "loose": Decimal("8"),
-            "microstructure_adaptive": max(Decimal("3"), Decimal(trade.stop_ticks)),
-        }.get(trade.trailing_mode, Decimal(trade.stop_ticks))
+        if trade.trailing_mode == "expectancy_adaptive":
+            trail_ticks = max(
+                trade.execution_cost_ticks * Decimal("1.25"),
+                min(
+                    Decimal(trade.stop_ticks) * Decimal("0.50"),
+                    max(Decimal("4"), trade.mfe_ticks * Decimal("0.30")),
+                ),
+            )
+        else:
+            trail_ticks = {
+                "tight": Decimal("5"),
+                "normal": Decimal("10"),
+                "loose": Decimal("20"),
+            }.get(trade.trailing_mode, Decimal(trade.stop_ticks))
         if trade.side is PositionSide.LONG:
-            pullback = (trade.best_price_after_entry - exit_price) / tick
+            pullback = (trade.best_price_after_entry - trigger_price) / tick
             pressure_lost = Decimal(str(micro["pressure_score"])) < Decimal("0")
         else:
-            pullback = (exit_price - trade.best_price_after_entry) / tick
+            pullback = (trigger_price - trade.best_price_after_entry) / tick
             pressure_lost = Decimal(str(micro["pressure_score"])) > Decimal("0")
-        spread_expanded = bool(micro["spread_expansion_flag"])
         volatility_compressed = Decimal(str(volatility["chop_score"])) >= Decimal("0.85")
         book_flip_against = bool(micro["orderbook_flip_flag"]) and pressure_lost
-        if bool(micro["thin_book_flag"]):
-            return "microstructure_deterioration"
-        if book_flip_against:
-            return "book_flip_against_runner"
+        reason = None
         if pullback >= trail_ticks:
-            return "MFE_pullback"
-        if pressure_lost:
-            return "pressure_loss"
-        if spread_expanded:
-            return "spread_expansion"
-        if volatility_compressed:
-            return "volatility_compression"
-        return None
+            reason = "MFE_pullback"
+        elif book_flip_against:
+            reason = "book_flip_against_runner"
+        elif bool(micro["thin_book_flag"]):
+            reason = "microstructure_deterioration"
+        elif pressure_lost:
+            reason = "pressure_loss"
+        elif volatility_compressed:
+            reason = "volatility_compression"
+        if reason is None:
+            trade.trailing_bad_cycles = 0
+            return None
+        if reason == "MFE_pullback":
+            trade.trailing_bad_cycles = 0
+            return reason
+        trade.trailing_bad_cycles += 1
+        if trade.trailing_bad_cycles < self.config.tail_catcher.trailing_confirmation_cycles:
+            return None
+        return reason
 
     def _entry_price(self, snapshot: MarketSnapshot, side: PositionSide) -> Decimal | None:
         tick = snapshot.tick_size or Decimal("1")
@@ -891,7 +1204,10 @@ class TailCatcherEngine:
         return None
 
     def _has_open_matrix(self, instrument: str) -> bool:
-        return any(trade.instrument == instrument for trade in self._open_trades.values())
+        return any(
+            trade.instrument == instrument and trade.is_control
+            for trade in self._open_trades.values()
+        )
 
     def _reentry_plan(
         self,
@@ -905,13 +1221,29 @@ class TailCatcherEngine:
         consecutive_stops: int,
     ) -> dict[str, Any]:
         blocked: list[str] = []
+        effective_consecutive_stops = consecutive_stops
+        reset_after_cooldown = False
         signed_pressure = _side_signed(side, Decimal(str(micro["pressure_score"])))
         signed_micro = _side_signed(side, Decimal(str(micro["microprice_deviation"])))
         if consecutive_stops >= self.config.tail_catcher.max_consecutive_stops:
-            blocked.append("max_consecutive_stops")
-        if consecutive_stops > self.config.tail_catcher.max_reentries_per_direction_per_instrument:
+            latest_exit = self._latest_control_exit_time(snapshot.instrument, side)
+            age_sec = (
+                None
+                if latest_exit is None
+                else (snapshot.timestamp_utc - latest_exit).total_seconds()
+            )
+            if age_sec is None or age_sec < self.config.tail_catcher.cooldown_after_bad_series_sec:
+                blocked.append("bad_series_cooldown")
+            else:
+                effective_consecutive_stops = 0
+                reset_after_cooldown = True
+        if (
+            not blocked
+            and effective_consecutive_stops
+            > self.config.tail_catcher.max_reentries_per_direction_per_instrument
+        ):
             blocked.append("max_reentries")
-        if consecutive_stops > 0:
+        if effective_consecutive_stops > 0:
             if entry.direction_score < self._entry_engine.min_direction_score:
                 blocked.append("direction_score_deteriorated")
             if signed_micro < Decimal("-0.25"):
@@ -924,7 +1256,7 @@ class TailCatcherEngine:
                 blocked.append("volatility_chaotic")
         series_id = (
             self._latest_reentry_series_id(snapshot.instrument, side, entry.entry_type)
-            if consecutive_stops > 0
+            if effective_consecutive_stops > 0
             else None
         )
         if series_id is None:
@@ -933,19 +1265,23 @@ class TailCatcherEngine:
             return {
                 "allowed": False,
                 "reentry_series_id": series_id,
-                "reentry_number": consecutive_stops,
+                "reentry_number": effective_consecutive_stops,
+                "effective_consecutive_stops": effective_consecutive_stops,
                 "reason_reentry_allowed": None,
                 "reason_reentry_blocked": ",".join(blocked),
             }
         reason = (
-            "initial_entry"
-            if consecutive_stops == 0
+            "initial_entry_after_bad_series_cooldown"
+            if reset_after_cooldown
+            else "initial_entry"
+            if effective_consecutive_stops == 0
             else "reentry_allowed: direction_score/book/spread still aligned"
         )
         return {
             "allowed": True,
             "reentry_series_id": series_id,
-            "reentry_number": consecutive_stops,
+            "reentry_number": effective_consecutive_stops,
+            "effective_consecutive_stops": effective_consecutive_stops,
             "reason_reentry_allowed": reason,
             "reason_reentry_blocked": None,
         }
@@ -963,6 +1299,7 @@ class TailCatcherEngine:
             WHERE instrument = ?
               AND side = ?
               AND entry_type = ?
+              AND is_control = 1
               AND reentry_series_id IS NOT NULL
             ORDER BY COALESCE(exit_time, entry_time) DESC
             LIMIT 1
@@ -972,6 +1309,27 @@ class TailCatcherEngine:
         if not rows:
             return None
         return None if rows[0]["reentry_series_id"] is None else str(rows[0]["reentry_series_id"])
+
+    def _latest_control_exit_time(
+        self,
+        instrument: str,
+        side: PositionSide,
+    ) -> datetime | None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT exit_time
+            FROM shadow_trades
+            WHERE instrument = ?
+              AND side = ?
+              AND status = 'CLOSED'
+              AND is_control = 1
+              AND exit_time IS NOT NULL
+            ORDER BY exit_time DESC
+            LIMIT 1
+            """,
+            (instrument, side.value),
+        )
+        return None if not rows else _dt(rows[0]["exit_time"])
 
     def _record_reentry_series_signal(
         self,
@@ -1010,10 +1368,14 @@ class TailCatcherEngine:
             conn.commit()
 
     def _update_reentry_series_on_close(self, trade: _ShadowTrade, reason: str) -> None:
-        if trade.reentry_series_id is None:
+        if trade.reentry_series_id is None or not trade.is_control:
             return
-        stop_like = reason in {"stop_loss", "protected_stop", "protected_exit"}
-        status = "STOPPED" if stop_like else "CLOSED"
+        trigger_entry = trade.trigger_entry_price or trade.entry_price
+        exit_trigger = trade.exit_trigger_price or trigger_entry
+        tick = abs(trigger_entry - trade.stop_price) / Decimal(trade.stop_ticks)
+        trigger_pnl_ticks = _pnl_abs(trade.side, trigger_entry, exit_trigger) / tick
+        loss = (trigger_pnl_ticks - trade.execution_shortfall_ticks) < 0
+        status = "STOPPED" if loss else "CLOSED"
         with self.storage.connect() as conn:
             conn.execute(
                 """
@@ -1022,7 +1384,87 @@ class TailCatcherEngine:
                     status = ?
                 WHERE series_id = ?
                 """,
-                (1 if stop_like else 0, status, trade.reentry_series_id),
+                (1 if loss else 0, status, trade.reentry_series_id),
+            )
+            conn.commit()
+
+    def _record_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        signal_id: str,
+        timestamp_utc: datetime,
+        instrument: str,
+        side: PositionSide,
+        entry: EntryCandidate,
+        control_trade_id: str,
+        direction_margin: Decimal,
+        confirmation_cycles: int,
+        pressure_persistence: Decimal,
+        execution_cost_ticks: Decimal,
+        required_mfe_ticks: Decimal,
+        control_stop_ticks: int,
+    ) -> None:
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO market_opportunities(
+                    opportunity_id, signal_id, timestamp_utc, instrument, side, entry_type,
+                    status, control_trade_id, policy_version, direction_score,
+                    direction_margin, confirmation_cycles, pressure_persistence,
+                    execution_cost_ticks, required_mfe_ticks, details_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    opportunity_id,
+                    signal_id,
+                    timestamp_utc.isoformat(),
+                    instrument,
+                    side.value,
+                    entry.entry_type,
+                    control_trade_id,
+                    POLICY_VERSION,
+                    _num(entry.direction_score),
+                    _num(direction_margin),
+                    confirmation_cycles,
+                    _num(pressure_persistence),
+                    _num(execution_cost_ticks),
+                    _num(required_mfe_ticks),
+                    _json({"control_stop_ticks": control_stop_ticks}),
+                ),
+            )
+            conn.execute(
+                "UPDATE shadow_signals SET opportunity_id = ? WHERE signal_id = ?",
+                (opportunity_id, signal_id),
+            )
+            conn.commit()
+
+    def _close_opportunity(
+        self,
+        trade: _ShadowTrade,
+        timestamp_utc: datetime,
+        exit_price: Decimal,
+        reason: str,
+    ) -> None:
+        if trade.opportunity_id is None:
+            return
+        trigger_entry = trade.trigger_entry_price or trade.entry_price
+        tick = abs(trigger_entry - trade.stop_price) / Decimal(trade.stop_ticks)
+        pnl_ticks = _pnl_abs(trade.side, trade.entry_price, exit_price) / tick
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                UPDATE market_opportunities
+                SET status = 'CLOSED', exit_time = ?, exit_reason = ?, pnl_ticks = ?
+                WHERE opportunity_id = ?
+                """,
+                (
+                    timestamp_utc.isoformat(),
+                    reason,
+                    _num(pnl_ticks),
+                    trade.opportunity_id,
+                ),
             )
             conn.commit()
 
@@ -1034,50 +1476,71 @@ class TailCatcherEngine:
                     trade_id, signal_id, instrument, side, stop_ticks, protection_trigger_bps,
                     trailing_mode, status, entry_time, entry_price, theoretical_bid,
                     theoretical_ask, stop_price, best_price_after_entry, worst_price_after_entry,
-                    mfe_abs, mfe_pct, mfe_ticks, mae_abs, mae_pct, mae_ticks,
-                    max_runup_before_exit, max_drawdown_before_exit, entry_type,
-                    direction_model, direction_score, pressure_score, impulse_score,
+                    entry_type, direction_model, direction_score, pressure_score, impulse_score,
                     pullback_score, book_flip_score, reversal_score, lead_lag_score,
                     expected_mfe_ticks, expected_stop_risk_ticks, reentry_series_id,
                     reentry_number, reason_reentry_allowed, reason_reentry_blocked,
-                    reentry_index, consecutive_stop_index
+                    reentry_index, consecutive_stop_index, opportunity_id, is_control,
+                    experiment_role, policy_version, trigger_entry_price, execution_cost_ticks,
+                    direction_margin, confirmation_cycles, max_hold_sec
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0,
-                        0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (
+                    :trade_id, :signal_id, :instrument, :side, :stop_ticks,
+                    :protection_trigger_bps, :trailing_mode, 'OPEN', :entry_time,
+                    :entry_price, :theoretical_bid, :theoretical_ask, :stop_price,
+                    :best_price_after_entry, :worst_price_after_entry, :entry_type,
+                    :direction_model, :direction_score, :pressure_score, :impulse_score,
+                    :pullback_score, :book_flip_score, :reversal_score, :lead_lag_score,
+                    :expected_mfe_ticks, :expected_stop_risk_ticks, :reentry_series_id,
+                    :reentry_number, :reason_reentry_allowed, :reason_reentry_blocked,
+                    :reentry_index, :consecutive_stop_index, :opportunity_id, :is_control,
+                    :experiment_role, :policy_version, :trigger_entry_price,
+                    :execution_cost_ticks, :direction_margin, :confirmation_cycles,
+                    :max_hold_sec
+                )
                 """,
-                (
-                    trade.trade_id,
-                    trade.signal_id,
-                    trade.instrument,
-                    trade.side.value,
-                    trade.stop_ticks,
-                    _num(trade.protection_trigger_bps),
-                    trade.trailing_mode,
-                    trade.entry_time.isoformat(),
-                    _num(trade.entry_price),
-                    _num(trade.theoretical_bid),
-                    _num(trade.theoretical_ask),
-                    _num(trade.stop_price),
-                    _num(trade.best_price_after_entry),
-                    _num(trade.worst_price_after_entry),
-                    trade.entry_type,
-                    trade.direction_model,
-                    _num(trade.direction_score),
-                    _num(trade.pressure_score),
-                    _num(trade.impulse_score),
-                    _num(trade.pullback_score),
-                    _num(trade.book_flip_score),
-                    _num(trade.reversal_score),
-                    _num(trade.lead_lag_score),
-                    _num(trade.expected_mfe_ticks),
-                    _num(trade.expected_stop_risk_ticks),
-                    trade.reentry_series_id,
-                    trade.reentry_number,
-                    trade.reason_reentry_allowed,
-                    trade.reason_reentry_blocked,
-                    trade.reentry_index,
-                    trade.consecutive_stop_index,
-                ),
+                {
+                    "trade_id": trade.trade_id,
+                    "signal_id": trade.signal_id,
+                    "instrument": trade.instrument,
+                    "side": trade.side.value,
+                    "stop_ticks": trade.stop_ticks,
+                    "protection_trigger_bps": _num(trade.protection_trigger_bps),
+                    "trailing_mode": trade.trailing_mode,
+                    "entry_time": trade.entry_time.isoformat(),
+                    "entry_price": _num(trade.entry_price),
+                    "theoretical_bid": _num(trade.theoretical_bid),
+                    "theoretical_ask": _num(trade.theoretical_ask),
+                    "stop_price": _num(trade.stop_price),
+                    "best_price_after_entry": _num(trade.best_price_after_entry),
+                    "worst_price_after_entry": _num(trade.worst_price_after_entry),
+                    "entry_type": trade.entry_type,
+                    "direction_model": trade.direction_model,
+                    "direction_score": _num(trade.direction_score),
+                    "pressure_score": _num(trade.pressure_score),
+                    "impulse_score": _num(trade.impulse_score),
+                    "pullback_score": _num(trade.pullback_score),
+                    "book_flip_score": _num(trade.book_flip_score),
+                    "reversal_score": _num(trade.reversal_score),
+                    "lead_lag_score": _num(trade.lead_lag_score),
+                    "expected_mfe_ticks": _num(trade.expected_mfe_ticks),
+                    "expected_stop_risk_ticks": _num(trade.expected_stop_risk_ticks),
+                    "reentry_series_id": trade.reentry_series_id,
+                    "reentry_number": trade.reentry_number,
+                    "reason_reentry_allowed": trade.reason_reentry_allowed,
+                    "reason_reentry_blocked": trade.reason_reentry_blocked,
+                    "reentry_index": trade.reentry_index,
+                    "consecutive_stop_index": trade.consecutive_stop_index,
+                    "opportunity_id": trade.opportunity_id,
+                    "is_control": int(trade.is_control),
+                    "experiment_role": trade.experiment_role,
+                    "policy_version": trade.policy_version,
+                    "trigger_entry_price": _num(trade.trigger_entry_price),
+                    "execution_cost_ticks": _num(trade.execution_cost_ticks),
+                    "direction_margin": _num(trade.direction_margin),
+                    "confirmation_cycles": trade.confirmation_cycles,
+                    "max_hold_sec": trade.max_hold_sec,
+                },
             )
             conn.commit()
 
@@ -1102,7 +1565,14 @@ class TailCatcherEngine:
                     protection_activated = ?,
                     protection_price = ?,
                     protected_exit_reason = ?,
-                    trailing_reason = ?
+                    trailing_reason = ?,
+                    spread_bad_cycles = ?,
+                    stop_trigger_cycles = ?,
+                    protection_trigger_cycles = ?,
+                    trailing_bad_cycles = ?,
+                    time_exit_bad_spread_cycles = ?,
+                    exit_trigger_price = ?,
+                    execution_shortfall_ticks = ?
                 WHERE trade_id = ?
                 """,
                 (
@@ -1123,6 +1593,13 @@ class TailCatcherEngine:
                     _num(trade.protection_price),
                     trade.protected_exit_reason,
                     trade.trailing_reason,
+                    trade.spread_bad_cycles,
+                    trade.stop_trigger_cycles,
+                    trade.protection_trigger_cycles,
+                    trade.trailing_bad_cycles,
+                    trade.time_exit_bad_spread_cycles,
+                    _num(trade.exit_trigger_price),
+                    _num(trade.execution_shortfall_ticks),
                     trade.trade_id,
                 ),
             )
@@ -1135,7 +1612,11 @@ class TailCatcherEngine:
         exit_price: Decimal,
         reason: str,
     ) -> None:
-        self._record_mfe_mae(trade, timestamp_utc, exit_price)
+        self._record_mfe_mae(
+            trade,
+            timestamp_utc,
+            trade.exit_trigger_price or exit_price,
+        )
         self._update_shadow_trade(trade, status="CLOSED")
         with self.storage.connect() as conn:
             conn.execute(
@@ -1146,7 +1627,9 @@ class TailCatcherEngine:
                     exit_price = ?,
                     exit_reason = ?,
                     protected_exit_reason = ?,
-                    trailing_reason = ?
+                    trailing_reason = ?,
+                    exit_trigger_price = ?,
+                    execution_shortfall_ticks = ?
                 WHERE trade_id = ?
                 """,
                 (
@@ -1155,6 +1638,8 @@ class TailCatcherEngine:
                     reason,
                     trade.protected_exit_reason,
                     trade.trailing_reason,
+                    _num(trade.exit_trigger_price),
+                    _num(trade.execution_shortfall_ticks),
                     trade.trade_id,
                 ),
             )
@@ -1171,8 +1656,14 @@ class TailCatcherEngine:
                 "protection_activated": trade.protection_activated,
                 "entry_type": trade.entry_type,
                 "trailing_reason": trade.trailing_reason,
+                "opportunity_id": trade.opportunity_id,
+                "experiment_role": trade.experiment_role,
+                "exit_trigger_price": str(trade.exit_trigger_price),
+                "execution_shortfall_ticks": str(trade.execution_shortfall_ticks),
             },
         )
+        if trade.is_control:
+            self._close_opportunity(trade, timestamp_utc, exit_price, reason)
         self._open_trades.pop(trade.trade_id, None)
 
     def _record_signal(
@@ -1204,9 +1695,11 @@ class TailCatcherEngine:
                     entry_type, direction_model, direction_score, pressure_score,
                     impulse_score, pullback_score, book_flip_score, reversal_score,
                     lead_lag_score, expected_mfe_ticks, expected_stop_risk_ticks,
+                    policy_version, direction_margin, confirmation_cycles,
+                    pressure_persistence, execution_cost_ticks, required_mfe_ticks,
                     gate_status_json, features_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -1226,6 +1719,12 @@ class TailCatcherEngine:
                     _num(Decimal("0") if entry is None else entry.lead_lag_score),
                     _num(Decimal("0") if entry is None else entry.expected_mfe_ticks),
                     _num(Decimal("0") if entry is None else entry.expected_stop_risk_ticks),
+                    POLICY_VERSION,
+                    _num(Decimal(str(gates.get("direction_margin", 0)))),
+                    int(gates.get("confirmation_cycles", 0)),
+                    _num(Decimal(str(gates.get("pressure_persistence", 0)))),
+                    _num(Decimal(str(gates.get("execution_cost_ticks", 0)))),
+                    _num(Decimal(str(gates.get("required_mfe_ticks", 0)))),
                     _json(gates),
                     _json(features),
                 ),
@@ -1549,67 +2048,68 @@ class TailCatcherEngine:
     def _record_experiment_metrics(self, timestamp_utc: datetime, instrument: str) -> None:
         with self.storage.connect() as conn:
             for stop_ticks in self.config.tail_catcher.stop_ticks:
-                for trigger in self.config.tail_catcher.protection_trigger_bps:
-                    for trailing_mode in self.config.tail_catcher.trailing_modes:
-                        rows = list(
-                            conn.execute(
-                                """
-                                SELECT *
-                                FROM shadow_trades
-                                WHERE instrument = ?
-                                  AND stop_ticks = ?
-                                  AND protection_trigger_bps = ?
-                                  AND trailing_mode = ?
-                                  AND status = 'CLOSED'
-                                """,
-                                (instrument, stop_ticks, _num(trigger), trailing_mode),
-                            )
-                        )
-                        metrics = _experiment_metrics(
-                            rows,
-                            big_runner_bps=self.config.tail_catcher.big_runner_mfe_bps,
-                        )
-                        conn.execute(
-                            """
-                            INSERT INTO shadow_stop_experiments(
-                                timestamp_utc, instrument, stop_ticks, protection_trigger_bps,
-                                trailing_mode, trades_count, stops_count, reentries_count,
-                                winrate, avg_loss_ticks, avg_win_ticks, expectancy,
-                                profit_factor, median_mfe, median_mae, p90_mfe, p95_mfe,
-                                max_consecutive_stops, time_in_trade_avg, stop_efficiency,
-                                protection_reached_rate, protection_saved_count,
-                                big_runner_count, best_context_json
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                    ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                timestamp_utc.isoformat(),
-                                instrument,
-                                stop_ticks,
-                                _num(trigger),
-                                trailing_mode,
-                                metrics["trades_count"],
-                                metrics["stops_count"],
-                                metrics["reentries_count"],
-                                _num(metrics["winrate"]),
-                                _num(metrics["avg_loss_ticks"]),
-                                _num(metrics["avg_win_ticks"]),
-                                _num(metrics["expectancy"]),
-                                _num(metrics["profit_factor"]),
-                                _num(metrics["median_mfe"]),
-                                _num(metrics["median_mae"]),
-                                _num(metrics["p90_mfe"]),
-                                _num(metrics["p95_mfe"]),
-                                metrics["max_consecutive_stops"],
-                                _num(metrics["time_in_trade_avg"]),
-                                _num(metrics["stop_efficiency"]),
-                                _num(metrics["protection_reached_rate"]),
-                                metrics["protection_saved_count"],
-                                metrics["big_runner_count"],
-                                _json(metrics["best_context"]),
-                            ),
-                        )
+                trigger = self.config.tail_catcher.default_protection_trigger_bps
+                trailing_mode = self.config.tail_catcher.default_trailing_mode
+                rows = list(
+                    conn.execute(
+                        """
+                        SELECT *
+                        FROM shadow_trades
+                        WHERE instrument = ?
+                          AND stop_ticks = ?
+                          AND protection_trigger_bps = ?
+                          AND trailing_mode = ?
+                          AND is_control = 0
+                          AND status = 'CLOSED'
+                        """,
+                        (instrument, stop_ticks, _num(trigger), trailing_mode),
+                    )
+                )
+                metrics = _experiment_metrics(
+                    rows,
+                    big_runner_bps=self.config.tail_catcher.big_runner_mfe_bps,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shadow_stop_experiments(
+                        timestamp_utc, instrument, stop_ticks, protection_trigger_bps,
+                        trailing_mode, trades_count, stops_count, reentries_count,
+                        winrate, avg_loss_ticks, avg_win_ticks, expectancy,
+                        profit_factor, median_mfe, median_mae, p90_mfe, p95_mfe,
+                        max_consecutive_stops, time_in_trade_avg, stop_efficiency,
+                        protection_reached_rate, protection_saved_count,
+                        big_runner_count, best_context_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        timestamp_utc.isoformat(),
+                        instrument,
+                        stop_ticks,
+                        _num(trigger),
+                        trailing_mode,
+                        metrics["trades_count"],
+                        metrics["stops_count"],
+                        metrics["reentries_count"],
+                        _num(metrics["winrate"]),
+                        _num(metrics["avg_loss_ticks"]),
+                        _num(metrics["avg_win_ticks"]),
+                        _num(metrics["expectancy"]),
+                        _num(metrics["profit_factor"]),
+                        _num(metrics["median_mfe"]),
+                        _num(metrics["median_mae"]),
+                        _num(metrics["p90_mfe"]),
+                        _num(metrics["p95_mfe"]),
+                        metrics["max_consecutive_stops"],
+                        _num(metrics["time_in_trade_avg"]),
+                        _num(metrics["stop_efficiency"]),
+                        _num(metrics["protection_reached_rate"]),
+                        metrics["protection_saved_count"],
+                        metrics["big_runner_count"],
+                        _json(metrics["best_context"]),
+                    ),
+                )
             conn.commit()
 
     def _record_entry_type_performance(self, timestamp_utc: datetime, instrument: str) -> None:
@@ -1641,7 +2141,7 @@ class TailCatcherEngine:
                         """
                         SELECT *
                         FROM shadow_trades
-                        WHERE instrument = ? AND entry_type = ?
+                        WHERE instrument = ? AND entry_type = ? AND is_control = 1
                         """,
                         (instrument, entry_type),
                     )
@@ -1733,27 +2233,24 @@ class TailCatcherEngine:
     def _recent_consecutive_stops(self, instrument: str, side: PositionSide) -> int:
         rows = self.storage.fetch_all(
             """
-            SELECT signal_id,
-                   MAX(exit_time) AS last_exit_time,
-                   SUM(
-                       CASE
-                           WHEN exit_reason IN ('stop_loss', 'protected_stop', 'protected_exit')
-                           THEN 1
-                           ELSE 0
-                       END
-                   ) AS stop_like_count,
-                   COUNT(*) AS closed_count
+            SELECT entry_price, exit_price, side
             FROM shadow_trades
-            WHERE instrument = ? AND side = ? AND status = 'CLOSED'
-            GROUP BY signal_id
-            ORDER BY last_exit_time DESC
+            WHERE instrument = ?
+              AND side = ?
+              AND status = 'CLOSED'
+              AND is_control = 1
+              AND exit_price IS NOT NULL
+            ORDER BY exit_time DESC
             LIMIT 20
             """,
             (instrument, side.value),
         )
         count = 0
         for row in rows:
-            if int(row["stop_like_count"]) > 0:
+            entry_price = Decimal(str(row["entry_price"]))
+            exit_price = Decimal(str(row["exit_price"]))
+            pnl = _pnl_abs(PositionSide(str(row["side"])), entry_price, exit_price)
+            if pnl < 0:
                 count += 1
             else:
                 break
@@ -1775,9 +2272,7 @@ def _spread_entry_assessment(
 ) -> dict[str, Any]:
     spread_ticks = _dec_or_none(micro.get("spread_ticks"))
     spread_bps = Decimal(str(micro["spread_bps"]))
-    tick_blocked = (
-        spread_ticks is not None and spread_ticks > config.tail_catcher.spread_max_ticks
-    )
+    tick_blocked = spread_ticks is not None and spread_ticks > config.tail_catcher.spread_max_ticks
     bps_blocked = spread_bps > config.tail_catcher.spread_hard_bps
     reasons = []
     if tick_blocked:
@@ -1915,6 +2410,14 @@ def _stop_hit(trade: _ShadowTrade, exit_price: Decimal) -> bool:
     return exit_price >= trade.stop_price
 
 
+def _protection_hit(trade: _ShadowTrade, trigger_price: Decimal) -> bool:
+    if trade.protection_price is None:
+        return False
+    if trade.side is PositionSide.LONG:
+        return trigger_price <= trade.protection_price
+    return trigger_price >= trade.protection_price
+
+
 def _pnl_abs(side: PositionSide, entry: Decimal, exit_price: Decimal) -> Decimal:
     if side is PositionSide.LONG:
         return exit_price - entry
@@ -1929,12 +2432,6 @@ def _protection_price(side: PositionSide, entry: Decimal, tick: Decimal) -> Deci
     if side is PositionSide.LONG:
         return entry + tick
     return entry - tick
-
-
-def _protected_exit_price(side: PositionSide, entry: Decimal, raw_exit: Decimal) -> Decimal:
-    if side is PositionSide.LONG:
-        return max(entry, raw_exit)
-    return min(entry, raw_exit)
 
 
 def _experiment_metrics(rows: list[Any], *, big_runner_bps: Decimal) -> dict[str, Any]:
@@ -1972,9 +2469,7 @@ def _experiment_metrics(rows: list[Any], *, big_runner_bps: Decimal) -> dict[str
     protection_reached = sum(1 for row in rows if int(row["protection_activated"]) == 1)
     protection_saved = sum(1 for row in rows if row["protected_exit_reason"] is not None)
     big_runner = sum(
-        1
-        for row in rows
-        if Decimal(str(row["mfe_pct"])) >= big_runner_bps / Decimal("10000")
+        1 for row in rows if Decimal(str(row["mfe_pct"])) >= big_runner_bps / Decimal("10000")
     )
     gross_win = sum(wins, Decimal("0"))
     gross_loss = abs(sum(losses, Decimal("0")))
@@ -2121,7 +2616,9 @@ def _row_pnl_ticks(row: Any) -> Decimal:
     exit_price = Decimal(str(row["exit_price"]))
     stop_price = Decimal(str(row["stop_price"]))
     stop_ticks = Decimal(str(row["stop_ticks"]))
-    tick = abs(entry - stop_price) / stop_ticks if stop_ticks else Decimal("1")
+    trigger_entry_raw = row["trigger_entry_price"]
+    trigger_entry = entry if trigger_entry_raw is None else Decimal(str(trigger_entry_raw))
+    tick = abs(trigger_entry - stop_price) / stop_ticks if stop_ticks else Decimal("1")
     pnl = _pnl_abs(PositionSide(str(row["side"])), entry, exit_price)
     return pnl / tick if tick else Decimal("0")
 

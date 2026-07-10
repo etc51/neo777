@@ -59,7 +59,7 @@ class EntryTypeEngine:
     researched offline in ``entry_research.py`` and are intentionally not imported here.
     """
 
-    def __init__(self, *, min_direction_score: Decimal = Decimal("0.12")) -> None:
+    def __init__(self, *, min_direction_score: Decimal = Decimal("0.45")) -> None:
         self.min_direction_score = min_direction_score
 
     def select(
@@ -160,13 +160,10 @@ class EntryTypeEngine:
                 if side is PositionSide.LONG
                 else range_position <= Decimal("0.30")
             )
-            continuation = signed_velocity > Decimal("0.05") or (
-                abs(tick_velocity) <= Decimal("0.05") and signed_pressure > Decimal("0.12")
-            )
             if (
-                not continuation
-                or signed_pressure < Decimal("-0.08")
-                or signed_micro < Decimal("-0.50")
+                signed_velocity < Decimal("0.05")
+                or signed_pressure < Decimal("0.10")
+                or signed_micro < Decimal("-0.25")
             ):
                 continue
             score = (
@@ -230,8 +227,8 @@ class EntryTypeEngine:
                 signed_trend < Decimal("1.5")
                 or pullback_ticks < Decimal("1.5")
                 or pullback_ticks > Decimal("6")
-                or signed_pressure < Decimal("-0.05")
-                or signed_micro < Decimal("-0.50")
+                or signed_pressure < Decimal("0.10")
+                or signed_micro < Decimal("-0.25")
             ):
                 continue
             pullback_fit = Decimal("6") - abs(pullback_ticks - Decimal("3"))
@@ -323,12 +320,14 @@ class EntryTypeEngine:
             )
             signed_pressure = _side_value(side, pressure)
             signed_micro = _side_value(side, micro_dev)
-            signed_reversal_velocity = _side_value(side, -tick_velocity)
+            signed_reversal_velocity = _side_value(side, tick_velocity)
             signed_acceleration = _side_value(side, acceleration)
             if (
                 not at_failed_edge
                 or signed_pressure < Decimal("0.05")
                 or signed_micro < Decimal("-0.25")
+                or signed_reversal_velocity < Decimal("0.05")
+                or signed_acceleration < Decimal("0.02")
             ):
                 continue
             score = (
@@ -372,6 +371,12 @@ class EntryTypeEngine:
         candidates: list[EntryCandidate] = []
         for peer_name, context in peer_contexts.items():
             if peer_name == snapshot.instrument:
+                continue
+            context_timestamp = context.get("timestamp_utc")
+            if not isinstance(context_timestamp, datetime):
+                continue
+            age_sec = (snapshot.timestamp_utc - context_timestamp).total_seconds()
+            if age_sec < 0 or age_sec > 15:
                 continue
             peer_volatility = context.get("volatility", {})
             if not isinstance(peer_volatility, Mapping):
@@ -437,13 +442,20 @@ class EntryTypeEngine:
     ) -> EntryCandidate:
         score = _clamp(score, Decimal("0"), Decimal("1"))
         tick_velocity = abs(_dec(volatility.get("tick_velocity")))
+        type_prior = {
+            "book_flip_entry": Decimal("5"),
+            "pullback_continuation": Decimal("4"),
+            "impulse_continuation": Decimal("3"),
+            "failed_push_reversal": Decimal("2"),
+            "lead_lag_confirmed": Decimal("2"),
+        }.get(entry_type, Decimal("2"))
         expected_mfe_ticks = _clamp(
-            Decimal("3") + (score * Decimal("8")) + (tick_velocity * Decimal("0.12")),
+            type_prior + (score * Decimal("5")) + (tick_velocity * Decimal("0.10")),
             Decimal("3"),
             Decimal("15"),
         )
         expected_stop_risk_ticks = _clamp(
-            Decimal("6") - (score * Decimal("3")),
+            Decimal("8") - (score * Decimal("5")),
             Decimal("2"),
             Decimal("10"),
         )

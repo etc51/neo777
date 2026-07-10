@@ -1,4 +1,4 @@
-﻿"""Markdown and JSON reports for `neo_swarm_scalper`."""
+"""Markdown and JSON reports for `neo_swarm_scalper`."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any
 
 from neo_swarm_scalper.bots import ACTIVE_BOT_IDS
 from neo_swarm_scalper.config import NeoSwarmScalperConfig
+from neo_swarm_scalper.expectancy import evaluate_promotion
 from neo_swarm_scalper.storage import SQLiteJournal
 
 
@@ -75,7 +76,8 @@ def build_report_payload(
     )
     shadow_rows = storage.fetch_all(
         """
-        SELECT instrument, stop_ticks, protection_trigger_bps, trailing_mode,
+        SELECT instrument, experiment_role, stop_ticks, protection_trigger_bps, trailing_mode,
+               COUNT(DISTINCT opportunity_id) AS opportunities,
                COUNT(*) AS trades,
                SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_trades,
                SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_trades,
@@ -85,8 +87,8 @@ def build_report_payload(
                MAX(mfe_ticks) AS max_mfe_ticks,
                MIN(mae_ticks) AS min_mae_ticks
         FROM shadow_trades
-        GROUP BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
-        ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
+        GROUP BY instrument, experiment_role, stop_ticks, protection_trigger_bps, trailing_mode
+        ORDER BY instrument, experiment_role, stop_ticks
         """
     )
     latest_experiments = storage.fetch_all(
@@ -95,16 +97,25 @@ def build_report_payload(
                stops_count, winrate, expectancy, profit_factor, median_mfe, median_mae,
                p90_mfe, p95_mfe, big_runner_count
         FROM shadow_stop_experiments
-        WHERE id IN (
+        WHERE protection_trigger_bps = ? AND trailing_mode = ? AND id IN (
             SELECT MAX(id)
             FROM shadow_stop_experiments
             GROUP BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
         )
         ORDER BY instrument, stop_ticks, protection_trigger_bps, trailing_mode
-        """
+        """,
+        (
+            float(config.tail_catcher.default_protection_trigger_bps),
+            config.tail_catcher.default_trailing_mode,
+        ),
     )
-    shadow_exit_summary = _shadow_exit_summary(storage)
-    stop_comparison = _shadow_stop_comparison(storage)
+    shadow_exit_summary = _shadow_exit_summary(storage, is_control=True)
+    research_exit_summary = _shadow_exit_summary(storage, is_control=False)
+    stop_comparison = _shadow_stop_comparison(
+        storage,
+        configured_stop_ticks=config.tail_catcher.stop_ticks,
+    )
+    control_expectancy = _control_expectancy(storage)
     entry_type_performance = _entry_type_performance(storage)
     total_pnl = sum((Decimal(str(row["net_pnl"])) for row in bot_rows), Decimal("0"))
     best_bot = max(bot_rows, key=lambda row: Decimal(str(row["net_pnl"])), default=None)
@@ -145,6 +156,7 @@ def build_report_payload(
             "entry_research_labels",
             "entry_strategy_scores",
             "entry_type_performance",
+            "market_opportunities",
             "reentry_series",
             "forward_outcome_labels",
             "curator_decisions",
@@ -169,12 +181,14 @@ def build_report_payload(
         "shadow_trades": [_row_dict(row) for row in shadow_rows],
         "shadow_experiments": [_row_dict(row) for row in latest_experiments],
         "shadow_exit_summary": shadow_exit_summary,
+        "research_exit_summary": research_exit_summary,
         "shadow_stop_comparison": stop_comparison,
+        "control_expectancy": control_expectancy,
         "entry_type_performance": entry_type_performance,
         "next_steps": [
             "Watch data freshness and orderbook_missing warnings.",
-            "Compare stop_ticks after at least 30 closed shadow trades per instrument.",
-            "Review spread, protection saves, and MFE pullbacks before changing defaults.",
+            "Compare stop_ticks only after 30 independent non-spread opportunities per stop.",
+            "Keep real orders disabled until control expectancy passes the forward gate.",
         ],
     }
 
@@ -259,24 +273,43 @@ def render_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Shadow Trades",
             "",
-            "| instrument | stop_ticks | protection_bps | trailing | trades | open | "
-            "closed | stops | protected | max_mfe_ticks | min_mae_ticks |",
-            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| instrument | role | stop_ticks | protection_bps | trailing | "
+            "opportunities | trades | open | closed | stops | protected | "
+            "max_mfe_ticks | min_mae_ticks |",
+            "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | "
+            "---: | ---: | ---: | ---: |",
         ]
     )
     for row in payload["shadow_trades"]:
         lines.append(
-            f"| {row['instrument']} | {row['stop_ticks']} | {row['protection_trigger_bps']} | "
-            f"{row['trailing_mode']} | {row['trades']} | {row['open_trades']} | "
+            f"| {row['instrument']} | {row['experiment_role']} | {row['stop_ticks']} | "
+            f"{row['protection_trigger_bps']} | {row['trailing_mode']} | "
+            f"{row['opportunities']} | {row['trades']} | {row['open_trades']} | "
             f"{row['closed_trades']} | {row['stops']} | {row['protected']} | "
             f"{row['max_mfe_ticks']} | {row['min_mae_ticks']} |"
         )
     exit_summary = payload["shadow_exit_summary"]
+    research_exit_summary = payload["research_exit_summary"]
     stop_comparison = payload["shadow_stop_comparison"]
+    control = payload["control_expectancy"]
     lines.extend(
         [
             "",
-            "## Shadow Exit Summary",
+            "## Control Expectancy",
+            "",
+            "One control trade is counted per independent market opportunity.",
+            "",
+            f"- status: {control['status']}",
+            f"- gate reason: {control['reason']}",
+            f"- opportunities: {control['opportunities']}",
+            f"- closed opportunities: {control['closed_opportunities']}",
+            f"- expectancy ticks: {control['expectancy_ticks']}",
+            f"- profit factor: {control['profit_factor']}",
+            f"- 95% lower confidence bound ticks: {control['lower_confidence_ticks']}",
+            f"- eligible for next validation stage: {control['eligible_for_next_stage']}",
+            f"- real orders disabled: {control['real_orders_disabled']}",
+            "",
+            "## Control Exit Summary",
             "",
             f"- stop exits: {exit_summary['stop_exits']}",
             f"- protection exits: {exit_summary['protection_exits']}",
@@ -285,6 +318,15 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"- real spread_shock exits: {exit_summary['real_spread_shock_exits']}",
             f"- avoided spread_shock exits: {exit_summary['avoided_spread_shock_exits']}",
             f"- market_bad spread warnings: {exit_summary['market_bad_spread_warnings']}",
+            "",
+            "## Research Exit Summary",
+            "",
+            f"- stop exits: {research_exit_summary['stop_exits']}",
+            f"- protection exits: {research_exit_summary['protection_exits']}",
+            f"- trailing exits: {research_exit_summary['trailing_exits']}",
+            f"- time exits: {research_exit_summary['time_exits']}",
+            f"- real spread_shock exits: {research_exit_summary['real_spread_shock_exits']}",
+            f"- avoided spread_shock exits: {research_exit_summary['avoided_spread_shock_exits']}",
             "",
             "## Stop Tick Comparison",
             "",
@@ -434,7 +476,11 @@ def _row_dict(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
-def _shadow_exit_summary(storage: SQLiteJournal) -> dict[str, Any]:
+def _shadow_exit_summary(
+    storage: SQLiteJournal,
+    *,
+    is_control: bool,
+) -> dict[str, Any]:
     row = storage.fetch_all(
         """
         SELECT
@@ -444,21 +490,28 @@ def _shadow_exit_summary(storage: SQLiteJournal) -> dict[str, Any]:
                 AS protection_exits,
             SUM(CASE WHEN exit_reason = 'trailing_runner' THEN 1 ELSE 0 END)
                 AS trailing_exits,
-            SUM(CASE WHEN exit_reason = 'time_exit' THEN 1 ELSE 0 END)
+            SUM(CASE
+                    WHEN exit_reason IN ('time_exit', 'time_exit_spread_timeout') THEN 1
+                    ELSE 0
+                END)
                 AS time_exits,
             SUM(CASE WHEN exit_reason = 'spread_shock' THEN 1 ELSE 0 END)
                 AS real_spread_shock_exits
         FROM shadow_trades
-        WHERE status = 'CLOSED'
-        """
+        WHERE status = 'CLOSED' AND is_control = ?
+        """,
+        (int(is_control),),
     )[0]
     events = storage.fetch_all(
         """
-        SELECT event_type, COUNT(*) AS count
-        FROM shadow_trade_events
-        WHERE event_type IN ('avoided_spread_shock_exit', 'market_bad_spread_warning')
-        GROUP BY event_type
-        """
+        SELECT e.event_type, COUNT(*) AS count
+        FROM shadow_trade_events e
+        JOIN shadow_trades st ON st.trade_id = e.trade_id
+        WHERE st.is_control = ?
+          AND e.event_type IN ('avoided_spread_shock_exit', 'market_bad_spread_warning')
+        GROUP BY e.event_type
+        """,
+        (int(is_control),),
     )
     event_counts = {str(item["event_type"]): int(item["count"]) for item in events}
     return {
@@ -472,12 +525,18 @@ def _shadow_exit_summary(storage: SQLiteJournal) -> dict[str, Any]:
     }
 
 
-def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
+def _shadow_stop_comparison(
+    storage: SQLiteJournal,
+    *,
+    configured_stop_ticks: tuple[int, ...],
+) -> dict[str, Any]:
     rows = storage.fetch_all(
         """
         SELECT
             stop_ticks,
             COUNT(*) AS trades,
+            COUNT(DISTINCT CASE WHEN exit_reason != 'spread_shock' THEN opportunity_id END)
+                AS independent_opportunities,
             SUM(CASE WHEN exit_reason != 'spread_shock' THEN 1 ELSE 0 END)
                 AS non_spread_trades,
             AVG(
@@ -485,8 +544,12 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
                     WHEN exit_reason != 'spread_shock'
                     THEN CASE
                         WHEN side = 'LONG'
-                        THEN (exit_price - entry_price) / ((entry_price - stop_price) / stop_ticks)
-                        ELSE (entry_price - exit_price) / ((stop_price - entry_price) / stop_ticks)
+                        THEN (exit_price - entry_price)
+                             / (ABS(COALESCE(trigger_entry_price, entry_price) - stop_price)
+                                / stop_ticks)
+                        ELSE (entry_price - exit_price)
+                             / (ABS(stop_price - COALESCE(trigger_entry_price, entry_price))
+                                / stop_ticks)
                     END
                     ELSE NULL
                 END
@@ -497,12 +560,15 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
                 AS protection_exits,
             SUM(CASE WHEN exit_reason = 'trailing_runner' THEN 1 ELSE 0 END)
                 AS trailing_exits,
-            SUM(CASE WHEN exit_reason = 'time_exit' THEN 1 ELSE 0 END)
+            SUM(CASE
+                    WHEN exit_reason IN ('time_exit', 'time_exit_spread_timeout') THEN 1
+                    ELSE 0
+                END)
                 AS time_exits,
             SUM(CASE WHEN exit_reason = 'spread_shock' THEN 1 ELSE 0 END)
                 AS spread_shock_exits
         FROM shadow_trades
-        WHERE status = 'CLOSED' AND exit_price IS NOT NULL
+        WHERE status = 'CLOSED' AND exit_price IS NOT NULL AND is_control = 0
         GROUP BY stop_ticks
         ORDER BY stop_ticks
         """
@@ -511,14 +577,16 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
         """
         SELECT DISTINCT exit_reason
         FROM shadow_trades
-        WHERE status = 'CLOSED' AND exit_reason IS NOT NULL
+        WHERE status = 'CLOSED' AND exit_reason IS NOT NULL AND is_control = 0
         """
     )
     result_rows = [_row_dict(row) for row in rows]
     non_spread_total = sum(int(row["non_spread_trades"] or 0) for row in result_rows)
     distinct_reasons = {str(row["exit_reason"]) for row in reason_rows}
+    configured = set(configured_stop_ticks)
+    observed = {int(row["stop_ticks"]) for row in result_rows}
     status = "VALID"
-    reason = "non-spread exit sample is available"
+    reason = "independent non-spread sample is available"
     if not result_rows:
         status = "INVALID"
         reason = "no closed shadow trades"
@@ -528,6 +596,12 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
     elif non_spread_total == 0:
         status = "INVALID"
         reason = "no closed trades after excluding spread_shock"
+    elif observed != configured:
+        status = "INVALID"
+        reason = "not all configured stop_ticks have closed samples"
+    elif any(int(row["independent_opportunities"] or 0) < 30 for row in result_rows):
+        status = "INVALID"
+        reason = "fewer than 30 independent non-spread opportunities per stop_ticks"
     best_stop_ticks: int | None = None
     if status == "VALID":
         candidates = [
@@ -544,6 +618,33 @@ def _shadow_stop_comparison(storage: SQLiteJournal) -> dict[str, Any]:
         "reason": reason,
         "best_stop_ticks": best_stop_ticks,
         "rows": result_rows,
+    }
+
+
+def _control_expectancy(storage: SQLiteJournal) -> dict[str, Any]:
+    rows = storage.fetch_all(
+        """
+        SELECT status, pnl_ticks
+        FROM market_opportunities
+        ORDER BY timestamp_utc, opportunity_id
+        """
+    )
+    pnl_ticks = [
+        Decimal(str(row["pnl_ticks"]))
+        for row in rows
+        if row["status"] == "CLOSED" and row["pnl_ticks"] is not None
+    ]
+    decision = evaluate_promotion(pnl_ticks)
+    return {
+        "status": "FORWARD_GATE_PASSED" if decision.promoted else "NOT_VALIDATED",
+        "reason": decision.reason,
+        "opportunities": len(rows),
+        "closed_opportunities": decision.opportunities,
+        "expectancy_ticks": str(decision.expectancy_ticks),
+        "profit_factor": str(decision.profit_factor),
+        "lower_confidence_ticks": str(decision.lower_confidence_ticks),
+        "eligible_for_next_stage": decision.promoted,
+        "real_orders_disabled": True,
     }
 
 

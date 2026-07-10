@@ -1,4 +1,4 @@
-﻿"""YAML configuration for `neo_swarm_scalper`."""
+"""YAML configuration for `neo_swarm_scalper`."""
 
 from __future__ import annotations
 
@@ -100,21 +100,44 @@ class ScalpingConfig:
 
 @dataclass(frozen=True)
 class TailCatcherConfig:
-    stop_ticks: tuple[int, ...] = (2, 3, 4, 5, 7, 10)
+    stop_ticks: tuple[int, ...] = (10, 20, 40, 80, 160, 320)
     protection_trigger_bps: tuple[Decimal, ...] = (
-        Decimal("10"),
-        Decimal("15"),
-        Decimal("20"),
+        Decimal("1"),
+        Decimal("2"),
+        Decimal("3"),
+        Decimal("5"),
     )
-    trailing_modes: tuple[str, ...] = ("tight", "normal", "loose", "microstructure_adaptive")
-    default_protection_trigger_bps: Decimal = Decimal("15")
-    default_trailing_mode: str = "microstructure_adaptive"
-    max_reentries_per_direction_per_instrument: int = 5
-    max_consecutive_stops: int = 5
+    trailing_modes: tuple[str, ...] = ("tight", "normal", "loose", "expectancy_adaptive")
+    default_protection_trigger_bps: Decimal = Decimal("2")
+    default_trailing_mode: str = "expectancy_adaptive"
+    control_entry_types: tuple[str, ...] = (
+        "book_flip_entry",
+        "impulse_continuation",
+        "pullback_continuation",
+    )
+    control_min_direction_score: Decimal = Decimal("0.45")
+    min_direction_margin: Decimal = Decimal("0.10")
+    entry_confirmation_cycles: int = 2
+    pressure_confirmation_window: int = 3
+    pressure_confirmation_ratio: Decimal = Decimal("0.67")
+    min_signed_velocity: Decimal = Decimal("0.02")
+    min_edge_to_cost_ratio: Decimal = Decimal("1.25")
+    max_stop_to_mfe_ratio: Decimal = Decimal("0.85")
+    control_stop_bps: Decimal = Decimal("5")
+    control_stop_ticks_min: int = 10
+    control_stop_ticks_max: int = 600
+    control_time_exit_sec: int = 120
+    stop_confirmation_cycles: int = 2
+    protection_confirmation_cycles: int = 1
+    trailing_confirmation_cycles: int = 2
+    time_exit_spread_grace_cycles: int = 6
+    panic_stop_multiple: Decimal = Decimal("2")
+    max_reentries_per_direction_per_instrument: int = 2
+    max_consecutive_stops: int = 3
     cooldown_after_bad_series_sec: int = 300
     spread_max_ticks: Decimal = Decimal("3")
     spread_hard_bps: Decimal = Decimal("12")
-    min_pressure_score: Decimal = Decimal("0.08")
+    min_pressure_score: Decimal = Decimal("0.12")
     min_depth_top5: Decimal = Decimal("10")
     thin_book_depth_top5: Decimal = Decimal("5")
     protection_activation_pct_hint: Decimal = Decimal("0.0015")
@@ -209,8 +232,10 @@ class NeoSwarmScalperConfig:
             raise ValueError("allow_flip_without_close must remain false.")
         if self.risk.max_open_positions_per_bot != 1:
             raise ValueError("max_open_positions_per_bot must be 1.")
-        if self.tail_catcher.stop_ticks != (2, 3, 4, 5, 7, 10):
-            raise ValueError("tail_catcher.stop_ticks must be 2/3/4/5/7/10.")
+        if not self.tail_catcher.stop_ticks or any(
+            item <= 0 for item in self.tail_catcher.stop_ticks
+        ):
+            raise ValueError("tail_catcher.stop_ticks must contain positive values.")
         if (
             self.tail_catcher.default_protection_trigger_bps
             not in self.tail_catcher.protection_trigger_bps
@@ -218,6 +243,16 @@ class NeoSwarmScalperConfig:
             raise ValueError("default protection trigger must be part of protection_trigger_bps.")
         if self.tail_catcher.default_trailing_mode not in self.tail_catcher.trailing_modes:
             raise ValueError("default trailing mode must be part of trailing_modes.")
+        if self.tail_catcher.entry_confirmation_cycles < 2:
+            raise ValueError("entry_confirmation_cycles must be at least 2.")
+        if self.tail_catcher.stop_confirmation_cycles < 2:
+            raise ValueError("stop_confirmation_cycles must be at least 2.")
+        if self.tail_catcher.protection_confirmation_cycles < 1:
+            raise ValueError("protection_confirmation_cycles must be positive.")
+        if not Decimal("0") < self.tail_catcher.pressure_confirmation_ratio <= Decimal("1"):
+            raise ValueError("pressure_confirmation_ratio must be in (0, 1].")
+        if self.tail_catcher.control_stop_ticks_min > self.tail_catcher.control_stop_ticks_max:
+            raise ValueError("control stop tick bounds are inverted.")
 
     @property
     def enabled_instruments(self) -> tuple[InstrumentConfig, ...]:
@@ -278,9 +313,7 @@ def _data(raw: Mapping[str, Any]) -> DataConfig:
 
 def _simulation(raw: Mapping[str, Any]) -> SimulationConfig:
     return SimulationConfig(
-        virtual_accounts_count=_int(
-            raw.get("virtual_accounts_count", 3), "virtual_accounts_count"
-        ),
+        virtual_accounts_count=_int(raw.get("virtual_accounts_count", 3), "virtual_accounts_count"),
         total_capital=_decimal(raw.get("total_capital", "500000"), "total_capital"),
         reserve_cash=_decimal(raw.get("reserve_cash", "0"), "reserve_cash"),
         working_capital=_decimal(raw.get("working_capital", "500000"), "working_capital"),
@@ -388,38 +421,116 @@ def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
         stop_ticks=tuple(
             _int(item, "tail_catcher.stop_ticks[]")
             for item in _sequence(
-                raw.get("stop_ticks", [2, 3, 4, 5, 7, 10]),
+                raw.get("stop_ticks", [10, 20, 40, 80, 160, 320]),
                 "tail_catcher.stop_ticks",
             )
         ),
         protection_trigger_bps=tuple(
             _decimal(item, "tail_catcher.protection_trigger_bps[]")
             for item in _sequence(
-                raw.get("protection_trigger_bps", [10, 15, 20]),
+                raw.get("protection_trigger_bps", [1, 2, 3, 5]),
                 "tail_catcher.protection_trigger_bps",
             )
         ),
         trailing_modes=tuple(
             _string(item, "tail_catcher.trailing_modes[]")
             for item in _sequence(
-                raw.get("trailing_modes", ["tight", "normal", "loose", "microstructure_adaptive"]),
+                raw.get("trailing_modes", ["tight", "normal", "loose", "expectancy_adaptive"]),
                 "tail_catcher.trailing_modes",
             )
         ),
         default_protection_trigger_bps=_decimal(
-            raw.get("default_protection_trigger_bps", "15"),
+            raw.get("default_protection_trigger_bps", "2"),
             "tail_catcher.default_protection_trigger_bps",
         ),
         default_trailing_mode=_string(
-            raw.get("default_trailing_mode", "microstructure_adaptive"),
+            raw.get("default_trailing_mode", "expectancy_adaptive"),
             "tail_catcher.default_trailing_mode",
         ),
+        control_entry_types=tuple(
+            _string(item, "tail_catcher.control_entry_types[]")
+            for item in _sequence(
+                raw.get(
+                    "control_entry_types",
+                    ["book_flip_entry", "impulse_continuation", "pullback_continuation"],
+                ),
+                "tail_catcher.control_entry_types",
+            )
+        ),
+        control_min_direction_score=_decimal(
+            raw.get("control_min_direction_score", "0.45"),
+            "tail_catcher.control_min_direction_score",
+        ),
+        min_direction_margin=_decimal(
+            raw.get("min_direction_margin", "0.10"),
+            "tail_catcher.min_direction_margin",
+        ),
+        entry_confirmation_cycles=_int(
+            raw.get("entry_confirmation_cycles", 2),
+            "tail_catcher.entry_confirmation_cycles",
+        ),
+        pressure_confirmation_window=_int(
+            raw.get("pressure_confirmation_window", 3),
+            "tail_catcher.pressure_confirmation_window",
+        ),
+        pressure_confirmation_ratio=_decimal(
+            raw.get("pressure_confirmation_ratio", "0.67"),
+            "tail_catcher.pressure_confirmation_ratio",
+        ),
+        min_signed_velocity=_decimal(
+            raw.get("min_signed_velocity", "0.02"),
+            "tail_catcher.min_signed_velocity",
+        ),
+        min_edge_to_cost_ratio=_decimal(
+            raw.get("min_edge_to_cost_ratio", "1.25"),
+            "tail_catcher.min_edge_to_cost_ratio",
+        ),
+        max_stop_to_mfe_ratio=_decimal(
+            raw.get("max_stop_to_mfe_ratio", "0.85"),
+            "tail_catcher.max_stop_to_mfe_ratio",
+        ),
+        control_stop_bps=_decimal(
+            raw.get("control_stop_bps", "5"),
+            "tail_catcher.control_stop_bps",
+        ),
+        control_stop_ticks_min=_int(
+            raw.get("control_stop_ticks_min", 10),
+            "tail_catcher.control_stop_ticks_min",
+        ),
+        control_stop_ticks_max=_int(
+            raw.get("control_stop_ticks_max", 600),
+            "tail_catcher.control_stop_ticks_max",
+        ),
+        control_time_exit_sec=_int(
+            raw.get("control_time_exit_sec", 120),
+            "tail_catcher.control_time_exit_sec",
+        ),
+        stop_confirmation_cycles=_int(
+            raw.get("stop_confirmation_cycles", 2),
+            "tail_catcher.stop_confirmation_cycles",
+        ),
+        protection_confirmation_cycles=_int(
+            raw.get("protection_confirmation_cycles", 1),
+            "tail_catcher.protection_confirmation_cycles",
+        ),
+        trailing_confirmation_cycles=_int(
+            raw.get("trailing_confirmation_cycles", 2),
+            "tail_catcher.trailing_confirmation_cycles",
+        ),
+        time_exit_spread_grace_cycles=_int(
+            raw.get("time_exit_spread_grace_cycles", 6),
+            "tail_catcher.time_exit_spread_grace_cycles",
+        ),
+        panic_stop_multiple=_decimal(
+            raw.get("panic_stop_multiple", "2"),
+            "tail_catcher.panic_stop_multiple",
+        ),
         max_reentries_per_direction_per_instrument=_int(
-            raw.get("max_reentries_per_direction_per_instrument", 5),
+            raw.get("max_reentries_per_direction_per_instrument", 2),
             "tail_catcher.max_reentries_per_direction_per_instrument",
         ),
         max_consecutive_stops=_int(
-            raw.get("max_consecutive_stops", 5),
+            raw.get("max_consecutive_stops", 3),
             "tail_catcher.max_consecutive_stops",
         ),
         cooldown_after_bad_series_sec=_int(
@@ -432,7 +543,7 @@ def _tail_catcher(raw: Mapping[str, Any]) -> TailCatcherConfig:
         ),
         spread_hard_bps=_decimal(raw.get("spread_hard_bps", "12"), "tail_catcher.spread_hard_bps"),
         min_pressure_score=_decimal(
-            raw.get("min_pressure_score", "0.08"),
+            raw.get("min_pressure_score", "0.12"),
             "tail_catcher.min_pressure_score",
         ),
         min_depth_top5=_decimal(raw.get("min_depth_top5", "10"), "tail_catcher.min_depth_top5"),

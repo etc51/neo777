@@ -1,4 +1,4 @@
-﻿"""Streamlit dashboard for the paper/live-data swarm."""
+"""Streamlit dashboard for the paper/live-data swarm."""
 
 from __future__ import annotations
 
@@ -161,7 +161,7 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
                 """
                 SELECT *
                 FROM shadow_trades
-                WHERE status = 'OPEN'
+                WHERE status = 'OPEN' AND is_control = 1
                 ORDER BY entry_time DESC
                 LIMIT 200
                 """
@@ -173,6 +173,7 @@ def load_dashboard_state(db_path: Path | str) -> dict[str, Any]:
                 """
                 SELECT *
                 FROM shadow_trades
+                WHERE is_control = 1
                 ORDER BY entry_time DESC
                 LIMIT 200
                 """
@@ -387,6 +388,7 @@ def _performance_by_stop_ticks(storage: SQLiteJournal) -> list[dict[str, Any]]:
                AVG(mfe_ticks) AS avg_mfe_ticks,
                AVG(mae_ticks) AS avg_mae_ticks
         FROM shadow_trades
+        WHERE is_control = 0
         GROUP BY stop_ticks
         ORDER BY stop_ticks
         """
@@ -405,6 +407,7 @@ def _mfe_mae_distribution(storage: SQLiteJournal) -> list[dict[str, Any]]:
                AVG(mae_ticks) AS avg_mae,
                MAX(mae_ticks) AS max_mae
         FROM shadow_trades
+        WHERE is_control = 0
         GROUP BY instrument, stop_ticks
         ORDER BY instrument, stop_ticks
         """
@@ -478,16 +481,18 @@ def _stop_comparison_by_entry_type(storage: SQLiteJournal) -> list[dict[str, Any
                        WHEN exit_price IS NOT NULL AND exit_reason != 'spread_shock'
                        THEN CASE
                            WHEN side = 'LONG'
-                           THEN (exit_price - entry_price)
-                                / ((entry_price - stop_price) / stop_ticks)
-                           ELSE (entry_price - exit_price)
-                                / ((stop_price - entry_price) / stop_ticks)
+                            THEN (exit_price - entry_price)
+                                / (ABS(COALESCE(trigger_entry_price, entry_price) - stop_price)
+                                   / stop_ticks)
+                            ELSE (entry_price - exit_price)
+                                / (ABS(stop_price - COALESCE(trigger_entry_price, entry_price))
+                                   / stop_ticks)
                        END
                        ELSE NULL
                    END
                ) AS avg_pnl_ticks_non_spread
         FROM shadow_trades
-        WHERE entry_type IS NOT NULL
+        WHERE entry_type IS NOT NULL AND is_control = 0
         GROUP BY entry_type, instrument, stop_ticks
         ORDER BY entry_type, instrument, stop_ticks
         """
@@ -579,18 +584,30 @@ def _best_entry_type_today(storage: SQLiteJournal) -> dict[str, Any] | None:
 def _daily_summary(storage: SQLiteJournal) -> dict[str, Any]:
     rows = storage.fetch_all(
         """
-        SELECT COUNT(*) AS shadow_trades,
-               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_shadow_trades,
-               SUM(CASE WHEN protection_activated = 1 THEN 1 ELSE 0 END) AS protected_trades,
+        SELECT COUNT(*) AS control_trades,
+               COUNT(DISTINCT opportunity_id) AS market_opportunities,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_control_trades,
+               SUM(CASE WHEN protection_activated = 1 THEN 1 ELSE 0 END)
+                   AS protected_control_trades,
                SUM(CASE WHEN exit_reason IN ('trailing_runner', 'protected_exit') THEN 1 ELSE 0 END)
                    AS trailed_or_protected_exits,
                MAX(mfe_ticks) AS max_mfe_ticks,
                MIN(mae_ticks) AS min_mae_ticks
         FROM shadow_trades
+        WHERE is_control = 1
         """
     )
     counts = SQLiteJournal(storage.path).table_counts()
     summary = _row_dict(rows[0]) if rows else {}
+    research = storage.fetch_all(
+        """
+        SELECT COUNT(*) AS research_arms,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_research_arms
+        FROM shadow_trades
+        WHERE is_control = 0
+        """
+    )[0]
+    summary.update(_row_dict(research))
     summary["counts"] = counts
     summary["real_orders_disabled"] = True
     summary["token_masked"] = True

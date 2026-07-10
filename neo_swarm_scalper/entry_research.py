@@ -15,7 +15,7 @@ from neo_swarm_scalper.storage import SQLiteJournal
 from neo_swarm_scalper.types import BookLevel, InstrumentMetadata, MarketSnapshot, PositionSide
 
 DEFAULT_WINDOWS_SEC = (5, 15, 30, 60, 120)
-DEFAULT_STOP_TICKS = (2, 3, 4, 5, 7, 10)
+DEFAULT_STOP_TICKS = (10, 20, 40, 80, 160, 320)
 
 
 @dataclass(frozen=True)

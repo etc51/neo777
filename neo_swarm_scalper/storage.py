@@ -1,4 +1,4 @@
-﻿"""SQLite append-only journal for the neo swarm scalper."""
+"""SQLite append-only journal for the neo swarm scalper."""
 
 from __future__ import annotations
 
@@ -684,6 +684,7 @@ class SQLiteJournal:
             "entry_research_labels",
             "entry_strategy_scores",
             "entry_type_performance",
+            "market_opportunities",
             "reentry_series",
             "forward_outcome_labels",
             "mfe_mae_tracking",
@@ -820,6 +821,13 @@ def _migrate_entry_engine(conn: sqlite3.Connection) -> None:
             "lead_lag_score": "REAL NOT NULL DEFAULT 0",
             "expected_mfe_ticks": "REAL NOT NULL DEFAULT 0",
             "expected_stop_risk_ticks": "REAL NOT NULL DEFAULT 0",
+            "opportunity_id": "TEXT",
+            "policy_version": "TEXT",
+            "direction_margin": "REAL NOT NULL DEFAULT 0",
+            "confirmation_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "pressure_persistence": "REAL NOT NULL DEFAULT 0",
+            "execution_cost_ticks": "REAL NOT NULL DEFAULT 0",
+            "required_mfe_ticks": "REAL NOT NULL DEFAULT 0",
         },
     )
     _add_columns(
@@ -842,7 +850,27 @@ def _migrate_entry_engine(conn: sqlite3.Connection) -> None:
             "reason_reentry_allowed": "TEXT",
             "reason_reentry_blocked": "TEXT",
             "trailing_reason": "TEXT",
+            "opportunity_id": "TEXT",
+            "is_control": "INTEGER NOT NULL DEFAULT 0",
+            "experiment_role": "TEXT NOT NULL DEFAULT 'research'",
+            "policy_version": "TEXT",
+            "trigger_entry_price": "REAL",
+            "execution_cost_ticks": "REAL NOT NULL DEFAULT 0",
+            "direction_margin": "REAL NOT NULL DEFAULT 0",
+            "confirmation_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "max_hold_sec": "INTEGER NOT NULL DEFAULT 120",
+            "spread_bad_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "stop_trigger_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "protection_trigger_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "trailing_bad_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "time_exit_bad_spread_cycles": "INTEGER NOT NULL DEFAULT 0",
+            "exit_trigger_price": "REAL",
+            "execution_shortfall_ticks": "REAL NOT NULL DEFAULT 0",
         },
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_trades_control_exit "
+        "ON shadow_trades(is_control, status, exit_time)"
     )
 
 
@@ -1066,6 +1094,13 @@ CREATE TABLE IF NOT EXISTS shadow_signals (
     lead_lag_score REAL NOT NULL DEFAULT 0,
     expected_mfe_ticks REAL NOT NULL DEFAULT 0,
     expected_stop_risk_ticks REAL NOT NULL DEFAULT 0,
+    opportunity_id TEXT,
+    policy_version TEXT,
+    direction_margin REAL NOT NULL DEFAULT 0,
+    confirmation_cycles INTEGER NOT NULL DEFAULT 0,
+    pressure_persistence REAL NOT NULL DEFAULT 0,
+    execution_cost_ticks REAL NOT NULL DEFAULT 0,
+    required_mfe_ticks REAL NOT NULL DEFAULT 0,
     gate_status_json TEXT NOT NULL,
     features_json TEXT NOT NULL
 );
@@ -1118,6 +1153,22 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     reason_reentry_allowed TEXT,
     reason_reentry_blocked TEXT,
     trailing_reason TEXT,
+    opportunity_id TEXT,
+    is_control INTEGER NOT NULL DEFAULT 0,
+    experiment_role TEXT NOT NULL DEFAULT 'research',
+    policy_version TEXT,
+    trigger_entry_price REAL,
+    execution_cost_ticks REAL NOT NULL DEFAULT 0,
+    direction_margin REAL NOT NULL DEFAULT 0,
+    confirmation_cycles INTEGER NOT NULL DEFAULT 0,
+    max_hold_sec INTEGER NOT NULL DEFAULT 120,
+    spread_bad_cycles INTEGER NOT NULL DEFAULT 0,
+    stop_trigger_cycles INTEGER NOT NULL DEFAULT 0,
+    protection_trigger_cycles INTEGER NOT NULL DEFAULT 0,
+    trailing_bad_cycles INTEGER NOT NULL DEFAULT 0,
+    time_exit_bad_spread_cycles INTEGER NOT NULL DEFAULT 0,
+    exit_trigger_price REAL,
+    execution_shortfall_ticks REAL NOT NULL DEFAULT 0,
     reentry_index INTEGER NOT NULL DEFAULT 0,
     consecutive_stop_index INTEGER NOT NULL DEFAULT 0
 );
@@ -1234,6 +1285,31 @@ CREATE TABLE IF NOT EXISTS entry_type_performance (
     profit_factor REAL NOT NULL,
     details_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS market_opportunities (
+    opportunity_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL UNIQUE,
+    timestamp_utc TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    control_trade_id TEXT,
+    policy_version TEXT NOT NULL,
+    direction_score REAL NOT NULL,
+    direction_margin REAL NOT NULL,
+    confirmation_cycles INTEGER NOT NULL,
+    pressure_persistence REAL NOT NULL,
+    execution_cost_ticks REAL NOT NULL,
+    required_mfe_ticks REAL NOT NULL,
+    exit_time TEXT,
+    exit_reason TEXT,
+    pnl_ticks REAL,
+    details_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_opportunities_instrument_time
+ON market_opportunities(instrument, timestamp_utc);
 
 CREATE TABLE IF NOT EXISTS reentry_series (
     series_id TEXT PRIMARY KEY,
