@@ -1,0 +1,3 @@
+deploy/install-neobitcoin-research.sh text eol=lf
+deploy/neobitcoin-research.service text eol=lf
+deploy/neobitcoin-research.env.example text eol=lf
