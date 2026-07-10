@@ -10,8 +10,8 @@ CONFIG_DIR=/etc/neobitcoin-research
 SERVICE=neobitcoin-research.service
 USER_NAME=neobitcoin-research
 
-if [[ ! -f "${CONFIG_DIR}/tbank.token" ]]; then
-  echo "missing ${CONFIG_DIR}/tbank.token" >&2
+if [[ ! -f "${CONFIG_DIR}/tbank-token.txt" ]]; then
+  echo "missing ${CONFIG_DIR}/tbank-token.txt" >&2
   exit 20
 fi
 
@@ -26,8 +26,8 @@ install -d -o "${USER_NAME}" -g "${USER_NAME}" -m 0750 \
   "${DATA_DIR}" "${DATA_DIR}/reports" "${LOG_DIR}"
 install -d -o root -g root -m 0755 "${RELEASES_DIR}"
 install -d -o root -g "${USER_NAME}" -m 0750 "${CONFIG_DIR}"
-chown root:"${USER_NAME}" "${CONFIG_DIR}/tbank.token"
-chmod 0640 "${CONFIG_DIR}/tbank.token"
+chown root:"${USER_NAME}" "${CONFIG_DIR}/tbank-token.txt"
+chmod 0640 "${CONFIG_DIR}/tbank-token.txt"
 
 stage="$(mktemp -d /opt/.neobitcoin-research-stage.XXXXXX)"
 cleanup() { rm -rf "${stage}"; }

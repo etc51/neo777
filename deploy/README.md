@@ -85,7 +85,7 @@ resolver or swarm runtimes.
 Server paths:
 
 - code: `/opt/neobitcoin-research`;
-- token: `/etc/neobitcoin-research/tbank.token` (root-owned, never committed);
+- token: `/etc/neobitcoin-research/tbank-token.txt` (root-owned, never committed);
 - env: `/etc/neobitcoin-research/research.env`;
 - raw WAL, Parquet, DuckDB, SQLite and reports: `/var/lib/neobitcoin-research`.
 
