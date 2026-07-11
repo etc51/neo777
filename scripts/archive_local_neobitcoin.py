@@ -41,8 +41,9 @@ def main() -> int:
             break
         selected.append(path)
         total += size
-    if not selected:
+    if total < MAX_BYTES:
         print("packed=0")
+        print(f"waiting_bytes={total}")
         return 0
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     target = archives / f"neobitcoin-{stamp}.tar.zst"
