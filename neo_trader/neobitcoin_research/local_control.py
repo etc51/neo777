@@ -273,6 +273,12 @@ def worker_main(paths: LocalRuntimePaths | None = None) -> int:
             ResearchConfig.from_env(),
             data_root=paths.active_dir,
             reports_root=paths.root / "reports",
+            # Neo can legitimately be quiet for tens of seconds.  The generic
+            # 10-second default created false reconnects and made every review
+            # window look discontinuous.
+            stale_after_seconds=float(
+                os.environ.get("NEOBITCOIN_LOCAL_STALE_SECONDS", "180")
+            ),
         )
         config.validate()
         asyncio.run(
