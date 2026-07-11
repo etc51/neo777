@@ -27,3 +27,6 @@ review_bundle/
 neo_trader_review_bundle.zip
 neo_trader_review_bundle.sha256
 reports/
+!reports/
+reports/*
+!reports/golden_real_slice.md

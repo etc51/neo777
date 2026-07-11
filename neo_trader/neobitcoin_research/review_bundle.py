@@ -159,16 +159,26 @@ def create_neobitcoin_review_bundle(
     destination.mkdir(parents=True, exist_ok=True)
     current = _utc(now or datetime.now(UTC))
     if (base / "active" / "raw").exists() or (base / "raw").exists():
-        source = _prepare_source(
+        from .schema_v4.workflow import create_schema_v4_golden_bundle
+
+        result = create_schema_v4_golden_bundle(
             base,
+            output_dir=destination,
             now=current,
-            candidate_window_minutes=candidate_window_minutes,
-            max_outcome_horizon_minutes=max_outcome_horizon_minutes,
-            candle_context_hours=candle_context_hours,
             token_files=token_files,
         )
-    else:
-        source = _discover_source(base)
+        return ReviewBundleResult(
+            archive_path=result.archive.archive_path,
+            sha256_path=result.archive.sha256_path,
+            archive_sha256=result.archive.sha256,
+            candidate_window_start=result.candidate_start,
+            candidate_window_end=result.candidate_end,
+            support_data_start=result.support_start,
+            support_data_end=result.required_support_end,
+            file_count=result.archive.file_count,
+            rows_by_dataset=result.archive.rows_by_dataset,
+        )
+    source = _discover_source(base)
     tables = {name: _read_dataset(source, name) for name in DATASETS}
     t0, t1 = _select_window(
         tables,
