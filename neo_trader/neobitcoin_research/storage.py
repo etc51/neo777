@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Final, TypeAlias, cast
 from uuid import uuid4
 
+from .buffered_parquet import BufferedParquetWriter, ParquetBatchPolicy
+
 JsonMapping: TypeAlias = Mapping[str, Any]
 
 RAW_REQUIRED_FIELDS: Final = frozenset(
@@ -122,6 +124,9 @@ class ResearchStorage:
         )
         self.fsync = fsync
         self._lock = threading.RLock()
+        # One active private writer per dataset/hour.  The writer publishes a
+        # single final part only when the partition rotates or storage closes.
+        self._derived_writers: dict[tuple[str, str, str], BufferedParquetWriter] = {}
         self.state_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
             self.state_db_path,
@@ -134,7 +139,9 @@ class ResearchStorage:
         self._connection.execute(f"PRAGMA synchronous={'FULL' if fsync else 'NORMAL'}")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._initialize_schema()
-        self._migrate_derived_record_json()
+        # Research payloads are authoritative in Parquet.  Never backfill
+        # record_json from parts: that turns the bounded runtime catalog back
+        # into an unbounded market-data store.
 
     def __enter__(self) -> ResearchStorage:
         return self
@@ -146,6 +153,9 @@ class ResearchStorage:
         """Close the SQLite state catalog."""
 
         with self._lock:
+            for writer in self._derived_writers.values():
+                writer.finalize()
+            self._derived_writers.clear()
             self._connection.close()
 
     def append_raw_event(self, event: JsonMapping) -> RawAppendResult:
@@ -428,13 +438,14 @@ class ResearchStorage:
             "recorded_at",
         )
         normalized_event_id = event_id or _derived_event_id(normalized_dataset, record)
-        target = (
-            self.derived_parquet_root
-            / normalized_dataset
-            / f"date={timestamp.date().isoformat()}"
-            / f"hour={timestamp.strftime('%H')}"
-            / f"part-{uuid4().hex}.parquet"
+        partition = (
+            normalized_dataset,
+            timestamp.date().isoformat(),
+            timestamp.strftime("%H"),
         )
+        self._rotate_derived_writers_before(timestamp)
+        writer = self._derived_writer(partition)
+        target = writer.final_path
 
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -455,12 +466,14 @@ class ResearchStorage:
                         parquet_path=Path(existing["parquet_path"]),
                     )
 
-                self._write_derived_part(
-                    target,
-                    dataset=normalized_dataset,
-                    event_id=normalized_event_id,
-                    recorded_at=timestamp,
-                    record=normalized_record,
+                writer.append(
+                    {
+                        "dataset": normalized_dataset,
+                        "event_id": normalized_event_id,
+                        "recorded_at": timestamp.isoformat(),
+                        "schema_version": str(normalized_record.get("schema_version", "1")),
+                        "record_json": _json_text(normalized_record),
+                    }
                 )
                 self._connection.execute(
                     """
@@ -489,6 +502,66 @@ class ResearchStorage:
             appended=True,
             parquet_path=target,
         )
+
+    def flush_derived_writers(self) -> None:
+        """Flush aged/full batches to private .inprogress files.
+
+        This deliberately does not publish a part; publication happens only on
+        rotation/close, so a busy hour cannot produce per-record Parquet files.
+        """
+
+        with self._lock:
+            for writer in self._derived_writers.values():
+                writer.flush_if_due()
+
+    def finalize_derived_writers(self) -> None:
+        """Publish all active derived partitions for a consistent read/report."""
+
+        with self._lock:
+            for writer in self._derived_writers.values():
+                writer.finalize()
+            self._derived_writers.clear()
+
+    def _derived_writer(
+        self, partition: tuple[str, str, str]
+    ) -> BufferedParquetWriter:
+        existing = self._derived_writers.get(partition)
+        if existing is not None:
+            return existing
+        dataset, partition_date, hour = partition
+        pa = cast(Any, importlib.import_module("pyarrow"))
+        target = (
+            self.derived_parquet_root
+            / dataset
+            / f"date={partition_date}"
+            / f"hour={hour}"
+            / "part-00000.parquet"
+        )
+        writer = BufferedParquetWriter(
+            target,
+            pa.schema(
+                [
+                    ("dataset", pa.string()),
+                    ("event_id", pa.string()),
+                    ("recorded_at", pa.string()),
+                    ("schema_version", pa.string()),
+                    ("record_json", pa.string()),
+                ]
+            ),
+            policy=ParquetBatchPolicy(),
+            fsync=self.fsync,
+        )
+        self._derived_writers[partition] = writer
+        return writer
+
+    def _rotate_derived_writers_before(self, timestamp: datetime) -> None:
+        """Publish partitions older than the record currently being appended."""
+
+        current = (timestamp.date().isoformat(), timestamp.strftime("%H"))
+        for partition, writer in tuple(self._derived_writers.items()):
+            if partition[1:] != current:
+                writer.finalize()
+                del self._derived_writers[partition]
 
     def append_derived_many(
         self,
@@ -750,12 +823,18 @@ class ResearchStorage:
         """Iterate derived records from authoritative immutable Parquet parts."""
 
         normalized_dataset = _dataset_name(dataset)
-        query = "SELECT parquet_path FROM derived_event_index WHERE dataset = ?"
+        # A buffered part contains many event ids, so read each physical file
+        # once (the former per-event layout did not need DISTINCT).
+        self.finalize_derived_writers()
+        query = (
+            "SELECT parquet_path, MIN(recorded_at) AS first_recorded_at "
+            "FROM derived_event_index WHERE dataset = ?"
+        )
         parameters: list[object] = [normalized_dataset]
         if partition_date is not None:
             query += " AND substr(recorded_at, 1, 10) = ?"
             parameters.append(_partition_date(partition_date))
-        query += " ORDER BY recorded_at, event_id"
+        query += " GROUP BY parquet_path ORDER BY first_recorded_at, parquet_path"
         pq = cast(Any, importlib.import_module("pyarrow.parquet"))
         for row in self._connection.execute(query, parameters):
             path = Path(row["parquet_path"])
