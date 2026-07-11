@@ -218,3 +218,167 @@ def test_horizon_prices_do_not_look_ahead() -> None:
 
     assert _nearest(path, times, horizon) == 100.0
     assert _segment(path, times, start, horizon) == [(start, 100.0)]
+
+
+def test_fixed2_trade_controls_use_deduplicated_raw_trades_only() -> None:
+    t0 = datetime(2026, 7, 11, 10, 0, tzinfo=UTC)
+    feature = {
+        "timestamp": t0,
+        "recorded_at": t0 + timedelta(milliseconds=50),
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "midprice": 100.0,
+        "spread_ticks": 2.0,
+        "spread_bps": 20.0,
+    }
+    trades = [
+        {
+            "event_id": "left",
+            "exchange_ts": t0 - timedelta(seconds=5),
+            "aggressor_side": "BUY",
+            "quantity": 99,
+        },
+        {
+            "event_id": "buy",
+            "exchange_ts": t0 - timedelta(seconds=4),
+            "receive_ts": t0 - timedelta(seconds=3),
+            "aggressor_side": "BUY",
+            "quantity": 3,
+        },
+        {
+            "event_id": "buy",
+            "exchange_ts": t0 - timedelta(seconds=4),
+            "receive_ts": t0 - timedelta(seconds=3),
+            "aggressor_side": "BUY",
+            "quantity": 3,
+        },
+        {"event_id": "unknown", "exchange_ts": t0, "aggressor_side": "UNKNOWN", "quantity": 100},
+        {
+            "event_id": "future",
+            "exchange_ts": t0 + timedelta(microseconds=1),
+            "aggressor_side": "SELL",
+            "quantity": 50,
+        },
+    ]
+    table = build_review_datasets(
+        [feature],
+        [
+            {
+                "event_id": "book",
+                "exchange_ts": t0,
+                "receive_ts": t0 - timedelta(milliseconds=20),
+                "mid_price": 100.0,
+            }
+        ],
+        trade_rows=trades,
+        candidate_start=t0,
+        candidate_end=t0,
+    )["feature_snapshots"]
+    row = table.to_pylist()[0]
+    assert row["trade_count_5s"] == 2
+    assert row["known_side_trade_count_5s"] == 1
+    assert row["unknown_side_trade_count_5s"] == 1
+    assert row["buy_volume_5s"] == 3.0
+    assert row["sell_volume_5s"] == 0.0
+    assert row["trade_flow_5s"] == 3.0
+    assert row["trade_window_first_event_id_5s"] == "buy"
+    assert row["trade_window_last_event_id_5s"] == "unknown"
+
+
+def test_fixed2_outcomes_and_stops_have_raw_orderbook_lineage() -> None:
+    t0 = datetime(2026, 7, 11, 10, 0, tzinfo=UTC)
+    feature = {
+        "timestamp": t0,
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "midprice": 100.0,
+        "spread_ticks": 2.0,
+        "spread_bps": 20.0,
+    }
+    path = []
+    for second in range(1802):
+        mid = 100.0 if second == 0 else 98.0
+        path.append(
+            {
+                "event_id": f"book-{second}",
+                "exchange_ts": t0 + timedelta(seconds=second),
+                "receive_ts": t0 + timedelta(seconds=second, milliseconds=10),
+                "mid_price": mid,
+                "best_bid": mid - 0.1,
+                "best_ask": mid + 0.1,
+            }
+        )
+    tables = build_review_datasets(
+        [feature], path, trade_rows=[], candidate_start=t0, candidate_end=t0
+    )
+    outcomes = tables["future_outcomes"].to_pylist()
+    assert outcomes
+    assert all(row["price_source"] == "raw_orderbook" for row in outcomes)
+    assert all(row["price_source_event_id"].startswith("book-") for row in outcomes)
+    assert all(row["future_price"] == row["executable_exit_price"] for row in outcomes)
+    long_stops = [
+        row
+        for row in tables["shadow_stop_results"].to_pylist()
+        if row["side"] == "LONG" and row["stop_triggered"]
+    ]
+    assert long_stops
+    assert all(row["trigger_event_id"] == "book-1" for row in long_stops)
+    assert all(row["exit_source_event_id"] == "book-1" for row in long_stops)
+    assert all(row["gap_through_stop"] for row in long_stops)
+    assert all(row["slippage_from_stop_ticks"] > 0 for row in long_stops)
+
+
+def test_late_received_source_is_not_selected_or_clamped_to_zero() -> None:
+    t0 = datetime(2026, 7, 11, 10, 0, tzinfo=UTC)
+    processing = t0 + timedelta(seconds=1)
+    feature = {
+        "timestamp": t0,
+        "processing_ts": processing,
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "midprice": 100.0,
+        "spread_ticks": 2.0,
+        "spread_bps": 20.0,
+    }
+    book = {
+        "event_id": "book",
+        "exchange_ts": t0,
+        "receive_ts": processing - timedelta(milliseconds=10),
+        "mid_price": 100.0,
+    }
+    trade = {
+        "event_id": "trade",
+        "exchange_ts": t0,
+        "receive_ts": processing - timedelta(milliseconds=20),
+        "aggressor_side": "BUY",
+        "quantity": 1.0,
+    }
+    last = {
+        "event_id": "last",
+        "exchange_ts": t0,
+        "receive_ts": processing - timedelta(milliseconds=30),
+    }
+    candle = {
+        "event_id": "candle",
+        "exchange_ts": t0,
+        "receive_ts": processing - timedelta(milliseconds=40),
+    }
+    late_candle = {
+        "event_id": "late-candle",
+        "exchange_ts": t0,
+        "receive_ts": processing + timedelta(seconds=5),
+    }
+    row = build_review_datasets(
+        [feature],
+        [book],
+        trade_rows=[trade],
+        last_price_rows=[last],
+        candle_rows_by_interval={"1m": [late_candle], "5m": [candle], "15m": [candle]},
+        candidate_start=t0,
+        candidate_end=t0,
+    )["feature_snapshots"].to_pylist()[0]
+    assert row["candle_1m_source_event_id"] is None
+    assert row["candle_1m_age_ms"] is None
+    assert row["feature_ready"] is False
+    assert "candle_1m_source_event_id" in row["missing_reason"]
+    assert row["orderbook_age_ms"] == 10.0

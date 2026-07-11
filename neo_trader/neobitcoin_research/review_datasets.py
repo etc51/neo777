@@ -34,6 +34,7 @@ EXIT_VARIANTS: Final = (
     "microstructure",
     "orderbook",
 )
+TRADE_WINDOWS: Final = (5, 10, 30, 60, 180, 300, 900)
 
 TS = pa.timestamp("us", tz="UTC")
 
@@ -76,7 +77,20 @@ FEATURE_SCHEMA = _schema(
     *[(f"imbalance_{n}", pa.float64(), True) for n in (1, 3, 5, 10, 20)],
     *[(f"bid_depth_{n}", pa.float64(), True) for n in (1, 3, 5, 10, 20)],
     *[(f"ask_depth_{n}", pa.float64(), True) for n in (1, 3, 5, 10, 20)],
-    *[(f"trade_flow_{n}s", pa.float64(), True) for n in (5, 10, 30, 60, 180, 300, 900)],
+    *[(f"trade_flow_{n}s", pa.float64(), False) for n in TRADE_WINDOWS],
+    *[
+        (f"{kind}_{n}s", typ, nullable)
+        for n in TRADE_WINDOWS
+        for kind, typ, nullable in (
+            ("trade_count", pa.int64(), False),
+            ("known_side_trade_count", pa.int64(), False),
+            ("unknown_side_trade_count", pa.int64(), False),
+            ("buy_volume", pa.float64(), False),
+            ("sell_volume", pa.float64(), False),
+            ("trade_window_first_event_id", pa.string(), True),
+            ("trade_window_last_event_id", pa.string(), True),
+        )
+    ],
     ("signed_volume", pa.float64(), True),
     ("return_1m", pa.float64(), True),
     ("realized_volatility", pa.float64(), True),
@@ -96,6 +110,21 @@ FEATURE_SCHEMA = _schema(
     ("source_status", pa.string(), False),
     ("raw_signal", pa.string(), True),
     ("data_age_ms", pa.float64(), True),
+    ("orderbook_age_ms", pa.float64(), True),
+    ("last_price_age_ms", pa.float64(), True),
+    ("last_trade_age_ms", pa.float64(), True),
+    ("candle_1m_age_ms", pa.float64(), True),
+    ("candle_5m_age_ms", pa.float64(), True),
+    ("candle_15m_age_ms", pa.float64(), True),
+    ("oldest_required_source_age_ms", pa.float64(), True),
+    ("newest_source_age_ms", pa.float64(), True),
+    ("source_exchange_age_ms", pa.float64(), True),
+    ("orderbook_source_event_id", pa.string(), True),
+    ("last_price_source_event_id", pa.string(), True),
+    ("last_trade_source_event_id", pa.string(), True),
+    ("candle_1m_source_event_id", pa.string(), True),
+    ("candle_5m_source_event_id", pa.string(), True),
+    ("candle_15m_source_event_id", pa.string(), True),
     *[
         (f"{side}_{kind}_{level:02d}", pa.float64(), True)
         for level in range(1, 21)
@@ -162,7 +191,20 @@ OUTCOME_SCHEMA = _schema(
     ("entry_ts", TS, False),
     ("entry_price", pa.float64(), False),
     ("future_ts", TS, False),
+    ("target_ts", TS, False),
     ("future_price", pa.float64(), False),
+    ("future_mid_price", pa.float64(), False),
+    ("executable_exit_price", pa.float64(), False),
+    ("exit_bid", pa.float64(), False),
+    ("exit_ask", pa.float64(), False),
+    ("price_source", pa.string(), False),
+    ("price_source_event_id", pa.string(), False),
+    ("price_source_exchange_ts", TS, False),
+    ("price_source_receive_ts", TS, False),
+    ("price_selection_method", pa.string(), False),
+    ("source_age_ms_at_target", pa.float64(), False),
+    ("support_complete", pa.bool_(), False),
+    ("gap_detected", pa.bool_(), False),
     ("raw_return", pa.float64(), False),
     ("return_ticks", pa.float64(), False),
     ("return_percent", pa.float64(), False),
@@ -186,12 +228,24 @@ STOP_SCHEMA = _schema(
     ("simulation_id", pa.string(), False),
     ("side", pa.string(), False),
     ("stop_ticks", pa.int64(), False),
+    ("stop_level", pa.float64(), False),
     ("entry_ts", TS, False),
     ("entry_price", pa.float64(), False),
     ("exit_ts", TS, False),
     ("exit_price", pa.float64(), False),
     ("exit_reason", pa.string(), False),
     ("stop_triggered", pa.bool_(), False),
+    ("trigger_event_id", pa.string(), True),
+    ("trigger_event_type", pa.string(), True),
+    ("trigger_ts", TS, True),
+    ("trigger_price", pa.float64(), True),
+    ("trigger_bid", pa.float64(), True),
+    ("trigger_ask", pa.float64(), True),
+    ("trigger_sequence", pa.int64(), True),
+    ("exit_source_event_id", pa.string(), False),
+    ("exit_source_ts", TS, False),
+    ("gap_through_stop", pa.bool_(), False),
+    ("slippage_from_stop_ticks", pa.float64(), False),
     ("gross_pnl", pa.float64(), False),
     ("net_pnl", pa.float64(), False),
     ("mfe_before_exit", pa.float64(), False),
@@ -242,6 +296,8 @@ def build_review_datasets(
     market_events: Sequence[Mapping[str, Any]] | None = None,
     orderbook_rows: Sequence[Mapping[str, Any]] | None = None,
     trade_rows: Sequence[Mapping[str, Any]] | None = None,
+    last_price_rows: Sequence[Mapping[str, Any]] | None = None,
+    candle_rows_by_interval: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     execution_latency_ms: int = 100,
     virtual_order_quantity: float = 10.0,
 ) -> dict[str, Any]:
@@ -260,7 +316,15 @@ def build_review_datasets(
     if trade_rows:
         path = _merge_trade_events(path, trade_rows)
     path_ts = [p["exchange_ts"] for p in path]
-    enriched_features = _enrich_feature_market_fields(feature_rows, path, trade_rows or ())
+    enriched_features = _enrich_feature_market_fields(
+        feature_rows,
+        path,
+        trade_rows or (),
+        last_price_rows or (),
+        candle_rows_by_interval or {},
+        trade_rows is not None,
+        last_price_rows is not None or candle_rows_by_interval is not None,
+    )
     normalized_features = [_feature_row(row) for row in enriched_features]
     features = [row for row in normalized_features if start <= row["exchange_ts"] <= end]
     candidates: list[dict[str, Any]] = []
@@ -377,7 +441,7 @@ def _base(row: Mapping[str, Any], event_id: str) -> dict[str, Any]:
         "instrument_ticker": str(row.get("instrument_ticker") or row.get("ticker") or "NEOBITCOIN"),
         "exchange_ts": exchange,
         "receive_ts": receive,
-        "processing_ts": receive,
+        "processing_ts": _utc(_dt(row.get("processing_ts") or receive)),
         "session_id": str(row.get("session_id") or "local-review"),
         "collector_instance_id": str(row.get("collector_instance_id") or "local-review"),
         "source": "local_counterfactual_review",
@@ -422,6 +486,22 @@ def _feature_row(source: Mapping[str, Any]) -> dict[str, Any]:
             # event-time window ending at (and never after) exchange_ts.
             window = field.removeprefix("trade_flow_")
             value = record.get(f"trades_{window}_signed_volume")
+            if value is None:
+                value = 0.0
+        if (
+            any(
+                field.startswith(prefix)
+                for prefix in (
+                    "trade_count_",
+                    "known_side_trade_count_",
+                    "unknown_side_trade_count_",
+                )
+            )
+            and value is None
+        ):
+            value = 0
+        if field.startswith(("buy_volume_", "sell_volume_")) and value is None:
+            value = 0.0
         if "_quantity_" in field:
             value = record.get(field.replace("_quantity_", "_volume_").replace("_0", "_"))
         if "_price_" in field:
@@ -437,7 +517,9 @@ def _feature_row(source: Mapping[str, Any]) -> dict[str, Any]:
                 0.0, (_utc(_dt(feature_ts)) - _utc(_dt(market_ts))).total_seconds() * 1000
             )
     row["regime"] = str(record.get("regime") or "unknown")
-    row["source_status"] = str(record.get("trading_status") or "NORMAL_TRADING")
+    row["source_status"] = str(
+        record.get("source_status") or record.get("trading_status") or "NORMAL_TRADING"
+    )
     required = (
         "trade_flow_10s",
         "trade_flow_180s",
@@ -445,7 +527,15 @@ def _feature_row(source: Mapping[str, Any]) -> dict[str, Any]:
         "trade_flow_900s",
         "data_age_ms",
     )
-    missing = [name for name in required if row.get(name) is None]
+    missing = []
+    for name in required:
+        if name.startswith("trade_flow_"):
+            window = name.removeprefix("trade_flow_")
+            if record.get(f"trades_{window}_signed_volume") is None:
+                missing.append(name)
+        elif row.get(name) is None:
+            missing.append(name)
+    missing.extend(f"{name}_source_event_id" for name in record.get("_lineage_missing", ()))
     row["feature_ready"] = bool(record.get("feature_ready", True)) and not missing
     row["warmup_remaining"] = max(int(record.get("warmup_remaining") or 0), len(missing))
     row["missing_reason"] = record.get("missing_reason") or (
@@ -633,16 +723,31 @@ def _outcomes(
     entry = sim["fill_ts"]
     for horizon in HORIZONS:
         future = entry + timedelta(seconds=horizon)
-        segment = _segment(path, times, entry, future)
-        price = _nearest(path, times, future)
-        if price is None or not segment:
+        segment = [p for p in _segment(path, times, entry, future) if _is_quote(p)]
+        entry_quote = _asof_quote(path, times, entry)
+        if entry_quote is not None and not any(
+            _market_event_id(item) == _market_event_id(entry_quote) for item in segment
+        ):
+            segment.insert(0, entry_quote)
+        point = _asof_quote(path, times, future)
+        if point is None or not segment:
+            continue
+        mid_price = _point_price(point)
+        exit_price = _exit_price(point, candidate["side"], tick)
+        quote_support_end = max(
+            (_point_ts(item) for item in path if _is_quote(item)),
+            default=None,
+        )
+        support_complete = quote_support_end is not None and quote_support_end >= future
+        gap_detected = _has_critical_gap(path, entry, future)
+        if not support_complete or gap_detected:
             continue
         changes = [sign * (_point_price(p) - sim["fill_price"]) for p in segment]
         mfe = max(0.0, max(changes))
         mae = max(0.0, -min(changes))
         mfe_i = changes.index(max(changes))
         mae_i = changes.index(min(changes))
-        raw = sign * (price - sim["fill_price"])
+        raw = sign * (exit_price - sim["fill_price"])
         spread = sim["spread_cost"]
         oid = _id("outcome", sim["simulation_id"], horizon)
         row = _base(candidate, oid)
@@ -655,7 +760,20 @@ def _outcomes(
             entry_ts=entry,
             entry_price=sim["fill_price"],
             future_ts=future,
-            future_price=price,
+            target_ts=future,
+            future_price=exit_price,
+            future_mid_price=mid_price,
+            executable_exit_price=exit_price,
+            exit_bid=float(point.get("best_bid", mid_price - tick)),
+            exit_ask=float(point.get("best_ask", mid_price + tick)),
+            price_source="raw_orderbook",
+            price_source_event_id=_market_event_id(point),
+            price_source_exchange_ts=_point_ts(point),
+            price_source_receive_ts=_event_receive_ts(point),
+            price_selection_method="last_executable_orderbook_quote_at_or_before_target",
+            source_age_ms_at_target=max(0.0, (future - _point_ts(point)).total_seconds() * 1000),
+            support_complete=True,
+            gap_detected=False,
             raw_return=raw,
             return_ticks=raw / tick,
             return_percent=raw / sim["fill_price"] * 100,
@@ -688,9 +806,10 @@ def _stops(
     segment = [
         p
         for p in _segment(path, times, sim["fill_ts"], sim["fill_ts"] + timedelta(seconds=1800))
-        if _point_ts(p) > sim["fill_ts"]
+        if _point_ts(p) > sim["fill_ts"] and _is_quote(p)
     ]
     for stop in STOP_TICKS:
+        stop_level = sim["fill_price"] + (-stop * tick if sign == 1 else stop * tick)
         threshold = -stop * tick
         triggered = next(
             (
@@ -709,6 +828,31 @@ def _stops(
             sign * (_point_price(p) - sim["fill_price"]) for p in segment if _point_ts(p) <= hit_ts
         ] or [0.0]
         gross = sign * (hit_price - sim["fill_price"])
+        triggered_flag = triggered is not None
+        slippage_ticks = (
+            (
+                max(0.0, (stop_level - hit_price) / tick)
+                if sign == 1
+                else max(0.0, (hit_price - stop_level) / tick)
+            )
+            if triggered_flag
+            else 0.0
+        )
+        trigger_bid = (
+            float(triggered["best_bid"])
+            if triggered is not None and triggered.get("best_bid") is not None
+            else None
+        )
+        trigger_ask = (
+            float(triggered["best_ask"])
+            if triggered is not None and triggered.get("best_ask") is not None
+            else None
+        )
+        trigger_sequence = (
+            int(triggered.get("sequence") or triggered.get("revision") or 0)
+            if triggered is not None
+            else None
+        )
         rid = _id("stop", sim["simulation_id"], stop)
         row = _base(candidate, rid)
         row.update(
@@ -717,12 +861,28 @@ def _stops(
             simulation_id=sim["simulation_id"],
             side=candidate["side"],
             stop_ticks=stop,
+            stop_level=stop_level,
             entry_ts=sim["fill_ts"],
             entry_price=sim["fill_price"],
             exit_ts=hit_ts,
             exit_price=hit_price,
             exit_reason="stop_triggered" if triggered is not None else "horizon_end",
-            stop_triggered=triggered is not None,
+            stop_triggered=triggered_flag,
+            trigger_event_id=_market_event_id(triggered) if triggered_flag else None,
+            trigger_event_type="raw_orderbook" if triggered_flag else None,
+            trigger_ts=_point_ts(triggered) if triggered_flag else None,
+            trigger_price=hit_price if triggered_flag else None,
+            trigger_bid=trigger_bid,
+            trigger_ask=trigger_ask,
+            trigger_sequence=trigger_sequence,
+            exit_source_event_id=(
+                _market_event_id(hit)
+                if hit is not None
+                else _market_event_id_at_entry(path, times, sim["fill_ts"])
+            ),
+            exit_source_ts=hit_ts,
+            gap_through_stop=triggered_flag and slippage_ticks > 1e-9,
+            slippage_from_stop_ticks=slippage_ticks,
             gross_pnl=gross,
             net_pnl=gross - sim["spread_cost"],
             mfe_before_exit=max(0.0, max(changes)) / tick,
@@ -936,8 +1096,56 @@ def _exit_price(point: Mapping[str, Any] | None, side: str, tick: float) -> floa
     return _point_price(point) + (-tick if side == "LONG" else tick)
 
 
+def _is_quote(point: Mapping[str, Any]) -> bool:
+    return point.get("_event_type") != "raw_trade"
+
+
+def _market_event_id(point: Mapping[str, Any] | None) -> str:
+    if point is None:
+        return ""
+    return str(
+        point.get("event_id")
+        or point.get("raw_event_id")
+        or _id("market", _point_ts(point), point.get("best_bid"), point.get("best_ask"))
+    )
+
+
+def _event_receive_ts(point: Mapping[str, Any]) -> datetime:
+    return _utc(_dt(point.get("receive_ts") or point.get("recorded_at") or _point_ts(point)))
+
+
+def _asof_quote(
+    path: Sequence[Mapping[str, Any]], times: list[datetime], target: datetime
+) -> Mapping[str, Any] | None:
+    index = bisect_right(times, target) - 1
+    while index >= 0:
+        if _is_quote(path[index]) and _event_receive_ts(path[index]) <= target:
+            return path[index]
+        index -= 1
+    return None
+
+
+def _market_event_id_at_entry(
+    path: Sequence[Mapping[str, Any]], times: list[datetime], target: datetime
+) -> str:
+    return _market_event_id(_asof_quote(path, times, target))
+
+
+def _has_critical_gap(path: Sequence[Mapping[str, Any]], start: datetime, end: datetime) -> bool:
+    quote_times = (
+        [start]
+        + [_point_ts(p) for p in path if _is_quote(p) and start <= _point_ts(p) <= end]
+        + [end]
+    )
+    return any(
+        (right - left).total_seconds() > 180
+        for left, right in zip(quote_times, quote_times[1:], strict=False)
+    )
+
+
 def _normalize_market_point(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
+    result["_event_type"] = "raw_orderbook"
     result["exchange_ts"] = _utc(_dt(row["exchange_ts"]))
     bids, asks = list(row.get("bids") or []), list(row.get("asks") or [])
     if result.get("best_bid") is None and bids:
@@ -965,6 +1173,8 @@ def _merge_trade_events(
             continue
         point = dict(path[index])
         point["exchange_ts"] = ts
+        point["_event_type"] = "raw_trade"
+        point["trade_event_id"] = str(trade.get("event_id") or trade.get("raw_event_id") or "")
         quantity = float(trade.get("quantity") or trade.get("volume") or 0.0)
         side = str(trade.get("side") or trade.get("direction") or "").upper()
         point["buy_volume" if side in {"BUY", "LONG"} else "sell_volume"] = quantity
@@ -985,42 +1195,119 @@ def _enrich_feature_market_fields(
     features: Sequence[Mapping[str, Any]],
     market_path: Sequence[Mapping[str, Any]],
     trades: Sequence[Mapping[str, Any]],
+    last_prices: Sequence[Mapping[str, Any]],
+    candles: Mapping[str, Sequence[Mapping[str, Any]]],
+    trade_stream_provided: bool,
+    strict_lineage: bool,
 ) -> list[dict[str, Any]]:
     """Compute trailing signed flow and age strictly as-of each feature timestamp."""
-    normalized_trades: list[tuple[datetime, float]] = []
+    normalized_trades: list[dict[str, Any]] = []
+    seen_trade_ids: set[str] = set()
     for trade in trades:
         ts = _utc(_dt(trade["exchange_ts"]))
         quantity = float(trade.get("quantity") or trade.get("volume") or 0.0)
-        side = str(trade.get("side") or trade.get("direction") or "").upper()
-        signed = trade.get("signed_volume")
-        if signed is None:
-            signed = quantity if side in {"BUY", "LONG"} else -quantity
-        normalized_trades.append((ts, float(signed)))
-    normalized_trades.sort()
-    event_times = sorted(
-        [p["exchange_ts"] for p in market_path] + [timestamp for timestamp, _ in normalized_trades]
-    )
+        side = str(
+            trade.get("aggressor_side") or trade.get("side") or trade.get("direction") or "UNKNOWN"
+        ).upper()
+        if side in {"LONG", "AGGRESSIVE_BUY"}:
+            side = "BUY"
+        elif side in {"SHORT", "AGGRESSIVE_SELL"}:
+            side = "SELL"
+        elif side not in {"BUY", "SELL"}:
+            side = "UNKNOWN"
+        event_id = str(
+            trade.get("event_id")
+            or trade.get("raw_event_id")
+            or _id("trade", ts, trade.get("trade_id"), trade.get("price"), quantity, side)
+        )
+        if event_id in seen_trade_ids:
+            continue
+        seen_trade_ids.add(event_id)
+        normalized_trades.append(
+            {
+                "exchange_ts": ts,
+                "receive_ts": _event_receive_ts(trade),
+                "event_id": event_id,
+                "quantity": quantity,
+                "side": side,
+            }
+        )
+    normalized_trades.sort(key=lambda item: (item["exchange_ts"], item["event_id"]))
+
+    source_groups: dict[str, Sequence[Mapping[str, Any]]] = {
+        "orderbook": [p for p in market_path if _is_quote(p)],
+        "last_price": last_prices,
+        "last_trade": normalized_trades,
+        "candle_1m": candles.get("1m", candles.get("1", candles.get("candle_1m", ()))),
+        "candle_5m": candles.get("5m", candles.get("5", candles.get("candle_5m", ()))),
+        "candle_15m": candles.get("15m", candles.get("15", candles.get("candle_15m", ()))),
+    }
     result: list[dict[str, Any]] = []
     for source in features:
         row = dict(source)
         feature_ts = _utc(
             _dt(row.get("exchange_ts") or row.get("timestamp") or row.get("recorded_at"))
         )
-        for seconds in (10, 180, 300, 900):
-            field = f"trades_{seconds}s_signed_volume"
-            if row.get(field) is None and normalized_trades:
-                lower = feature_ts - timedelta(seconds=seconds)
-                row[field] = sum(
-                    signed
-                    for timestamp, signed in normalized_trades
-                    if lower < timestamp <= feature_ts
-                )
-        if row.get("data_age_ms") is None and event_times:
-            index = bisect_right(event_times, feature_ts) - 1
-            if index >= 0:
-                row["data_age_ms"] = max(
-                    0.0, (feature_ts - event_times[index]).total_seconds() * 1000
-                )
+        processing_ts = _utc(
+            _dt(
+                row.get("processing_ts")
+                or row.get("receive_ts")
+                or row.get("recorded_at")
+                or feature_ts
+            )
+        )
+        for seconds in TRADE_WINDOWS:
+            lower = feature_ts - timedelta(seconds=seconds)
+            window = [t for t in normalized_trades if lower < t["exchange_ts"] <= feature_ts]
+            known = [t for t in window if t["side"] in {"BUY", "SELL"}]
+            buys = sum(t["quantity"] for t in known if t["side"] == "BUY")
+            sells = sum(t["quantity"] for t in known if t["side"] == "SELL")
+            suffix = f"{seconds}s"
+            row[f"trade_count_{suffix}"] = len(window)
+            row[f"known_side_trade_count_{suffix}"] = len(known)
+            row[f"unknown_side_trade_count_{suffix}"] = len(window) - len(known)
+            row[f"buy_volume_{suffix}"] = buys
+            row[f"sell_volume_{suffix}"] = sells
+            if trade_stream_provided:
+                row[f"trades_{suffix}_signed_volume"] = buys - sells
+            row[f"trade_window_first_event_id_{suffix}"] = window[0]["event_id"] if window else None
+            row[f"trade_window_last_event_id_{suffix}"] = window[-1]["event_id"] if window else None
+
+        ages: list[float] = []
+        exchange_ages: list[float] = []
+        for name, events in source_groups.items():
+            eligible = [
+                e
+                for e in events
+                if _utc(_dt(e["exchange_ts"])) <= feature_ts
+                and _event_receive_ts(e) <= processing_ts
+            ]
+            event = max(eligible, key=lambda e: _utc(_dt(e["exchange_ts"]))) if eligible else None
+            age_name = f"{name}_age_ms"
+            id_name = f"{name}_source_event_id"
+            if event is None:
+                row[age_name] = None
+                row[id_name] = None
+                continue
+            receive_ts = _event_receive_ts(event)
+            age = (processing_ts - receive_ts).total_seconds() * 1000
+            exchange_age = (feature_ts - _utc(_dt(event["exchange_ts"]))).total_seconds() * 1000
+            row[age_name] = age
+            row[id_name] = str(event.get("event_id") or event.get("raw_event_id") or "") or None
+            ages.append(age)
+            exchange_ages.append(exchange_age)
+        row["oldest_required_source_age_ms"] = max(ages) if ages else None
+        row["newest_source_age_ms"] = min(ages) if ages else None
+        row["source_exchange_age_ms"] = max(exchange_ages) if exchange_ages else None
+        row["book_age_ms"] = row.get("orderbook_age_ms")
+        row["data_age_ms"] = row.get("newest_source_age_ms")
+        required_sources = tuple(source_groups) if strict_lineage else ()
+        lineage_missing = [
+            name for name in required_sources if row.get(f"{name}_source_event_id") is None
+        ]
+        if lineage_missing:
+            row["_lineage_missing"] = lineage_missing
+            row["source_status"] = "MISSING_REQUIRED_SOURCE"
         result.append(row)
     return result
 

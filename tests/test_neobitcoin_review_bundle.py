@@ -83,6 +83,7 @@ def _source(root: Path, *, token: str | None = None) -> None:
             "quantity": 1.0,
             "direction": "SELL" if index % 2 else "BUY",
             "aggressor_side": "SELL" if index % 2 else "BUY",
+            "side_inference_method": "api_direction",
             "feed_latency_ms": 1.0,
         }
         for index in range(42)
@@ -95,6 +96,7 @@ def _source(root: Path, *, token: str | None = None) -> None:
             "quantity": 12.0,
             "direction": "SELL",
             "aggressor_side": "SELL",
+            "side_inference_method": "api_direction",
             "feed_latency_ms": 1.0,
         }
     )
@@ -121,7 +123,8 @@ def _source(root: Path, *, token: str | None = None) -> None:
         schema=RAW_SCHEMAS["market_status_events"],
     )
     for minutes in (1, 5, 15):
-        when = start - timedelta(hours=6)
+        # Keep the lineage source inside the archived six-hour support window.
+        when = candidate_ts - timedelta(hours=5, minutes=59)
         raw[f"candles_{minutes}m"] = pa.Table.from_pylist(
             [
                 _common(f"candle-{minutes}", when)
@@ -162,6 +165,9 @@ def _source(root: Path, *, token: str | None = None) -> None:
         "feature_ready": True,
         "raw_signal": "LONG",
     }
+    # Production processing is later than exchange/receive time.  A non-zero,
+    # reproducible age also prevents an all-zero placeholder from passing.
+    feature["processing_ts"] = candidate_ts + timedelta(seconds=2)
     research = build_review_datasets(
         [feature],
         path,
@@ -169,6 +175,11 @@ def _source(root: Path, *, token: str | None = None) -> None:
         candidate_end=candidate_ts,
         orderbook_rows=books,
         trade_rows=trade_rows,
+        last_price_rows=raw["raw_last_price"].to_pylist(),
+        candle_rows_by_interval={
+            f"{minutes}m": raw[f"candles_{minutes}m"].to_pylist()
+            for minutes in (1, 5, 15)
+        },
     )
     if token:
         candidates = research["candidate_events"].to_pylist()

@@ -177,13 +177,13 @@ def create_neobitcoin_review_bundle(
         maturity=timedelta(minutes=max_outcome_horizon_minutes),
     )
     support_start = t0 - timedelta(hours=candle_context_hours)
-    support_end = t1 + timedelta(minutes=max_outcome_horizon_minutes)
+    support_end = _required_support_end(tables, t0, t1, max_outcome_horizon_minutes)
     selected = _select_tables(tables, t0, t1, support_start, support_end)
     secrets = _secret_values(token_files)
 
     stamp0 = _name_ts(t0)
     stamp1 = _name_ts(t1)
-    archive_name = f"neobitcoin_review_10m_{stamp0}_{stamp1}_schema-v3-fixed.tar.zst"
+    archive_name = f"neobitcoin_review_10m_{stamp0}_{stamp1}_schema-v3-fixed2.tar.zst"
     work = Path(tempfile.mkdtemp(prefix="review-bundle-", dir=destination))
     try:
         data_dir = work / "data"
@@ -370,9 +370,7 @@ def _prepare_source(
         # returns a stable ten-minute window containing that signal.
         matched_signal = False
         for signal_ts in sorted(mature_signals, reverse=True):
-            selection_now = signal_ts + timedelta(
-                minutes=max_outcome_horizon_minutes + 1
-            )
+            selection_now = signal_ts + timedelta(minutes=max_outcome_horizon_minutes + 1)
             try:
                 candidate_extraction = extract_review_raw(
                     raw_root,
@@ -400,6 +398,11 @@ def _prepare_source(
     _enrich_candle_features(feature_rows, extraction.paths)
     orderbook_rows = pq.read_table(extraction.paths["raw_orderbook"]).to_pylist()
     trade_rows = pq.read_table(extraction.paths["raw_trades"]).to_pylist()
+    last_price_rows = pq.read_table(extraction.paths["raw_last_price"]).to_pylist()
+    candle_rows = {
+        f"{minutes}m": pq.read_table(extraction.paths[f"candles_{minutes}m"]).to_pylist()
+        for minutes in (1, 5, 15)
+    }
     price_path = [
         {"exchange_ts": row["exchange_ts"], "mid_price": row["mid_price"]} for row in orderbook_rows
     ]
@@ -410,6 +413,8 @@ def _prepare_source(
         candidate_end=extraction.window.candidate_end,
         orderbook_rows=orderbook_rows,
         trade_rows=trade_rows,
+        last_price_rows=last_price_rows,
+        candle_rows_by_interval=candle_rows,
         # About 0.7% of observed median depth: large enough to expose partial
         # fills while remaining a modest diagnostic order for this instrument.
         virtual_order_quantity=5_000.0,
@@ -467,6 +472,7 @@ def _backfill_review_candles(extraction: Any, token_files: tuple[Path | str, ...
     received = datetime.now(UTC)
     try:
         for minutes, interval_name in interval_names.items():
+            existing_rows = pq.read_table(extraction.paths[f"candles_{minutes}m"]).to_pylist()
             payloads = client.get_candles(
                 instrument_uid,
                 from_time=extraction.window.support_start,
@@ -511,6 +517,17 @@ def _backfill_review_candles(extraction: Any, token_files: tuple[Path | str, ...
                 )
             if not rows:
                 raise ArchiveValidationError(f"T-Bank returned no {minutes}m candle warmup")
+            merged = {_utc(row["candle_start"]): row for row in rows}
+            # Prefer the earliest actually streamed copy for a candle. Its
+            # receive timestamp is valid lineage for historical feature ages;
+            # REST backfill remains only for candle starts absent in the stream.
+            for row in sorted(
+                existing_rows, key=lambda item: _utc(item["receive_ts"]), reverse=True
+            ):
+                if not row.get("is_complete"):
+                    continue
+                merged[_utc(row["candle_start"])] = row
+            rows = [merged[key] for key in sorted(merged)]
             pq.write_table(
                 pa.Table.from_pylist(rows, schema=RAW_SCHEMAS[f"candles_{minutes}m"]),
                 extraction.paths[f"candles_{minutes}m"],
@@ -742,9 +759,7 @@ def _select_tables(
                 table, "receive_ts", t0 - timedelta(seconds=900), support_end
             )
         elif name in {"raw_orderbook", "raw_last_price"}:
-            result[name] = _filter_time_with_context(
-                table, "receive_ts", raw_start, support_end
-            )
+            result[name] = _filter_time_with_context(table, "receive_ts", raw_start, support_end)
         elif name in {"market_status_events", "data_quality_events"}:
             result[name] = _filter_time(table, "receive_ts", raw_start, support_end)
         elif name == "feature_snapshots":
@@ -765,6 +780,33 @@ def _select_tables(
         else:
             result[name] = table.slice(0, 0)
     return result
+
+
+def _required_support_end(
+    tables: dict[str, pa.Table],
+    t0: datetime,
+    t1: datetime,
+    max_outcome_horizon_minutes: int,
+) -> datetime:
+    """Derive support from candidate entries/fills, never merely candidate end."""
+
+    candidate_ids = _candidate_ids(tables["candidate_events"], t0, t1)
+    executions = _filter_ids(tables["execution_simulations"], "candidate_id", candidate_ids)
+    outcomes = _filter_ids(tables["future_outcomes"], "candidate_id", candidate_ids)
+    entries = [
+        _utc(value)
+        for table, column in ((executions, "order_ts"), (outcomes, "entry_ts"))
+        if column in table.column_names
+        for value in table[column].to_pylist()
+        if value is not None
+    ]
+    fills = (
+        [_utc(value) for value in executions["fill_ts"].to_pylist() if value is not None]
+        if "fill_ts" in executions.column_names
+        else []
+    )
+    max_required_entry = max([t1, *entries, *fills])
+    return max_required_entry + timedelta(minutes=max_outcome_horizon_minutes)
 
 
 def _filter_time(table: pa.Table, column: str, start: datetime, end: datetime) -> pa.Table:
@@ -835,6 +877,8 @@ def _validate_tables(
     support_end: datetime,
     secrets: list[bytes],
 ) -> dict[str, Any]:
+    from .review_reconciliation import reconcile_review_tables
+
     errors: list[str] = []
     checks: list[dict[str, str]] = []
 
@@ -1407,6 +1451,32 @@ def _validate_tables(
         "no secret material",
         "secret material such as tokens and credentials must never enter the bundle",
     )
+    reconciliation = reconcile_review_tables(tables)
+    for section in ("trade_flow", "source_ages", "outcomes", "stops"):
+        payload = reconciliation[section]
+        passed = (
+            all(item.get("status") == "PASS" for item in payload.values())
+            if section == "trade_flow"
+            else not any(
+                error.startswith(section.replace("source_ages", "source-age"))
+                for error in reconciliation["errors"]
+            )
+        )
+        check(
+            f"independent_{section}_reconciliation",
+            passed,
+            payload,
+            "100% reproduced; 0 critical mismatches",
+            "independent archive-only recalculation must reproduce published values",
+        )
+    check(
+        "independent_reconciliation",
+        reconciliation["status"] == "PASS",
+        reconciliation["errors"] or "no errors",
+        "PASS",
+        "trade flow, support, source ages, outcomes and stops must all reconcile",
+    )
+    errors.extend(error for error in reconciliation["errors"] if error not in errors)
     return {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
@@ -1443,6 +1513,7 @@ def _validate_tables(
         "required_feature_null_fraction": required_feature_null_fraction,
         "mfe_range": [min(mfe_values), max(mfe_values)] if mfe_values else None,
         "mae_range": [min(mae_values), max(mae_values)] if mae_values else None,
+        "reconciliation": reconciliation,
     }
 
 
@@ -1513,6 +1584,8 @@ def _build_manifest(
                 "foreign_keys": [list(item) for item in FOREIGN_KEYS.get(dataset, ())],
             }
         )
+    reconciliation = validation["reconciliation"]
+    raw_support = reconciliation["raw_support"]
     return {
         "schema_version": "v3",
         "instrument": instrument,
@@ -1521,6 +1594,16 @@ def _build_manifest(
         "outcome_support_end": support_end.isoformat(),
         "support_data_start": support_start.isoformat(),
         "support_data_end": support_end.isoformat(),
+        "max_actual_fill_ts": raw_support["max_actual_fill_ts"],
+        "max_theoretical_entry_ts": raw_support["max_theoretical_entry_ts"],
+        "max_required_entry_ts": raw_support["max_required_entry_ts"],
+        "required_support_end": raw_support["required_support_end"],
+        "actual_support_end": raw_support["actual_support_end"],
+        "trade_flow_reconciliation_summary": reconciliation["trade_flow"],
+        "source_age_reconciliation_summary": reconciliation["source_ages"],
+        "outcome_source_reconciliation_summary": reconciliation["outcomes"],
+        "stop_trigger_reconciliation_summary": reconciliation["stops"],
+        "unexplained_identical_stop_count": reconciliation["stops"]["unexplained_identical_count"],
         "raw_orderbook_coverage_start": validation["raw_coverage"]["raw_orderbook"]["start"],
         "raw_orderbook_coverage_end": validation["raw_coverage"]["raw_orderbook"]["end"],
         "raw_trades_coverage_start": validation["raw_coverage"]["raw_trades"]["start"],
@@ -1626,6 +1709,11 @@ def _schema_dictionary(tables: dict[str, pa.Table]) -> str:
         "events are excluded. `data_age_ms` is feature timestamp minus the newest "
         "market-event timestamp used by the feature.",
         "",
+        "Outcome prices use the last order-book event at or before `target_ts`. "
+        "LONG exits use executable bid and SHORT exits use executable ask; the source "
+        "event ID and both exchange/receive timestamps are retained. Mid price is "
+        "reported separately and is never silently substituted for executable PnL.",
+        "",
         "MFE and MAE fields are non-negative magnitudes. MFE is the maximum favourable "
         "move; MAE is the absolute maximum adverse move, side-adjusted for LONG/SHORT.",
         "",
@@ -1685,6 +1773,72 @@ def _validation_report(validation: dict[str, Any], tables: dict[str, pa.Table]) 
             explanation=cell(item["explanation"]),
         )
         for item in validation["checks"]
+    )
+    reconciliation = validation["reconciliation"]
+    lines.extend(
+        (
+            "",
+            "## Trade flow",
+            "",
+            "| Window | Checked | Matched | Mismatched | Maximum error |",
+            "|---|---:|---:|---:|---:|",
+        )
+    )
+    for window, item in reconciliation["trade_flow"].items():
+        lines.append(
+            f"| {window} | {item['checked']} | {item['matched']} | "
+            f"{item['mismatched']} | {item['max_error']} |"
+        )
+    support = reconciliation["raw_support"]
+    lines.extend(
+        (
+            "",
+            "## Raw support",
+            "",
+            f"- Candidate end: `{validation['candidate_window_end']}`",
+            f"- Maximum fill timestamp: `{support['max_actual_fill_ts']}`",
+            f"- Required support end: `{support['required_support_end']}`",
+            f"- Actual orderbook end: `{support['actual_support_end']['raw_orderbook']}`",
+            f"- Actual trades end: `{support['actual_support_end']['raw_trades']}`",
+            f"- Actual last-price end: `{support['actual_support_end']['raw_last_price']}`",
+            "",
+            "## Source ages",
+            "",
+            "| Age | Null fraction | Min | Median | p95 | Max | Reconciled |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for name, item in reconciliation["source_ages"].items():
+        if "null_fraction" not in item:
+            continue
+        lines.append(
+            f"| {name} | {item.get('null_fraction')} | {item.get('min')} | "
+            f"{item.get('median')} | {item.get('p95')} | {item.get('max')} | "
+            f"{item.get('reconciled')} |"
+        )
+    outcome = reconciliation["outcomes"]
+    stop = reconciliation["stops"]
+    lines.extend(
+        (
+            "",
+            "## Outcomes",
+            "",
+            f"- Complete: {outcome['complete_count']}",
+            f"- Source IDs present: {outcome['source_ids_present']}",
+            f"- Reproduced prices: {outcome['reproduced_prices']}",
+            f"- Reproduced PnL: {outcome['reproduced_pnl']}",
+            f"- Outside support: {outcome['outside_support_count']}",
+            "",
+            "## Stops",
+            "",
+            f"- Triggered: {stop['triggered_count']}",
+            f"- Source IDs present: {stop['source_ids_present']}",
+            f"- Reproduced: {stop['reproduced_count']}",
+            f"- Identical results: {stop['identical_result_count']}",
+            f"- Gap-explained identical: {stop['gap_explained_identical_count']}",
+            f"- Unexplained identical: {stop['unexplained_identical_count']}",
+            f"- Trigger examples: {', '.join(stop['trigger_examples']) or 'none'}",
+        )
     )
     lines.extend(
         (

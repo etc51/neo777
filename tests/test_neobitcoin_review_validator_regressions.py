@@ -62,13 +62,42 @@ def _valid_tables(tmp_path: Path) -> dict[str, pa.Table]:
         tables[dataset] = _replace(tables[dataset], rows)
 
     feature_rows = _rows(tables["feature_snapshots"])
+    trade_rows = _rows(tables["raw_trades"])
     for row in feature_rows:
+        feature_ts = row["exchange_ts"]
+        for seconds in (5, 10, 30, 60, 180, 300, 900):
+            lower = feature_ts - timedelta(seconds=seconds)
+            window = sorted(
+                (
+                    trade
+                    for trade in trade_rows
+                    if lower < trade["exchange_ts"] <= feature_ts
+                ),
+                key=lambda trade: (trade["exchange_ts"], trade["event_id"]),
+            )
+            buys = [trade for trade in window if trade["aggressor_side"] == "BUY"]
+            sells = [trade for trade in window if trade["aggressor_side"] == "SELL"]
+            unknown = [
+                trade
+                for trade in window
+                if trade["aggressor_side"] not in {"BUY", "SELL"}
+            ]
+            suffix = f"{seconds}s"
+            row[f"trade_count_{suffix}"] = len(window)
+            row[f"known_side_trade_count_{suffix}"] = len(buys) + len(sells)
+            row[f"unknown_side_trade_count_{suffix}"] = len(unknown)
+            row[f"buy_volume_{suffix}"] = sum(float(trade["quantity"]) for trade in buys)
+            row[f"sell_volume_{suffix}"] = sum(float(trade["quantity"]) for trade in sells)
+            row[f"trade_flow_{suffix}"] = (
+                row[f"buy_volume_{suffix}"] - row[f"sell_volume_{suffix}"]
+            )
+            row[f"trade_window_first_event_id_{suffix}"] = (
+                window[0]["event_id"] if window else None
+            )
+            row[f"trade_window_last_event_id_{suffix}"] = (
+                window[-1]["event_id"] if window else None
+            )
         row.update(
-            trade_flow_10s=1.0,
-            trade_flow_180s=2.0,
-            trade_flow_300s=3.0,
-            trade_flow_900s=4.0,
-            data_age_ms=0.0,
             feature_ready=True,
             missing_reason=None,
             warmup_remaining=0,

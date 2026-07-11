@@ -88,7 +88,8 @@ RAW_SCHEMAS: Final[dict[str, pa.Schema]] = {
         pa.field("price", pa.float64(), nullable=False),
         pa.field("quantity", pa.float64(), nullable=False),
         pa.field("direction", pa.string()),
-        pa.field("aggressor_side", pa.string()),
+        pa.field("aggressor_side", pa.string(), nullable=False),
+        pa.field("side_inference_method", pa.string(), nullable=False),
         pa.field("feed_latency_ms", pa.float64(), nullable=False),
     ),
     "raw_last_price": _schema(
@@ -373,6 +374,7 @@ def _build_rows(
             previous_book_id = str(record["event_id"])
         elif event_type in {"trade", "trades"}:
             direction = _optional_text(payload.get("direction"))
+            aggressor_side = _aggressor(direction)
             rows["raw_trades"].append(
                 common
                 | {
@@ -380,7 +382,10 @@ def _build_rows(
                     "price": _quotation(payload.get("price")),
                     "quantity": float(payload.get("quantity") or 0),
                     "direction": direction,
-                    "aggressor_side": _aggressor(direction),
+                    "aggressor_side": aggressor_side,
+                    "side_inference_method": (
+                        "api_direction" if aggressor_side != "UNKNOWN" else "unknown_api_direction"
+                    ),
                     "feed_latency_ms": float(record["feed_latency_ms"]),
                 }
             )
@@ -526,8 +531,10 @@ def _interval_minutes(value: object) -> int:
     return mapping.get(value, int(value) if isinstance(value, int) else 0)
 
 
-def _aggressor(direction: str | None) -> str | None:
-    return {"1": "BUY", "2": "SELL", "BUY": "BUY", "SELL": "SELL"}.get(direction or "")
+def _aggressor(direction: str | None) -> str:
+    return {"1": "BUY", "2": "SELL", "BUY": "BUY", "SELL": "SELL"}.get(
+        direction or "", "UNKNOWN"
+    )
 
 
 def _optional_text(value: object) -> str | None:
