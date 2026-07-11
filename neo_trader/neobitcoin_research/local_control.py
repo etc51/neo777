@@ -305,9 +305,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _atomic_json(path: Path, payload: dict[str, object]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, path)
+    for attempt in range(10):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
