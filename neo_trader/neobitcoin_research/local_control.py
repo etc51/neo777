@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -219,9 +220,23 @@ async def run_managed_service(
     """Run until a stop request arrives, then cancel through asyncio cleanup."""
 
     service: asyncio.Future[ResearchRuntime] = asyncio.ensure_future(runner(config))
+    warn_free = int(os.environ.get("NEOBITCOIN_WARN_FREE_GIB", "100")) * 1024**3
+    urgent_free = int(os.environ.get("NEOBITCOIN_URGENT_FREE_GIB", "50")) * 1024**3
+    stop_free = int(os.environ.get("NEOBITCOIN_STOP_FREE_GIB", "15")) * 1024**3
+    last_disk_warning = 0.0
     while not service.done() and not stop_file.exists():
         if heartbeat_file is not None:
             _atomic_json(heartbeat_file, {"at": _utc_now(), "pid": os.getpid()})
+        free = shutil.disk_usage(config.data_root).free
+        now = time.monotonic()
+        if free < stop_free:
+            LOGGER.critical("disk guard requested graceful stop: free_bytes=%d", free)
+            service.cancel()
+            break
+        if free < warn_free and now - last_disk_warning >= 300:
+            level = logging.ERROR if free < urgent_free else logging.WARNING
+            LOGGER.log(level, "local disk space warning: free_bytes=%d", free)
+            last_disk_warning = now
         await asyncio.sleep(poll_seconds)
     if stop_file.exists() and not service.done():
         LOGGER.info("graceful shutdown requested")
