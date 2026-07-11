@@ -13,7 +13,6 @@ from pathlib import Path
 
 import zstandard
 
-
 MAX_BYTES = 400 * 1024 * 1024
 SAFE_AGE_SECONDS = 180
 
@@ -55,8 +54,13 @@ def main() -> int:
                 for path in selected:
                     relative = path.relative_to(data)
                     archive.add(path, arcname=str(relative))
-                    manifest.append({"path": str(relative), "bytes": path.stat().st_size,
-                                     "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest()})
+                    manifest.append(
+                        {
+                            "path": str(relative),
+                            "bytes": path.stat().st_size,
+                            "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest(),
+                        }
+                    )
                 body = json.dumps({"files": manifest}, ensure_ascii=False).encode()
                 info = tarfile.TarInfo("MANIFEST.json")
                 info.size = len(body)
