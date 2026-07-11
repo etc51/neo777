@@ -216,7 +216,7 @@ def select_review_window(
             for record in records
             if raw_start - timedelta(seconds=critical_gap_seconds)
             <= _as_utc(record["receive_ts"])
-            <= support_end
+            <= support_end + timedelta(seconds=critical_gap_seconds)
         ]
         if _window_is_usable(
             candidate,
@@ -251,7 +251,7 @@ def _window_is_usable(
     if (
         not books
         or not support
-        or max(_as_utc(record["receive_ts"]) for record in support) < support_end - tolerance
+        or max(_as_utc(record["receive_ts"]) for record in support) < support_end
     ):
         return False
     raw_start = candidate_start - timedelta(seconds=60)
@@ -269,7 +269,7 @@ def _window_is_usable(
         if (
             not event_times
             or min(event_times) > candidate_start
-            or max(event_times) < support_end - tolerance
+            or max(event_times) < support_end
             or min(event_times) > raw_start + tolerance
         ):
             return False
@@ -320,11 +320,9 @@ def _build_rows(
                     "low": _quotation(payload.get("low")),
                     "close": _quotation(payload.get("close")),
                     "volume": float(payload.get("volume") or 0),
-                    # Some stream snapshots report ``is_complete=false``
-                    # even for historical candles. Exchange-time closure is
-                    # authoritative once the candle end precedes receipt.
-                    "is_complete": bool(payload.get("is_complete"))
-                    or candle_end <= receive_ts,
+                    # Preserve the source flag verbatim. Canonical completion
+                    # is a point-in-time derived property in schema-v4.1.
+                    "is_complete": bool(payload.get("is_complete")),
                     "source_timeframe": f"{interval}m",
                     "is_backfilled": candle_end < receive_ts - timedelta(minutes=interval),
                 }

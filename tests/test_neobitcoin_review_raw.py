@@ -47,9 +47,11 @@ def test_extracts_mature_window_to_one_typed_parquet_per_raw_dataset(tmp_path: P
         config_hash="cfg123",
     )
 
-    assert result.window.candidate_start == BASE + timedelta(minutes=9)
-    assert result.window.candidate_end == BASE + timedelta(minutes=19)
-    assert result.window.support_end == BASE + timedelta(minutes=49)
+    # The chosen window must have exact support in every mandatory raw stream;
+    # last_price is emitted every three minutes, so [09, 19] is one minute short.
+    assert result.window.candidate_start == BASE + timedelta(minutes=8)
+    assert result.window.candidate_end == BASE + timedelta(minutes=18)
+    assert result.window.support_end == BASE + timedelta(minutes=48)
     assert set(result.paths) == set(RAW_SCHEMAS)
     assert len(list((tmp_path / "review" / "data").glob("*.parquet"))) == 7
     for dataset, path in result.paths.items():
@@ -68,6 +70,9 @@ def test_extracts_mature_window_to_one_typed_parquet_per_raw_dataset(tmp_path: P
     assert result.rows_by_dataset["raw_trades"] >= 25
     assert result.rows_by_dataset["raw_last_price"] >= 14
     assert result.rows_by_dataset["candles_1m"] == 1
+    # Raw keeps the source flag even though this historical interval elapsed;
+    # schema-v4.1 derives canonical completion point-in-time downstream.
+    assert pq.read_table(result.paths["candles_1m"])["is_complete"][0].as_py() is False
 
 
 def test_skips_latest_candidate_window_containing_reconnect(tmp_path: Path) -> None:

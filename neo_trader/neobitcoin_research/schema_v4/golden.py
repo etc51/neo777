@@ -1,4 +1,4 @@
-"""Callable schema-v4 golden synthetic publication gate."""
+"""Callable schema-v4.1 golden synthetic publication gate."""
 
 from __future__ import annotations
 
@@ -146,7 +146,10 @@ def validate_golden_synthetic(fixture_path: Path | None = None) -> dict[str, Any
             fields.append(pa.field(field_name, array.type))
         tables[name] = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     oracle = validate_independent_oracle(
-        tables, tick_size=float(data["tick_size"]), require_all_contracts=False
+        tables,
+        tick_size=float(data["tick_size"]),
+        require_all_contracts=False,
+        candle_warmup=1,
     )
     if oracle["status"] != "PASS":
         mismatches.append(f"independent_oracle:{len(oracle['violations'])}_violations")

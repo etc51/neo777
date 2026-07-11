@@ -325,3 +325,37 @@ def test_golden_synthetic_production_oracle_and_manual_agree() -> None:
         oracle_tables, tick_size=data["tick_size"], require_all_contracts=False
     )
     assert oracle_report["metrics"]["secrets"]["hits"] == 0
+
+
+def test_schema_v4_1_golden_has_eight_literal_scenario_expectations() -> None:
+    """The v4.1 edge cases are reviewable literals, never generated expectations."""
+
+    scenarios = json.loads(FIXTURE.read_text(encoding="utf-8"))["schema_v4_1_scenarios"]
+    by_id = {row["id"]: row["expected"] for row in scenarios}
+    assert list(by_id) == [
+        "source_false_interval_elapsed",
+        "future_revision_excluded",
+        "late_revision_visible_later",
+        "unfinished_interval_excluded",
+        "stale_candle_blocks_readiness",
+        "first_ofi_snapshot",
+        "spread_exactly_three_ticks",
+        "spread_four_ticks",
+    ]
+    assert by_id["source_false_interval_elapsed"] == {
+        "canonical_is_complete": True,
+        "completion_reason": "interval_elapsed",
+        "selected": True,
+    }
+    assert by_id["future_revision_excluded"]["selected_revision"] == 1
+    assert by_id["late_revision_visible_later"] == {
+        "early_selected_revision": 1,
+        "late_selected_revision": 2,
+    }
+    assert by_id["unfinished_interval_excluded"]["selected"] is False
+    assert by_id["stale_candle_blocks_readiness"]["feature_ready"] is False
+    assert by_id["first_ofi_snapshot"]["ofi_delta"] is None
+    assert by_id["spread_exactly_three_ticks"]["spread_ticks_int"] == 3
+    assert by_id["spread_exactly_three_ticks"]["spread_gate_passed"] is True
+    assert by_id["spread_four_ticks"]["spread_ticks_int"] == 4
+    assert by_id["spread_four_ticks"]["spread_gate_passed"] is False

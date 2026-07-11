@@ -106,7 +106,10 @@ for _interval in ("1m", "5m", "15m"):
     CONTRACTS[_name] = _raw_contract(
         _name,
         [
+            ("candle_start", UTC_TS, True),
             ("candle_end", UTC_TS, False),
+            ("is_complete", pa.bool_(), True),
+            ("revision", pa.int64(), True),
             ("open", pa.float64(), False),
             ("high", pa.float64(), False),
             ("low", pa.float64(), False),
@@ -117,6 +120,7 @@ for _interval in ("1m", "5m", "15m"):
     )
 
 _feature_fields = [
+    ("schema_version", pa.string(), True),
     ("feature_snapshot_id", pa.string(), False),
     ("feature_ready", pa.bool_(), False),
     ("feature_ts", UTC_TS, False),
@@ -126,7 +130,51 @@ _feature_fields = [
     ("trend", pa.string(), True),
     ("regime", pa.string(), True),
     ("orderbook_source_event_id", pa.string(), True),
+    ("best_bid", pa.float64(), True),
+    ("best_ask", pa.float64(), True),
+    ("spread", pa.float64(), True),
+    ("spread_price", pa.float64(), True),
+    ("tick_size", pa.float64(), True),
+    ("spread_ticks", pa.float64(), True),
+    ("spread_ticks_decimal", pa.float64(), True),
+    ("spread_ticks_int", pa.int64(), True),
+    ("tick_grid_error", pa.float64(), True),
+    ("spread_threshold_ticks", pa.int64(), True),
+    ("spread_gate_passed", pa.bool_(), True),
+    ("microprice", pa.float64(), True),
+    ("ofi", pa.float64(), True),
+    ("ofi_delta", pa.float64(), True),
+    ("ofi_source_event_id", pa.string(), True),
+    ("ofi_previous_event_id", pa.string(), True),
+    ("ofi_continuity_valid", pa.bool_(), True),
+    ("ofi_reset_reason", pa.string(), True),
+    ("last_price_source_event_id", pa.string(), True),
+    ("last_price", pa.float64(), True),
+    ("missing_fields", pa.list_(pa.string()), True),
+    ("missing_reason", pa.string(), True),
+    ("source_status", pa.string(), True),
+    ("readiness_checks_passed", pa.int64(), True),
+    ("readiness_checks_total", pa.int64(), True),
+    ("readiness_version", pa.string(), True),
 ]
+for _interval in ("1m", "5m", "15m"):
+    _feature_fields += [
+        (f"candle_{_interval}_source_event_id", pa.string(), True),
+        (f"candle_{_interval}_start", UTC_TS, True),
+        (f"candle_{_interval}_end", UTC_TS, True),
+        (f"candle_{_interval}_revision", pa.int64(), True),
+        (f"candle_{_interval}_source_is_complete", pa.bool_(), True),
+        (f"candle_{_interval}_canonical_is_complete", pa.bool_(), True),
+        (f"candle_{_interval}_completion_reason", pa.string(), True),
+        (f"candle_{_interval}_revision_receive_ts", UTC_TS, True),
+        (f"candle_{_interval}_interval_age_ms", pa.float64(), True),
+        (f"candle_{_interval}_receive_age_ms", pa.float64(), True),
+        (f"candle_{_interval}_stale", pa.bool_(), True),
+        (f"candle_volume_{_interval}", pa.float64(), True),
+        (f"return_{_interval}", pa.float64(), True),
+        (f"atr_{_interval}", pa.float64(), True),
+        (f"atr_{_interval}_warmup_remaining", pa.int64(), True),
+    ]
 for _level in range(1, 21):
     for _side in ("bid", "ask"):
         _feature_fields += [
@@ -297,7 +345,7 @@ def validate_data_contracts(
                 continue
             actual = table.schema.field(expected.name).type
             wanted = expected.type
-            compatible = actual == wanted
+            compatible = actual == wanted or (expected.nullable and pa.types.is_null(actual))
             if pa.types.is_floating(wanted):
                 compatible = pa.types.is_floating(actual)
             elif pa.types.is_integer(wanted):
@@ -314,6 +362,19 @@ def validate_data_contracts(
         seen: set[tuple[Any, ...]] = set()
         previous: datetime | None = None
         for index, row in enumerate(rows):
+            if name == "feature_snapshots" and row.get("schema_version") == "schema-v4.1":
+                required_v41 = {
+                    "missing_fields", "readiness_checks_passed", "readiness_checks_total",
+                    "readiness_version", "ofi_source_event_id", "ofi_continuity_valid",
+                    "spread_price", "tick_size", "spread_ticks_decimal", "spread_ticks_int",
+                    "tick_grid_error", "spread_threshold_ticks",
+                }
+                for field_name in sorted(required_v41):
+                    if field_name not in row or row.get(field_name) is None:
+                        out.append(ContractViolation(
+                            "missing_v41_field", name, "schema-v4.1 field is absent/null",
+                            index, field_name,
+                        ))
             for field in contract.required:
                 if field in row and row[field] is None:
                     out.append(

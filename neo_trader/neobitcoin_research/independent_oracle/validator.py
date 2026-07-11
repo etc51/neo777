@@ -13,6 +13,7 @@ from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -20,6 +21,8 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from .contracts import PRICE_LEVELS, TRADE_WINDOWS, ContractViolation, validate_data_contracts
 
 EPS: Final = 1e-9
+GRID_EPS: Final = Decimal("1e-9")
+CANDLE_STALE_MS: Final = {"1m": 120_000.0, "5m": 600_000.0, "15m": 1_800_000.0}
 _SECRET = re.compile(
     r"(?i)(?:authorization\s*[:=]|bearer\s+|api[_-]?token\s*[:=]|"
     r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----|\bt\.[A-Za-z0-9_-]{20,})"
@@ -91,14 +94,61 @@ def _levels(row: Mapping[str, Any], side: str) -> list[tuple[float, float]]:
     return result
 
 
+def _candle_start(row: Mapping[str, Any], interval: str) -> datetime:
+    value = row.get("candle_start") or row.get("exchange_ts")
+    return _utc(value)
+
+
+def _candle_end(row: Mapping[str, Any]) -> datetime:
+    return _utc(row.get("candle_end") or row["exchange_ts"])
+
+
+def _revision_key(row: Mapping[str, Any]) -> tuple[int, datetime, str]:
+    return (_seq(row), _utc(row["receive_ts"]), str(row["event_id"]))
+
+
+def _candle_group(row: Mapping[str, Any], interval: str) -> tuple[str, str, datetime, datetime]:
+    return (
+        str(row.get("instrument_uid") or row.get("instrument_id") or row.get("figi") or ""),
+        str(row.get("timeframe") or row.get("interval") or interval),
+        _candle_start(row, interval),
+        _candle_end(row),
+    )
+
+
+def _completion_reason(source_complete: bool, interval_complete: bool) -> str:
+    if source_complete and interval_complete:
+        return "source_flag_and_interval_elapsed"
+    if source_complete:
+        return "source_flag"
+    if interval_complete:
+        return "interval_elapsed"
+    return "not_complete"
+
+
 class IndependentOracleValidator:
     """Recalculate published values solely from tables supplied by the caller."""
 
-    def __init__(self, *, tick_size: float, require_all_contracts: bool = True) -> None:
-        if tick_size <= 0:
-            raise ValueError("tick_size must be positive")
+    def __init__(
+        self,
+        *,
+        tick_size: float,
+        require_all_contracts: bool = True,
+        candle_warmup: int = 2,
+        atr_period: int = 2,
+        spread_threshold_ticks: int = 3,
+        candle_stale_ms: Mapping[str, float] | None = None,
+        max_source_age_ms: float = 30_000.0,
+    ) -> None:
+        if tick_size <= 0 or candle_warmup <= 0 or atr_period <= 0:
+            raise ValueError("tick_size, candle_warmup, and atr_period must be positive")
         self.tick_size = float(tick_size)
         self.require_all_contracts = require_all_contracts
+        self.candle_warmup = int(candle_warmup)
+        self.atr_period = int(atr_period)
+        self.spread_threshold_ticks = int(spread_threshold_ticks)
+        self.candle_stale_ms = dict(CANDLE_STALE_MS if candle_stale_ms is None else candle_stale_ms)
+        self.max_source_age_ms = float(max_source_age_ms)
 
     def validate(self, tables: Mapping[str, pa.Table]) -> OracleReport:
         report = OracleReport()
@@ -112,6 +162,7 @@ class IndependentOracleValidator:
         trades = sorted(rows.get("raw_trades", []), key=_key)
         self._books(books, report)
         self._features(rows, books, trades, report)
+        self._spread_filters(rows, report)
         self._executions(rows, books, trades, report)
         self._outcomes(rows, books, report)
         self._stops(rows, books, report)
@@ -183,6 +234,103 @@ class IndependentOracleValidator:
         eligible = [row for row in events if self._available(row, feature_ts, processing_ts)]
         return max(eligible, key=_key) if eligible else None
 
+    @staticmethod
+    def _canonical_candle_history(
+        candles: Sequence[Mapping[str, Any]],
+        interval: str,
+        feature_ts: datetime,
+        processing_ts: datetime,
+    ) -> list[Mapping[str, Any]]:
+        """Latest available revision per completed interval, with no production dependency."""
+        revisions: dict[tuple[str, str, datetime, datetime], Mapping[str, Any]] = {}
+        for row in candles:
+            if _utc(row["receive_ts"]) > processing_ts:
+                continue
+            if (
+                isinstance(row.get("processing_ts"), datetime)
+                and _utc(row["processing_ts"]) > processing_ts
+            ):
+                continue
+            if _candle_end(row) > feature_ts:
+                continue
+            group = _candle_group(row, interval)
+            prior = revisions.get(group)
+            if prior is None or _revision_key(row) > _revision_key(prior):
+                revisions[group] = row
+        return sorted(revisions.values(), key=lambda row: (_candle_end(row), _revision_key(row)))
+
+    def _spread_values(self, bid: float, ask: float) -> dict[str, Any]:
+        spread = Decimal(str(ask)) - Decimal(str(bid))
+        tick = Decimal(str(self.tick_size))
+        decimal_ticks = spread / tick
+        integer_ticks = int(decimal_ticks.to_integral_value(rounding=ROUND_HALF_UP))
+        error = abs(decimal_ticks - Decimal(integer_ticks))
+        return {
+            "spread_price": float(spread),
+            "tick_size": float(tick),
+            "spread_ticks_decimal": float(decimal_ticks),
+            "spread_ticks_int": integer_ticks,
+            "tick_grid_error": float(error),
+            "on_grid": error <= GRID_EPS,
+        }
+
+    @staticmethod
+    def _same_ofi_stream(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        instrument_left = left.get("instrument_id") or left.get("figi")
+        instrument_right = right.get("instrument_id") or right.get("figi")
+        if instrument_left != instrument_right:
+            return False
+        session_left = left.get("session_id") or left.get("connection_id")
+        session_right = right.get("session_id") or right.get("connection_id")
+        return session_left == session_right
+
+    @staticmethod
+    def _is_ofi_reset(row: Mapping[str, Any]) -> bool:
+        flags = {str(value).lower() for value in row.get("data_quality_flags") or []}
+        return bool(
+            row.get("is_reset")
+            or row.get("connection_reset")
+            or row.get("reconnect")
+            or row.get("reset_reason")
+            or flags & {"reset", "reconnect", "connection_reset"}
+        )
+
+    def _previous_ofi_book(
+        self,
+        books: Sequence[Mapping[str, Any]],
+        current: Mapping[str, Any],
+        processing_ts: datetime,
+        status_events: Sequence[Mapping[str, Any]],
+    ) -> tuple[Mapping[str, Any] | None, str | None]:
+        prior = [
+            row
+            for row in books
+            if _key(row) < _key(current)
+            and _utc(row["receive_ts"]) <= processing_ts
+        ]
+        if self._is_ofi_reset(current):
+            return None, str(current.get("reset_reason") or "reset_or_reconnect")
+        if not prior:
+            return None, "no_previous_snapshot"
+        candidate = max(prior, key=_key)
+        reset_types = {"reconnect", "disconnect", "collector_stop", "stream_reset"}
+        for status in status_events:
+            if not (_key(candidate) < _key(status) < _key(current)):
+                continue
+            value = str(
+                status.get("event_type")
+                or status.get("trading_status")
+                or status.get("status")
+                or ""
+            ).lower()
+            if value in reset_types:
+                return None, value
+        if not self._same_ofi_stream(candidate, current):
+            return None, "session_changed"
+        if self._is_ofi_reset(candidate):
+            return None, "previous_snapshot_reset"
+        return candidate, None
+
     def _features(
         self,
         rows: Mapping[str, list[dict[str, Any]]],
@@ -192,6 +340,7 @@ class IndependentOracleValidator:
     ) -> None:
         features = rows.get("feature_snapshots", [])
         depth_match = imbalance_match = flow_match = candle_match = age_match = 0
+        candle_value_match = atr_match = classification_match = ofi_match = spread_match = 0
         raw_by_name = {
             name: value
             for name, value in rows.items()
@@ -271,6 +420,85 @@ class IndependentOracleValidator:
                 )
             else:
                 imbalance_match += 1
+            top_bid_q = bids[0][1] if bids else None
+            top_ask_q = asks[0][1] if asks else None
+            expected_ofi = (
+                top_bid_q - top_ask_q
+                if top_bid_q is not None and top_ask_q is not None
+                else None
+            )
+            previous_book, reset_reason = self._previous_ofi_book(
+                books, source, processing, rows.get("market_status_events", [])
+            )
+            previous_ofi = None
+            if previous_book is not None:
+                previous_bids = _levels(previous_book, "bids")
+                previous_asks = _levels(previous_book, "asks")
+                if previous_bids and previous_asks:
+                    previous_ofi = previous_bids[0][1] - previous_asks[0][1]
+            expected_delta = (
+                expected_ofi - previous_ofi
+                if expected_ofi is not None and previous_ofi is not None
+                else None
+            )
+            ofi_expected = {
+                "ofi": expected_ofi,
+                "ofi_delta": expected_delta,
+                "ofi_source_event_id": source.get("event_id"),
+                "ofi_previous_event_id": previous_book.get("event_id") if previous_book else None,
+                "ofi_continuity_valid": previous_book is not None,
+                "ofi_reset_reason": reset_reason,
+            }
+            ofi_ok = all(
+                column not in feature or (
+                    _close(feature.get(column), value)
+                    if column in {"ofi", "ofi_delta"}
+                    else feature.get(column) == value
+                )
+                for column, value in ofi_expected.items()
+            )
+            if not ofi_ok:
+                report.add(
+                    "ofi_continuity_mismatch", "feature_snapshots",
+                    "OFI lineage/delta differs from previous valid snapshot", index,
+                )
+            else:
+                ofi_match += 1
+            if bids and asks:
+                spread_values = self._spread_values(bids[0][0], asks[0][0])
+                threshold = int(
+                    feature.get("spread_threshold_ticks") or self.spread_threshold_ticks
+                )
+                expected_gate = spread_values["spread_ticks_int"] <= threshold
+                expected_spread_fields = {
+                    **spread_values,
+                    "spread": spread_values["spread_price"],
+                    "spread_threshold_ticks": threshold,
+                    "spread_gate_passed": expected_gate,
+                }
+                spread_ok = True
+                for column, value in expected_spread_fields.items():
+                    if column == "on_grid" or column not in feature:
+                        continue
+                    actual = feature.get(column)
+                    equal = _close(actual, value) if isinstance(value, float) else actual == value
+                    if not equal:
+                        spread_ok = False
+                        report.add(
+                            "spread_ticks_mismatch", "feature_snapshots",
+                            f"{column}: expected {value!r}", index, column,
+                        )
+                flags_set = {str(value) for value in feature.get("data_quality_flags") or []}
+                if not spread_values["on_grid"] and not (
+                    {"off_tick_grid", "tick_grid_error"} & flags_set
+                ):
+                    spread_ok = False
+                    report.add(
+                        "unflagged_tick_grid_error", "feature_snapshots",
+                        "price spread is not an integral tick count", index, "tick_grid_error",
+                    )
+                if spread_ok:
+                    spread_match += 1
             flow_row_ok = True
             for seconds in TRADE_WINDOWS:
                 lower = ts - timedelta(seconds=seconds)
@@ -314,14 +542,15 @@ class IndependentOracleValidator:
                 "orderbook": books,
                 "last_price": raw_by_name.get("raw_last_price", []),
             }
+            candle_histories: dict[str, list[Mapping[str, Any]]] = {}
+            expected_atrs: dict[str, float | None] = {}
+            expected_candle_stale: dict[str, bool] = {}
             for interval in ("1m", "5m", "15m"):
-                candles = [
-                    item
-                    for item in raw_by_name.get(f"candles_{interval}", [])
-                    if bool(item.get("is_complete", True))
-                    and _utc(item.get("candle_end") or item["exchange_ts"]) <= ts
-                ]
-                selected = self._asof(candles, ts, processing) if candles else None
+                candles = self._canonical_candle_history(
+                    raw_by_name.get(f"candles_{interval}", []), interval, ts, processing
+                )
+                candle_histories[interval] = candles
+                selected = candles[-1] if candles else None
                 expected_id = selected.get("event_id") if selected else None
                 if feature.get(f"candle_{interval}_source_event_id") != expected_id:
                     report.add(
@@ -332,7 +561,88 @@ class IndependentOracleValidator:
                     )
                 else:
                     candle_match += 1
-                source_groups[f"candle_{interval}"] = candles
+                source_groups[f"candle_{interval}"] = [selected] if selected else []
+                if selected is None:
+                    continue
+                source_complete = bool(selected.get("is_complete", False))
+                canonical_complete = (
+                    _candle_end(selected) <= ts and _utc(selected["receive_ts"]) <= processing
+                )
+                interval_age = (ts - _candle_end(selected)).total_seconds() * 1000
+                receive_age = (processing - _utc(selected["receive_ts"])).total_seconds() * 1000
+                stale = interval_age >= self.candle_stale_ms[interval]
+                expected_candle_stale[interval] = stale
+                lineage_expected = {
+                    f"candle_{interval}_start": selected.get("candle_start"),
+                    f"candle_{interval}_end": _candle_end(selected),
+                    f"candle_{interval}_revision": _seq(selected),
+                    f"candle_{interval}_source_is_complete": source_complete,
+                    f"candle_{interval}_canonical_is_complete": canonical_complete,
+                    f"candle_{interval}_completion_reason": _completion_reason(
+                        source_complete, _candle_end(selected) <= ts
+                    ),
+                    f"candle_{interval}_revision_receive_ts": _utc(selected["receive_ts"]),
+                    f"candle_{interval}_interval_age_ms": interval_age,
+                    f"candle_{interval}_receive_age_ms": receive_age,
+                    f"candle_{interval}_stale": stale,
+                }
+                lineage_ok = True
+                for column, value in lineage_expected.items():
+                    if column not in feature:
+                        continue
+                    actual = feature.get(column)
+                    equal = _close(actual, value) if isinstance(value, float) else actual == value
+                    if not equal:
+                        lineage_ok = False
+                        report.add(
+                            "candle_lineage_mismatch", "feature_snapshots",
+                            f"{column}: expected {value!r}", index, column,
+                        )
+                expected_volume = float(selected["volume"])
+                expected_return = None
+                if len(candles) >= 2:
+                    prior_close = float(candles[-2]["close"])
+                    expected_return = (
+                        float(selected["close"]) / prior_close - 1 if prior_close else None
+                    )
+                expected_atr = None
+                if len(candles) >= self.atr_period + 1:
+                    true_ranges: list[float] = []
+                    first_position = len(candles) - self.atr_period
+                    for position in range(first_position, len(candles)):
+                        item = candles[position]
+                        previous_close = float(candles[position - 1]["close"])
+                        high, low = float(item["high"]), float(item["low"])
+                        true_ranges.append(
+                            max(high - low, abs(high - previous_close), abs(low - previous_close))
+                        )
+                    expected_atr = sum(true_ranges) / len(true_ranges)
+                expected_atrs[interval] = expected_atr
+                expected_warmup = max(0, self.atr_period + 1 - len(candles))
+                warmup_field = f"atr_{interval}_warmup_remaining"
+                if warmup_field in feature and feature.get(warmup_field) != expected_warmup:
+                    report.add(
+                        "candle_atr_warmup_mismatch", "feature_snapshots",
+                        f"expected {expected_warmup}", index, warmup_field,
+                    )
+                values_ok = _close(
+                    feature.get(f"candle_volume_{interval}"), expected_volume
+                ) and _close(feature.get(f"return_{interval}"), expected_return)
+                if not values_ok:
+                    report.add(
+                        "candle_value_mismatch", "feature_snapshots",
+                        f"{interval} volume/return does not reproduce raw revision", index,
+                    )
+                elif lineage_ok:
+                    candle_value_match += 1
+                if not _close(feature.get(f"atr_{interval}"), expected_atr):
+                    report.add(
+                        "candle_atr_mismatch", "feature_snapshots",
+                        f"{interval} ATR differs from point-in-time candles", index,
+                        f"atr_{interval}",
+                    )
+                else:
+                    atr_match += 1
             last_trade = [item for item in trades]
             source_groups["last_trade"] = last_trade
             for prefix, events in source_groups.items():
@@ -354,6 +664,147 @@ class IndependentOracleValidator:
                     )
                 else:
                     age_match += 1
+            one_minute = candle_histories.get("1m", [])
+            if len(one_minute) < self.candle_warmup:
+                expected_trend = expected_regime = "insufficient_history"
+                expected_trend_score = None
+            else:
+                first_close = float(one_minute[-self.candle_warmup]["close"])
+                last_close = float(one_minute[-1]["close"])
+                expected_trend_score = last_close / first_close - 1 if first_close else 0.0
+                expected_trend = (
+                    "up" if expected_trend_score > 0.001
+                    else "down" if expected_trend_score < -0.001
+                    else "range"
+                )
+                atr_1m = expected_atrs.get("1m") or 0.0
+                expected_regime = (
+                    "high_volatility"
+                    if last_close and atr_1m / last_close > 0.005
+                    else expected_trend
+                )
+            classification_ok = (
+                feature.get("trend") == expected_trend
+                and feature.get("regime") == expected_regime
+                and (
+                    "trend_score" not in feature
+                    or _close(feature.get("trend_score"), expected_trend_score)
+                )
+            )
+            if not classification_ok:
+                report.add(
+                    "classification_mismatch", "feature_snapshots",
+                    f"expected trend={expected_trend}, regime={expected_regime}", index,
+                )
+            else:
+                classification_match += 1
+
+            if feature.get("schema_version") == "schema-v4.1" or any(
+                name in feature
+                for name in ("readiness_version", "readiness_checks_total", "ofi_continuity_valid")
+            ):
+                mandatory: list[str] = [
+                    "best_bid", "best_ask", "spread_ticks_int", "microprice", "ofi", "ofi_delta",
+                    "imbalance_5", "last_price", "last_trade_source_event_id",
+                    "last_price_source_event_id",
+                ]
+                for side in ("bid", "ask"):
+                    for level in range(1, 21):
+                        mandatory.extend(
+                            (f"{side}_price_{level:02d}", f"{side}_quantity_{level:02d}")
+                        )
+                for seconds in TRADE_WINDOWS:
+                    mandatory.extend((f"trade_count_{seconds}s", f"trade_flow_{seconds}s"))
+                for interval in ("1m", "5m", "15m"):
+                    mandatory.extend(
+                        (
+                            f"candle_{interval}_source_event_id",
+                            f"candle_{interval}_canonical_is_complete",
+                            f"return_{interval}",
+                            f"candle_volume_{interval}",
+                            f"atr_{interval}",
+                        )
+                    )
+                mandatory.extend(("trend", "regime"))
+                expected_missing = sorted(name for name in mandatory if feature.get(name) is None)
+                stale_intervals = [
+                    interval for interval in ("1m", "5m", "15m")
+                    if expected_candle_stale.get(interval, True)
+                ]
+                last_trade_source = self._asof(trades, ts, processing) if trades else None
+                last_price_events = raw_by_name.get("raw_last_price", [])
+                last_price_source = (
+                    self._asof(last_price_events, ts, processing) if last_price_events else None
+                )
+                source_ages = [
+                    (processing - _utc(item["receive_ts"])).total_seconds() * 1000
+                    for item in (source, last_trade_source, last_price_source)
+                    if item is not None
+                ]
+                stale_source = any(value > self.max_source_age_ms for value in source_ages)
+                expected_flags: set[str] = set()
+                if any(quantity < 0 for _, quantity in bids + asks):
+                    expected_flags.add("negative_quantity")
+                if any(bids[pos][0] <= bids[pos + 1][0] for pos in range(len(bids) - 1)):
+                    expected_flags.add("bids_not_descending")
+                if any(asks[pos][0] >= asks[pos + 1][0] for pos in range(len(asks) - 1)):
+                    expected_flags.add("asks_not_ascending")
+                if not bids or not asks:
+                    expected_flags.add("empty_book_side")
+                elif bids[0][0] >= asks[0][0]:
+                    expected_flags.add("crossed_book")
+                if stale_source:
+                    expected_flags.add("stale_source")
+                if stale_intervals:
+                    expected_flags.add("stale_candle")
+                spread_on_grid = bool(
+                    bids
+                    and asks
+                    and self._spread_values(bids[0][0], asks[0][0])["on_grid"]
+                )
+                if not spread_on_grid:
+                    expected_flags.add("off_tick_grid")
+                actual_flags = {str(value) for value in feature.get("data_quality_flags") or []}
+                if actual_flags != expected_flags:
+                    report.add(
+                        "readiness_quality_flags_mismatch", "feature_snapshots",
+                        f"expected {sorted(expected_flags)!r}, got {sorted(actual_flags)!r}", index,
+                        "data_quality_flags",
+                    )
+                expected_ready = (
+                    not expected_missing and not stale_source and not stale_intervals
+                    and not expected_flags and spread_on_grid
+                )
+                actual_missing = sorted(str(value) for value in feature.get("missing_fields") or [])
+                if actual_missing != expected_missing:
+                    report.add(
+                        "readiness_missing_fields_mismatch", "feature_snapshots",
+                        f"expected {expected_missing!r}, got {actual_missing!r}", index,
+                        "missing_fields",
+                    )
+                if bool(feature.get("feature_ready")) != expected_ready:
+                    report.add(
+                        "feature_readiness_mismatch", "feature_snapshots",
+                        f"expected feature_ready={expected_ready}", index, "feature_ready",
+                    )
+                total = len(mandatory) + 4
+                failed_extra = (
+                    int(stale_source) + int(bool(stale_intervals))
+                    + int(bool(expected_flags)) + int(not spread_on_grid)
+                )
+                passed = max(0, total - len(expected_missing) - failed_extra)
+                if feature.get("readiness_checks_total") != total or feature.get(
+                    "readiness_checks_passed"
+                ) != passed:
+                    report.add(
+                        "readiness_check_count_mismatch", "feature_snapshots",
+                        f"expected {passed}/{total}", index,
+                    )
+                if stale_intervals and feature.get("source_status") != "stale_candle":
+                    report.add(
+                        "stale_candle_status_mismatch", "feature_snapshots",
+                        ",".join(stale_intervals), index, "source_status",
+                    )
             if feature.get("feature_ready") and (
                 feature.get("trend") is None
                 or feature.get("regime") in {None, "unknown", "UNKNOWN"}
@@ -371,7 +822,58 @@ class IndependentOracleValidator:
             "trade_flow_reproduced": flow_match,
             "candle_sources_reproduced": candle_match,
             "source_ages_reproduced": age_match,
+            "candle_values_reproduced": candle_value_match,
+            "atr_reproduced": atr_match,
+            "classification_reproduced": classification_match,
+            "ofi_reproduced": ofi_match,
+            "spread_reproduced": spread_match,
         }
+
+    def _spread_filters(
+        self, rows: Mapping[str, list[dict[str, Any]]], report: OracleReport
+    ) -> None:
+        features = {
+            str(row.get("feature_snapshot_id")): row
+            for row in rows.get("feature_snapshots", [])
+        }
+        candidates = {
+            str(row.get("candidate_id")): row for row in rows.get("candidate_events", [])
+        }
+        checked = matched = 0
+        for index, decision in enumerate(rows.get("filter_decisions", [])):
+            if str(decision.get("filter_name") or "").lower() not in {
+                "spread", "spread_gate", "max_spread"
+            }:
+                continue
+            checked += 1
+            feature_id = decision.get("feature_snapshot_id")
+            if feature_id is None:
+                candidate = candidates.get(str(decision.get("candidate_id")))
+                feature_id = candidate.get("feature_snapshot_id") if candidate else None
+            feature = features.get(str(feature_id))
+            if feature is None:
+                report.add(
+                    "spread_filter_lineage_missing", "filter_decisions",
+                    "spread filter has no feature snapshot", index,
+                )
+                continue
+            integer_ticks = feature.get("spread_ticks_int")
+            threshold = feature.get("spread_threshold_ticks", self.spread_threshold_ticks)
+            if integer_ticks is None:
+                report.add(
+                    "spread_filter_integer_ticks_missing", "filter_decisions",
+                    "spread filter cannot use floating ticks", index,
+                )
+                continue
+            expected = int(integer_ticks) <= int(threshold)
+            if decision.get("passed") is not expected:
+                report.add(
+                    "spread_gate_mismatch", "filter_decisions",
+                    f"expected {expected} from {integer_ticks} <= {threshold}", index, "passed",
+                )
+            else:
+                matched += 1
+        report.metrics["spread_filters"] = {"rows": checked, "reproduced": matched}
 
     def _executions(
         self,
@@ -742,10 +1244,26 @@ class IndependentOracleValidator:
 
 
 def validate_independent_oracle(
-    tables: Mapping[str, pa.Table], *, tick_size: float, require_all_contracts: bool = True
+    tables: Mapping[str, pa.Table],
+    *,
+    tick_size: float,
+    require_all_contracts: bool = True,
+    candle_warmup: int = 2,
+    atr_period: int = 2,
+    spread_threshold_ticks: int = 3,
+    candle_stale_ms: Mapping[str, float] | None = None,
+    max_source_age_ms: float = 30_000.0,
 ) -> dict[str, Any]:
     return (
-        IndependentOracleValidator(tick_size=tick_size, require_all_contracts=require_all_contracts)
+        IndependentOracleValidator(
+            tick_size=tick_size,
+            require_all_contracts=require_all_contracts,
+            candle_warmup=candle_warmup,
+            atr_period=atr_period,
+            spread_threshold_ticks=spread_threshold_ticks,
+            candle_stale_ms=candle_stale_ms,
+            max_source_age_ms=max_source_age_ms,
+        )
         .validate(tables)
         .as_dict()
     )

@@ -1,4 +1,4 @@
-"""Raw-event execution, outcome, stop, and exit simulations for schema-v4."""
+"""Raw-event execution, outcome, stop, and exit simulations for schema-v4.1."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ class ExecutionSimulator:
         simulation_id = _id("simulation", candidate["candidate_id"], model)
         return {
             "event_id": simulation_id,
-            "schema_version": "schema-v4",
+            "schema_version": "schema-v4.1",
             "exchange_ts": candidate["exchange_ts"],
             "receive_ts": candidate["receive_ts"],
             "processing_ts": candidate["processing_ts"],
@@ -271,7 +271,7 @@ class OutcomeMaterializer:
                 rows.append(
                     {
                         "event_id": outcome_id,
-                        "schema_version": "schema-v4",
+                        "schema_version": "schema-v4.1",
                         "exchange_ts": target,
                         "receive_ts": source.receive_ts if source else simulation["receive_ts"],
                         "processing_ts": source.processing_ts
@@ -381,7 +381,7 @@ class StopAndExitSimulator:
         result_id = _id("stop", sim["simulation_id"], ticks)
         return {
             "event_id": result_id,
-            "schema_version": "schema-v4",
+            "schema_version": "schema-v4.1",
             "exchange_ts": trigger.exchange_ts if trigger else sim["fill_ts"],
             "receive_ts": trigger.receive_ts if trigger else sim["receive_ts"],
             "processing_ts": trigger.processing_ts if trigger else sim["processing_ts"],
@@ -460,7 +460,7 @@ class StopAndExitSimulator:
         result_id = _id("exit", sim["simulation_id"], model)
         return {
             "event_id": result_id,
-            "schema_version": "schema-v4",
+            "schema_version": "schema-v4.1",
             "exchange_ts": trigger.exchange_ts if trigger else sim["fill_ts"],
             "receive_ts": trigger.receive_ts if trigger else sim["receive_ts"],
             "processing_ts": trigger.processing_ts if trigger else sim["processing_ts"],

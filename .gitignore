@@ -30,3 +30,4 @@ reports/
 !reports/
 reports/*
 !reports/golden_real_slice.md
+!reports/golden_real_candle_audit.md

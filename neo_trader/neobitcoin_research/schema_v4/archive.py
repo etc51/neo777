@@ -1,4 +1,4 @@
-"""Fail-closed publisher for schema-v4-golden review archives."""
+"""Fail-closed publisher for schema-v4.1-golden review archives."""
 
 from __future__ import annotations
 
@@ -87,11 +87,13 @@ def publish_golden_archive(
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     t0, t1 = _utc(candidate_start), _utc(candidate_end)
-    archive_name = f"neobitcoin_review_10m_{_stamp(t0)}_{_stamp(t1)}_schema-v4-golden.tar.zst"
+    archive_name = (
+        f"neobitcoin_review_10m_{_stamp(t0)}_{_stamp(t1)}_schema-v4.1-golden.tar.zst"
+    )
     final_path = destination / archive_name
     if final_path.exists():
         raise GoldenArchiveError(f"archive already exists: {final_path}")
-    work = Path(tempfile.mkdtemp(prefix="schema-v4-golden-", dir=destination))
+    work = Path(tempfile.mkdtemp(prefix="schema-v4.1-golden-", dir=destination))
     partial = destination / f".{archive_name}.inprogress"
     try:
         data = work / "data"
@@ -113,7 +115,7 @@ def publish_golden_archive(
             dataset_manifest.append(_dataset_manifest(name, table, path))
 
         manifest = {
-            "schema_version": "schema-v4-golden",
+            "schema_version": "schema-v4.1-golden",
             "candidate_window_start": t0.isoformat(),
             "candidate_window_end": t1.isoformat(),
             "support_start": _utc(support_start).isoformat(),
@@ -265,7 +267,7 @@ def _manifest_md(manifest: Mapping[str, Any]) -> str:
 
 def _readme(t0: datetime, t1: datetime) -> str:
     return (
-        "# Neobitcoin schema-v4-golden review bundle\n\n"
+        "# Neobitcoin schema-v4.1-golden review bundle\n\n"
         "All derived tables were materialized exclusively from the archived raw datasets.\n"
         "The independent oracle does not import production calculation logic.\n\n"
         f"Candidate window: `{t0.isoformat()}` — `{t1.isoformat()}`.\n"

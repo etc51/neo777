@@ -125,7 +125,9 @@ def test_features_have_twenty_levels_depth_flow_and_real_lineage() -> None:
     assert feature["trade_flow_5s"] == 2.0
     assert feature["unknown_side_volume_5s"] == 8.0
     assert feature["trade_window_last_event_id_5s"] == "t-unknown"
-    assert feature["candle_1m_source_event_id"] == "c1-2"
+    assert feature["candle_1m_source_event_id"] == "c1-3"
+    assert feature["candle_1m_source_is_complete"] is False
+    assert feature["candle_1m_canonical_is_complete"] is True
     assert feature["last_trade_source_event_id"] == "t-unknown"
     assert feature["last_trade_receive_age_ms"] == pytest.approx(1010.0)
     assert feature["materialization_lag_ms"] > feature["last_trade_receive_age_ms"]

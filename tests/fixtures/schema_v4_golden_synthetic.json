@@ -71,6 +71,56 @@
     "complete": [{"candle_id":"c1-complete","interval":"1m","open_ts":"2026-07-11T09:59:00Z","close_ts":"2026-07-11T10:00:00Z","open":99.8,"high":100.2,"low":99.7,"close":100.0,"volume":120.0,"complete":true}],
     "incomplete": [{"candle_id":"c1-incomplete","interval":"1m","open_ts":"2026-07-11T10:00:00Z","close_ts":"2026-07-11T10:01:00Z","open":100.0,"high":100.5,"low":99.9,"close":100.4,"volume":40.0,"complete":false}]
   },
+  "schema_v4_1_scenarios": [
+    {
+      "id": "source_false_interval_elapsed",
+      "description": "Elapsed candle is canonically complete even when the source flag is false",
+      "input": {"source_is_complete": false, "candle_end": "2026-07-11T09:59:00Z", "feature_ts": "2026-07-11T10:00:00Z", "revision_receive_ts": "2026-07-11T09:59:01Z"},
+      "expected": {"canonical_is_complete": true, "completion_reason": "interval_elapsed", "selected": true}
+    },
+    {
+      "id": "future_revision_excluded",
+      "description": "A revision received after feature processing time cannot leak backwards",
+      "input": {"early_revision": 1, "early_receive_ts": "2026-07-11T09:59:01Z", "late_revision": 2, "late_receive_ts": "2026-07-11T10:00:01Z", "feature_processing_ts": "2026-07-11T10:00:00Z"},
+      "expected": {"selected_revision": 1, "selected_event_id": "revision-early"}
+    },
+    {
+      "id": "late_revision_visible_later",
+      "description": "A later point-in-time view selects the final revision without changing the earlier view",
+      "input": {"early_feature_processing_ts": "2026-07-11T10:00:00Z", "late_feature_processing_ts": "2026-07-11T10:00:02Z"},
+      "expected": {"early_selected_revision": 1, "late_selected_revision": 2}
+    },
+    {
+      "id": "unfinished_interval_excluded",
+      "description": "A candle whose interval ends after feature time is not a closed-candle source",
+      "input": {"source_is_complete": true, "candle_end": "2026-07-11T10:01:00Z", "feature_ts": "2026-07-11T10:00:00Z"},
+      "expected": {"canonical_is_complete": false, "completion_reason": "not_complete", "selected": false}
+    },
+    {
+      "id": "stale_candle_blocks_readiness",
+      "description": "A mandatory one-minute candle at the freshness boundary is stale",
+      "input": {"timeframe": "1m", "interval_age_ms": 120000, "max_interval_age_ms": 120000},
+      "expected": {"candle_stale": true, "feature_ready": false, "source_status": "stale_candle", "missing_field": "candle_1m_stale"}
+    },
+    {
+      "id": "first_ofi_snapshot",
+      "description": "The first snapshot has no valid OFI predecessor",
+      "input": {"ofi": 4.0, "previous_event_id": null},
+      "expected": {"ofi_delta": null, "ofi_continuity_valid": false, "feature_ready": false, "missing_field": "ofi_delta", "ofi_reset_reason": "requires_previous_snapshot"}
+    },
+    {
+      "id": "spread_exactly_three_ticks",
+      "description": "Floating representation above three still normalizes to exactly three grid ticks",
+      "input": {"spread_price": "0.3000000000029", "tick_size": "0.1", "spread_ticks_decimal": "3.000000000029", "spread_threshold_ticks": 3},
+      "expected": {"spread_ticks_int": 3, "tick_grid_error": "0.000000000029", "spread_gate_passed": true}
+    },
+    {
+      "id": "spread_four_ticks",
+      "description": "Four normalized ticks fail a three-tick threshold",
+      "input": {"spread_price": "0.4", "tick_size": "0.1", "spread_threshold_ticks": 3},
+      "expected": {"spread_ticks_int": 4, "tick_grid_error": "0", "spread_gate_passed": false}
+    }
+  ],
   "manual_expected": {
     "trade_flow_10s": 2.0,
     "trade_flow_180s": 2.0,

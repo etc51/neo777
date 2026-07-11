@@ -1,4 +1,4 @@
-"""Public raw-tables-only schema-v4 materialization orchestration."""
+"""Public raw-tables-only schema-v4.1 materialization orchestration."""
 
 from __future__ import annotations
 
@@ -61,6 +61,8 @@ class RawOnlyPipeline:
             or self.execution_config.tick_size != tick_size
         ):
             raise ValueError("all pipeline tick sizes must match")
+        if self.feature_config.spread_threshold_ticks != self.candidate_config.spread_gate_ticks:
+            raise ValueError("feature and candidate spread thresholds must match")
         if feature_interval_seconds <= 0:
             raise ValueError("feature_interval_seconds must be positive")
         self.feature_interval_seconds = feature_interval_seconds

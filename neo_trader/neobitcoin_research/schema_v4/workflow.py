@@ -1,4 +1,4 @@
-"""End-to-end raw-only schema-v4-golden review workflow."""
+"""End-to-end raw-only schema-v4.1-golden review workflow."""
 
 from __future__ import annotations
 
@@ -109,26 +109,46 @@ def create_schema_v4_golden_bundle(
             for value in actual_support_end.values()
         )
         oracle = validate_independent_oracle(
-            tables, tick_size=tick_size, require_all_contracts=True
+            tables,
+            tick_size=tick_size,
+            require_all_contracts=True,
+            candle_warmup=pipeline.feature_config.candle_warmup,
+            atr_period=pipeline.feature_config.atr_period,
+            spread_threshold_ticks=int(pipeline.feature_config.spread_threshold_ticks),
+            candle_stale_ms={
+                "1m": pipeline.feature_config.candle_1m_max_interval_age_ms,
+                "5m": pipeline.feature_config.candle_5m_max_interval_age_ms,
+                "15m": pipeline.feature_config.candle_15m_max_interval_age_ms,
+            },
+            max_source_age_ms=pipeline.feature_config.max_source_age_ms,
         )
         golden = validate_golden_synthetic()
         real_report = (
-            base.parent / "777" / "111_neobitcoin_edge" / "reports" / "golden_real_slice.md"
+            base.parent
+            / "777"
+            / "111_neobitcoin_edge"
+            / "reports"
+            / "golden_real_candle_audit.md"
         )
         if not real_report.parent.exists():
-            real_report = Path.cwd() / "reports" / "golden_real_slice.md"
+            real_report = Path.cwd() / "reports" / "golden_real_candle_audit.md"
         _write_real_slice_data(Path(temporary) / "data", tables)
         from scripts.generate_golden_real_slice import generate
 
-        generate(Path(temporary) / "data", real_report, count=5)
+        generate(Path(temporary) / "data", real_report, count=10)
         real_ok = (
             real_report.is_file()
-            and real_report.read_text(encoding="utf-8").count("## ") >= 5
+            and real_report.read_text(encoding="utf-8").count("## ") >= 10
+        )
+        feature_rows = tables["feature_snapshots"].to_pylist()
+        all_features_ready = bool(feature_rows) and all(
+            row.get("feature_ready") is True for row in feature_rows
         )
         gates = {
             "golden_synthetic": golden["status"],
             "golden_real_slice": "PASS" if real_ok else "FAIL",
             "production_materializer": "PASS" if tables["feature_snapshots"].num_rows else "FAIL",
+            "all_features_ready": "PASS" if all_features_ready else "FAIL",
             "independent_oracle": oracle["status"],
             "production_vs_oracle": oracle["status"],
             "data_contracts": "PASS" if not oracle["violations"] else "FAIL",
@@ -155,11 +175,19 @@ def create_schema_v4_golden_bundle(
             "oracle": oracle,
             "golden": golden,
         }
-        diagnostic = real_report.parent / "schema_v4_last_validation.json"
+        diagnostic = real_report.parent / "schema_v4_1_last_validation.json"
         diagnostic.write_text(
             json.dumps(validation, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
         )
+        if status != "PASS":
+            _write_quarantine(
+                destination,
+                extraction.window.candidate_start,
+                extraction.window.candidate_end,
+                validation,
+            )
+            raise RuntimeError("schema-v4.1 validation failed; result quarantined")
         token_values = [
             Path(value).read_bytes().strip()
             for value in token_files
@@ -213,10 +241,8 @@ def _assemble_tables(
     for name, rows in derived.items():
         contract = CONTRACTS.get(name)
         schema = contract.arrow_schema if contract is not None else None
-        # Contracts intentionally define the mandatory portable subset. The
-        # full typed result keeps additional audit columns by inference.
         tables[name] = (
-            pa.Table.from_pylist(rows)
+            _table_with_contract(rows, schema)
             if rows
             else pa.Table.from_pylist([], schema=schema)
         )
@@ -232,6 +258,49 @@ def _assemble_tables(
     )
     tables["data_quality_events"] = pa.Table.from_pylist([], schema=quality_schema)
     return tables
+
+
+def _table_with_contract(
+    rows: list[dict[str, Any]], schema: pa.Schema | None
+) -> pa.Table:
+    """Apply mandatory Arrow types while preserving additional audit fields."""
+
+    if schema is None:
+        return pa.Table.from_pylist(rows)
+    arrays = [
+        pa.array([row.get(field.name) for row in rows], type=field.type)
+        for field in schema
+    ]
+    fields = list(schema)
+    mandatory = set(schema.names)
+    for name in rows[0].keys() - mandatory:
+        values = [row.get(name) for row in rows]
+        array = pa.array(values)
+        arrays.append(array)
+        fields.append(pa.field(name, array.type))
+    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+
+
+def _write_quarantine(
+    destination: Path,
+    candidate_start: datetime,
+    candidate_end: datetime,
+    validation: Mapping[str, Any],
+) -> Path:
+    """Persist sanitized fail-closed diagnostics without publishing an archive."""
+
+    stamp = (
+        f"{candidate_start.astimezone(UTC):%Y%m%dT%H%M%SZ}_"
+        f"{candidate_end.astimezone(UTC):%Y%m%dT%H%M%SZ}"
+    )
+    quarantine = destination / "quarantine"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    target = quarantine / f"schema-v4.1-{stamp}-validation.json"
+    target.write_text(
+        json.dumps(validation, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    return target
 
 
 def _required_support_end(tables: Mapping[str, pa.Table]) -> datetime:

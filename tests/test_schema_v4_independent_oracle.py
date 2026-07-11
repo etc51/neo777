@@ -522,3 +522,222 @@ def test_oracle_source_has_no_production_business_imports() -> None:
         "StopAndExitSimulator",
     )
     assert not any(name in source for name in forbidden)
+
+
+def _candle(
+    event_id: str,
+    interval_minutes: int,
+    *,
+    end: datetime = T0,
+    receive: datetime | None = None,
+    revision: int = 1,
+    source_complete: bool = False,
+    close: float = 100.0,
+) -> dict[str, object]:
+    receive_ts = receive or end
+    return {
+        "event_id": event_id,
+        "exchange_ts": end - timedelta(minutes=interval_minutes),
+        "receive_ts": receive_ts,
+        "processing_ts": receive_ts,
+        "materialized_ts": T0 + timedelta(hours=1),
+        "candle_start": end - timedelta(minutes=interval_minutes),
+        "candle_end": end,
+        "is_complete": source_complete,
+        "revision": revision,
+        "open": close - 1,
+        "high": close + 1,
+        "low": close - 2,
+        "close": close,
+        "volume": 10.0 + revision,
+    }
+
+
+def test_canonical_candle_ignores_false_source_flag_after_interval_elapsed() -> None:
+    tables = _base_feature_tables()
+    candle = _candle("elapsed", 1, end=T0 - timedelta(seconds=1), source_complete=False)
+    tables["candles_1m"] = _table([candle])
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature["candle_1m_source_event_id"] = "elapsed"
+    feature["candle_volume_1m"] = 11.0
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "candle_source_mismatch" not in _codes(result)
+
+
+def test_canonical_candle_excludes_revision_received_after_processing_cutoff() -> None:
+    tables = _base_feature_tables()
+    old = _candle("old", 1, end=T0 - timedelta(seconds=1), revision=1)
+    future = _candle(
+        "future-revision",
+        1,
+        end=T0 - timedelta(seconds=1),
+        receive=T0 + timedelta(seconds=1),
+        revision=2,
+    )
+    tables["candles_1m"] = _table([old, future])
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature["candle_1m_source_event_id"] = "old"
+    feature["candle_volume_1m"] = 11.0
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "candle_source_mismatch" not in _codes(result)
+
+
+def test_latest_available_candle_revision_and_volume_are_reproduced() -> None:
+    tables = _base_feature_tables()
+    first = _candle("r1", 1, end=T0 - timedelta(seconds=1), revision=1)
+    second = _candle("r2", 1, end=T0 - timedelta(seconds=1), revision=2)
+    tables["candles_1m"] = _table([first, second])
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature["candle_1m_source_event_id"] = "r2"
+    feature["candle_volume_1m"] = 999.0
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "candle_value_mismatch" in _codes(result)
+
+
+def test_first_ofi_snapshot_cannot_be_feature_ready_in_v41() -> None:
+    tables = _base_feature_tables()
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature.update(
+        schema_version="schema-v4.1",
+        ofi=-1.0,
+        ofi_delta=None,
+        ofi_source_event_id="book-0",
+        ofi_previous_event_id=None,
+        ofi_continuity_valid=False,
+        ofi_reset_reason="previous_snapshot_absent",
+        missing_fields=[],
+        readiness_checks_passed=0,
+        readiness_checks_total=0,
+        readiness_version="v4.1",
+    )
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "feature_readiness_mismatch" in _codes(result)
+
+
+def test_decimal_spread_exactly_three_ticks_passes_integer_gate() -> None:
+    book = _book(ask=100.3)
+    feature = _feature(book)
+    feature.update(
+        spread=0.3,
+        spread_price=0.3,
+        tick_size=0.1,
+        spread_ticks_decimal=3.000000000029104,
+        spread_ticks_int=3,
+        tick_grid_error=0.0,
+        spread_threshold_ticks=3,
+        spread_gate_passed=True,
+    )
+    decision = {
+        "filter_decision_id": "fd",
+        "candidate_id": "c",
+        "feature_snapshot_id": "feature-0",
+        "filter_name": "spread_gate",
+        "passed": True,
+    }
+    result = IndependentOracleValidator(tick_size=0.1, require_all_contracts=False).validate(
+        {
+            "raw_orderbook": _table([book]),
+            "feature_snapshots": _table([feature]),
+            "filter_decisions": _table([decision]),
+        }
+    )
+    assert "spread_ticks_mismatch" not in _codes(result)
+    assert "spread_gate_mismatch" not in _codes(result)
+
+
+def test_four_tick_spread_fails_three_tick_gate() -> None:
+    book = _book(ask=100.4)
+    feature = _feature(book)
+    feature.update(spread_ticks_int=4, spread_threshold_ticks=3)
+    decision = {
+        "filter_decision_id": "fd",
+        "candidate_id": "c",
+        "feature_snapshot_id": "feature-0",
+        "filter_name": "spread_gate",
+        "passed": True,
+    }
+    result = IndependentOracleValidator(tick_size=0.1, require_all_contracts=False).validate(
+        {
+            "raw_orderbook": _table([book]),
+            "feature_snapshots": _table([feature]),
+            "filter_decisions": _table([decision]),
+        }
+    )
+    assert "spread_gate_mismatch" in _codes(result)
+
+
+def test_off_grid_spread_requires_data_quality_flag() -> None:
+    book = _book(ask=100.35)
+    feature = _feature(book)
+    result = IndependentOracleValidator(tick_size=0.1, require_all_contracts=False).validate(
+        {"raw_orderbook": _table([book]), "feature_snapshots": _table([feature])}
+    )
+    assert "unflagged_tick_grid_error" in _codes(result)
+
+
+def test_atr_is_recomputed_from_point_in_time_canonical_sequence() -> None:
+    tables = _base_feature_tables()
+    candles = [
+        _candle("c0", 1, end=T0 - timedelta(minutes=2), close=99.0),
+        _candle("c1", 1, end=T0 - timedelta(minutes=1), close=100.0),
+        _candle("c2", 1, end=T0, close=101.0),
+    ]
+    tables["candles_1m"] = _table(candles)
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature.update(
+        candle_1m_source_event_id="c2",
+        candle_volume_1m=11.0,
+        return_1m=0.01,
+        atr_1m=999.0,
+        atr_1m_warmup_remaining=0,
+    )
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "candle_atr_mismatch" in _codes(result)
+
+
+def test_valid_following_snapshot_has_reproducible_ofi_delta() -> None:
+    first = _book("book-0", ts=T0 - timedelta(seconds=1))
+    second = _book("book-1", ts=T0)
+    second["bids"][0]["quantity"] = 5.0
+    feature = _feature(second)
+    feature["orderbook_source_event_id"] = "book-1"
+    feature.update(
+        ofi=3.0,
+        ofi_delta=4.0,
+        ofi_source_event_id="book-1",
+        ofi_previous_event_id="book-0",
+        ofi_continuity_valid=True,
+        ofi_reset_reason=None,
+    )
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(
+        {"raw_orderbook": _table([first, second]), "feature_snapshots": _table([feature])}
+    )
+    assert "ofi_continuity_mismatch" not in _codes(result)
+
+
+def test_stale_candle_cannot_be_ready_in_v41() -> None:
+    tables = _base_feature_tables()
+    old = _candle("old", 1, end=T0 - timedelta(minutes=3))
+    tables["candles_1m"] = _table([old])
+    feature = tables["feature_snapshots"].to_pylist()[0]
+    feature.update(
+        schema_version="schema-v4.1",
+        candle_1m_source_event_id="old",
+        candle_1m_stale=False,
+        candle_volume_1m=11.0,
+        ofi_source_event_id="book-0",
+        ofi_continuity_valid=False,
+        missing_fields=[],
+        readiness_checks_passed=0,
+        readiness_checks_total=0,
+        readiness_version="schema-v4.1",
+    )
+    tables["feature_snapshots"] = _table([feature])
+    result = IndependentOracleValidator(tick_size=1, require_all_contracts=False).validate(tables)
+    assert "candle_lineage_mismatch" in _codes(result)
+    assert "feature_readiness_mismatch" in _codes(result)
