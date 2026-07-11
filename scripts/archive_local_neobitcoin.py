@@ -48,17 +48,21 @@ def main() -> int:
     target = archives / f"neobitcoin-{stamp}.tar.zst"
     temporary = target.with_suffix(".tar.zst.partial")
     manifest: list[dict[str, object]] = []
-    with temporary.open("wb") as raw:
-        with zstandard.ZstdCompressor(level=3).stream_writer(raw) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w|") as archive:
+    with (
+        temporary.open("wb") as raw,
+        zstandard.ZstdCompressor(level=3).stream_writer(raw) as compressed,
+        tarfile.open(fileobj=compressed, mode="w|") as archive,
+    ):
                 for path in selected:
                     relative = path.relative_to(data)
                     archive.add(path, arcname=str(relative))
+                    with path.open("rb") as source:
+                        digest = hashlib.file_digest(source, "sha256").hexdigest()
                     manifest.append(
                         {
                             "path": str(relative),
                             "bytes": path.stat().st_size,
-                            "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest(),
+                            "sha256": digest,
                         }
                     )
                 body = json.dumps({"files": manifest}, ensure_ascii=False).encode()
