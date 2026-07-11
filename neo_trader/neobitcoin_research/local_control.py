@@ -35,6 +35,10 @@ class LocalRuntimePaths:
         return self.root / "state"
 
     @property
+    def active_dir(self) -> Path:
+        return self.root / "active"
+
+    @property
     def logs_dir(self) -> Path:
         return self.root / "logs"
 
@@ -63,8 +67,18 @@ class LocalRuntimePaths:
         return self.logs_dir / "collector.stderr.log"
 
     def prepare(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        for directory in (
+            self.active_dir,
+            self.root / "compacted",
+            self.root / "archives",
+            self.root / "manifests",
+            self.root / "schemas",
+            self.root / "reports",
+            self.root / "quarantine",
+            self.state_dir,
+            self.logs_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
 
 
 class CollectorLock:
@@ -242,7 +256,7 @@ def worker_main(paths: LocalRuntimePaths | None = None) -> int:
         _atomic_json(paths.heartbeat_file, {"at": _utc_now(), "pid": os.getpid()})
         config = replace(
             ResearchConfig.from_env(),
-            data_root=paths.root,
+            data_root=paths.active_dir,
             reports_root=paths.root / "reports",
         )
         config.validate()
