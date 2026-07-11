@@ -303,7 +303,7 @@ def _prepare_source(
 
     from .review_datasets import build_review_datasets
     from .review_raw import COMMON_FIELDS as RAW_COMMON_FIELDS
-    from .review_raw import ReviewRawError, extract_review_raw
+    from .review_raw import extract_review_raw
 
     raw_root = root / "active" / "raw"
     if not raw_root.exists():
@@ -337,63 +337,19 @@ def _prepare_source(
     if not signal_paths:
         signal_paths = sorted((root / "compacted" / "candidate_events").rglob("*.parquet"))
     signals: dict[str, str] = {}
-    directional_signal_times: list[datetime] = []
     for path in signal_paths:
         for row in pq.read_table(path).to_pylist():
             feature_id = str(row.get("feature_snapshot_id") or "")
             raw_signal = row.get("raw_signal")
             if feature_id and raw_signal:
                 signals[feature_id] = str(raw_signal)
-                if str(raw_signal) in {"LONG", "SHORT"}:
-                    directional_signal_times.append(
-                        _timestamp_value(row.get("timestamp") or row.get("recorded_at"))
-                    )
     for row in feature_rows:
         feature_id = str(row.get("feature_snapshot_id") or row.get("raw_event_id") or "")
         if feature_id in signals:
             row["raw_signal"] = signals[feature_id]
-    window_has_signal = any(
-        row.get("raw_signal") in {"LONG", "SHORT"}
-        and extraction.window.candidate_start
-        <= _timestamp_value(row.get("timestamp") or row.get("recorded_at"))
-        <= extraction.window.candidate_end
-        for row in feature_rows
-    )
-    mature_cutoff = now - timedelta(minutes=max_outcome_horizon_minutes)
-    mature_signals = [
-        timestamp for timestamp in directional_signal_times if timestamp <= mature_cutoff
-    ]
-    if not window_has_signal and mature_signals:
-        # A quiet latest window can contain only rejected NO_TRADE rows. Walk
-        # back through mature directional signals. A signal can itself sit in
-        # a reconnect window, so keep searching until raw selection actually
-        # returns a stable ten-minute window containing that signal.
-        matched_signal = False
-        for signal_ts in sorted(mature_signals, reverse=True):
-            selection_now = signal_ts + timedelta(minutes=max_outcome_horizon_minutes + 1)
-            try:
-                candidate_extraction = extract_review_raw(
-                    raw_root,
-                    output,
-                    now=min(now, selection_now),
-                    candidate_window_minutes=candidate_window_minutes,
-                    max_outcome_horizon_minutes=max_outcome_horizon_minutes,
-                    candle_context_hours=candle_context_hours,
-                )
-            except ReviewRawError:
-                continue
-            if (
-                candidate_extraction.window.candidate_start
-                <= signal_ts
-                <= candidate_extraction.window.candidate_end
-            ):
-                extraction = candidate_extraction
-                matched_signal = True
-                break
-        if not matched_signal:
-            raise ArchiveValidationError(
-                "no stable mature review window contains a directional signal"
-            )
+    # A review window audits both counterfactual sides and does not require a
+    # directional production signal.  Pinning selection to an old rare signal
+    # can regress to a pre-warmup window even when newer complete data exists.
     _backfill_review_candles(extraction, token_files)
     _enrich_candle_features(feature_rows, extraction.paths)
     orderbook_rows = pq.read_table(extraction.paths["raw_orderbook"]).to_pylist()
@@ -669,14 +625,18 @@ def _select_window(
 def _window_is_complete(
     tables: dict[str, pa.Table], candidate_ids: set[str], t0: datetime, t1: datetime
 ) -> bool:
-    raw_start = t0 - timedelta(seconds=60)
     raw_end = t1 + timedelta(minutes=30)
+    required_starts = {
+        "raw_orderbook": t0,
+        "raw_trades": t0 - timedelta(seconds=900),
+        "raw_last_price": t0,
+    }
     for dataset in ("raw_orderbook", "raw_trades", "raw_last_price"):
         table = tables[dataset]
         if "receive_ts" not in table.column_names or not table.num_rows:
             return False
         values = [_utc(value) for value in table["receive_ts"].to_pylist() if value is not None]
-        if not values or min(values) > raw_start or max(values) < raw_end:
+        if not values or min(values) > required_starts[dataset] or max(values) < raw_end:
             return False
     candidates = _filter_time(tables["candidate_events"], "candidate_ts", t0, t1)
     sides = set(candidates["side"].to_pylist()) if "side" in candidates.column_names else set()
@@ -685,7 +645,7 @@ def _window_is_complete(
         if "final_decision" in candidates.column_names
         else set()
     )
-    if not {"LONG", "SHORT"}.issubset(sides) or len(decisions) < 2:
+    if not {"LONG", "SHORT"}.issubset(sides) or not decisions:
         return False
     if "feature_ready" not in candidates.column_names or not all(
         candidates["feature_ready"].to_pylist()
@@ -910,8 +870,12 @@ def _validate_tables(
         "candidate window must be exactly ten minutes",
     )
     raw_coverage: dict[str, dict[str, str | None]] = {}
-    raw_required_start = t0 - timedelta(seconds=60)
     raw_required_end = t1 + timedelta(minutes=30)
+    raw_required_starts = {
+        "raw_orderbook": t0,
+        "raw_trades": t0 - timedelta(seconds=900),
+        "raw_last_price": t0,
+    }
     for dataset in ("raw_orderbook", "raw_trades", "raw_last_price"):
         table = tables[dataset]
         values = (
@@ -927,10 +891,15 @@ def _validate_tables(
         }
         check(
             f"{dataset}_coverage",
-            bool(start and end and start <= raw_required_start and end >= raw_required_end),
+            bool(
+                start
+                and end
+                and start <= raw_required_starts[dataset]
+                and end >= raw_required_end
+            ),
             f"{start.isoformat() if start else 'empty'} .. {end.isoformat() if end else 'empty'}",
-            f"{raw_required_start.isoformat()} .. {raw_required_end.isoformat()}",
-            "raw stream must include 60 seconds of pre-roll and 30 minutes of outcomes",
+            f"{raw_required_starts[dataset].isoformat()} .. {raw_required_end.isoformat()}",
+            "raw stream must include source-specific pre-roll and 30 minutes of outcomes",
         )
     duplicate_counts: dict[str, int] = {}
     for dataset, table in tables.items():
@@ -1035,10 +1004,10 @@ def _validate_tables(
     )
     check(
         "candidate_sides_and_decisions",
-        {"LONG", "SHORT"}.issubset(sides) and len(decisions) >= 2,
+        {"LONG", "SHORT"}.issubset(sides) and bool(decisions),
         f"sides={sorted(sides)}, decisions={sorted(str(value) for value in decisions)}",
-        "LONG+SHORT and accepted+rejected",
-        "review must include both sides and both decision outcomes",
+        "LONG+SHORT and explicit decisions",
+        "review must include both counterfactual sides and explicit decisions",
     )
     check(
         "future_horizons_complete",

@@ -88,6 +88,19 @@ def _source(root: Path, *, token: str | None = None) -> None:
         }
         for index in range(42)
     ]
+    trade_rows.insert(
+        0,
+        _common("trade-preroll", start - timedelta(minutes=15))
+        | {
+            "trade_id": "trade-preroll",
+            "price": 100.0,
+            "quantity": 1.0,
+            "direction": "BUY",
+            "aggressor_side": "BUY",
+            "side_inference_method": "api_direction",
+            "feed_latency_ms": 1.0,
+        },
+    )
     trade_rows.append(
         _common("trade-partial", candidate_ts + timedelta(seconds=1))
         | {

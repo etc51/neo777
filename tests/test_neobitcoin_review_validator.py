@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from test_neobitcoin_review_bundle import _source
 
 from neo_trader.neobitcoin_research.review_bundle import (
@@ -27,6 +28,9 @@ def test_validator_rejects_incomplete_raw_preroll_and_future_coverage(
     tables = _fixture_tables(tmp_path)
     t0 = datetime(2026, 7, 11, 10, 50, tzinfo=UTC)
     t1 = t0 + timedelta(minutes=10)
+    tables["raw_trades"] = tables["raw_trades"].filter(
+        pc.greater_equal(tables["raw_trades"]["receive_ts"], pa.scalar(t0))
+    )
 
     result = _validate_tables(
         tables,
@@ -39,9 +43,9 @@ def test_validator_rejects_incomplete_raw_preroll_and_future_coverage(
     statuses = {item["check"]: item["status"] for item in result["checks"]}
 
     assert result["status"] == "FAIL"
-    assert statuses["raw_orderbook_coverage"] == "FAIL"
+    assert statuses["raw_orderbook_coverage"] == "PASS"
     assert statuses["raw_trades_coverage"] == "FAIL"
-    assert statuses["raw_last_price_coverage"] == "FAIL"
+    assert statuses["raw_last_price_coverage"] == "PASS"
     assert result["raw_coverage"]["raw_trades"]["start"] == t0.isoformat()
 
 

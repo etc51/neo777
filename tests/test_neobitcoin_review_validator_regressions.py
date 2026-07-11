@@ -52,7 +52,7 @@ def _valid_tables(tmp_path: Path) -> dict[str, pa.Table]:
             (
                 _clone_at(
                     tables[dataset],
-                    RAW_START,
+                    T0 - timedelta(seconds=900) if dataset == "raw_trades" else RAW_START,
                     "coverage-start",
                     trade=dataset == "raw_trades",
                 ),
