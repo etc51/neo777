@@ -11,7 +11,6 @@ from neo_trader.neobitcoin_research.buffered_parquet import (
     recover_or_quarantine_inprogress,
 )
 
-
 SCHEMA = pa.schema([("event_id", pa.string()), ("recorded_at", pa.string()), ("value", pa.int64())])
 
 
@@ -20,10 +19,14 @@ def test_one_thousand_rows_publish_one_final_part_after_batches(tmp_path: Path) 
     writer = BufferedParquetWriter(
         target,
         SCHEMA,
-        policy=ParquetBatchPolicy(max_rows=100, max_buffer_bytes=1_000_000, max_interval_seconds=60),
+        policy=ParquetBatchPolicy(
+            max_rows=100, max_buffer_bytes=1_000_000, max_interval_seconds=60
+        ),
     )
     for index in range(1_000):
-        writer.append({"event_id": str(index), "recorded_at": "2026-07-11T12:00:00+00:00", "value": index})
+        writer.append(
+            {"event_id": str(index), "recorded_at": "2026-07-11T12:00:00+00:00", "value": index}
+        )
 
     assert list(target.parent.glob("*.parquet")) == []
     assert writer.finalize() == target
