@@ -117,9 +117,11 @@ class BufferedParquetWriter:
         self._rows.clear()
         self._buffer_bytes = 0
         self._last_flush_at = time.monotonic()
-        self._stream.flush()
+        stream = self._stream
+        assert stream is not None
+        stream.flush()
         if self.fsync:
-            os.fsync(self._stream.fileno())
+            os.fsync(stream.fileno())
 
     def finalize(self) -> Path | None:
         """Close, fsync, and atomically publish this partition's sole part."""
@@ -129,11 +131,15 @@ class BufferedParquetWriter:
             return None
         try:
             self._writer.close()  # writes the Parquet footer
-            self._stream.flush()
+            stream = self._stream
+            assert stream is not None
+            stream.flush()
             if self.fsync:
-                os.fsync(self._stream.fileno())
+                os.fsync(stream.fileno())
         finally:
-            self._stream.close()
+            stream = self._stream
+            if stream is not None:
+                stream.close()
             self._writer = None
             self._stream = None
         os.replace(self.inprogress_path, self.final_path)
@@ -183,13 +189,13 @@ def _estimate_row_size(row: Mapping[str, Any]) -> int:
 
 
 def _pyarrow() -> Any:
-    import pyarrow
+    import pyarrow  # type: ignore[import-untyped]
 
     return pyarrow
 
 
 def _parquet() -> Any:
-    import pyarrow.parquet
+    import pyarrow.parquet  # type: ignore[import-untyped]
 
     return pyarrow.parquet
 

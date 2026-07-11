@@ -23,6 +23,7 @@ from typing import Any, Final, TypeAlias, cast
 from uuid import uuid4
 
 from .buffered_parquet import BufferedParquetWriter, ParquetBatchPolicy
+from .derived_schemas import derived_arrow_schema, flatten_derived_row
 
 JsonMapping: TypeAlias = Mapping[str, Any]
 
@@ -467,13 +468,14 @@ class ResearchStorage:
                     )
 
                 writer.append(
-                    {
-                        "dataset": normalized_dataset,
-                        "event_id": normalized_event_id,
-                        "recorded_at": timestamp.isoformat(),
-                        "schema_version": str(normalized_record.get("schema_version", "1")),
-                        "record_json": _json_text(normalized_record),
-                    }
+                    flatten_derived_row(
+                        normalized_dataset,
+                        event_id=normalized_event_id,
+                        recorded_at=timestamp.isoformat(),
+                        schema_version=str(normalized_record.get("schema_version", "1")),
+                        record=normalized_record,
+                        record_json=_json_text(normalized_record),
+                    )
                 )
                 self._connection.execute(
                     """
@@ -522,14 +524,11 @@ class ResearchStorage:
                 writer.finalize()
             self._derived_writers.clear()
 
-    def _derived_writer(
-        self, partition: tuple[str, str, str]
-    ) -> BufferedParquetWriter:
+    def _derived_writer(self, partition: tuple[str, str, str]) -> BufferedParquetWriter:
         existing = self._derived_writers.get(partition)
         if existing is not None:
             return existing
         dataset, partition_date, hour = partition
-        pa = cast(Any, importlib.import_module("pyarrow"))
         target = (
             self.derived_parquet_root
             / dataset
@@ -539,15 +538,7 @@ class ResearchStorage:
         )
         writer = BufferedParquetWriter(
             target,
-            pa.schema(
-                [
-                    ("dataset", pa.string()),
-                    ("event_id", pa.string()),
-                    ("recorded_at", pa.string()),
-                    ("schema_version", pa.string()),
-                    ("record_json", pa.string()),
-                ]
-            ),
+            derived_arrow_schema(dataset),
             policy=ParquetBatchPolicy(),
             fsync=self.fsync,
         )
