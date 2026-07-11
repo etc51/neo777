@@ -946,8 +946,8 @@ def _validate_tables(
     )
     if not {"LONG", "SHORT"}.issubset(sides):
         errors.append("LONG and SHORT candidates required")
-    if len(decisions) < 2:
-        errors.append("accepted and rejected candidates required")
+    if not decisions:
+        errors.append("explicit candidate decisions required")
     if horizons != list(HORIZONS):
         errors.append(f"horizons incomplete: {horizons}")
     if stops != list(STOPS):

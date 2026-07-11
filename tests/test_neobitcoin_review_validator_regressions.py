@@ -30,8 +30,9 @@ def _clone_at(
     suffix: str,
     *,
     trade: bool = False,
+    last: bool = False,
 ) -> dict[str, Any]:
-    row = _rows(table)[0].copy()
+    row = _rows(table)[-1 if last else 0].copy()
     row["event_id"] = f"{row['event_id']}-{suffix}"
     row["exchange_ts"] = when
     row["receive_ts"] = when
@@ -56,7 +57,13 @@ def _valid_tables(tmp_path: Path) -> dict[str, pa.Table]:
                     "coverage-start",
                     trade=dataset == "raw_trades",
                 ),
-                _clone_at(tables[dataset], RAW_END, "coverage-end", trade=dataset == "raw_trades"),
+                _clone_at(
+                    tables[dataset],
+                    RAW_END + timedelta(seconds=2),
+                    "coverage-end",
+                    trade=dataset == "raw_trades",
+                    last=True,
+                ),
             )
         )
         tables[dataset] = _replace(tables[dataset], rows)

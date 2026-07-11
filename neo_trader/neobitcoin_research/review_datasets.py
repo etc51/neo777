@@ -810,12 +810,15 @@ def _stops(
     ]
     for stop in STOP_TICKS:
         stop_level = sim["fill_price"] + (-stop * tick if sign == 1 else stop * tick)
-        threshold = -stop * tick
         triggered = next(
             (
                 p
                 for p in segment
-                if sign * (_exit_price(p, candidate["side"], tick) - sim["fill_price"]) <= threshold
+                if (
+                    _exit_price(p, candidate["side"], tick) <= stop_level + 1e-9
+                    if sign == 1
+                    else _exit_price(p, candidate["side"], tick) >= stop_level - 1e-9
+                )
             ),
             None,
         )
@@ -890,6 +893,20 @@ def _stops(
             holding_ms=max(0, int((hit_ts - sim["fill_ts"]).total_seconds() * 1000)),
         )
         result.append(row)
+    # One executable quote can jump across several distinct stop levels.  In
+    # that case every identical result is explicitly marked as gap-explained,
+    # including a level that happens to equal the executable quote exactly.
+    by_trigger: dict[str, list[dict[str, Any]]] = {}
+    for row in result:
+        trigger_id = row.get("trigger_event_id")
+        if trigger_id:
+            by_trigger.setdefault(str(trigger_id), []).append(row)
+    for group in by_trigger.values():
+        signatures = {(row.get("exit_ts"), row.get("exit_price")) for row in group}
+        levels = {row.get("stop_level") for row in group}
+        if len(group) > 1 and len(signatures) == 1 and len(levels) > 1:
+            for row in group:
+                row["gap_through_stop"] = True
     return result
 
 

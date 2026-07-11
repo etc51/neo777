@@ -350,11 +350,20 @@ def _reconcile_outcomes(
 def _reconcile_stops(tables: dict[str, pa.Table], errors: list[str]) -> dict[str, Any]:
     books = _rows(tables, "raw_orderbook")
     by_id = {str(row.get("event_id")): row for row in books}
-    ordered = sorted(books, key=lambda row: (_utc(row["exchange_ts"]), str(row["event_id"])))
+    ordered = sorted(
+        books,
+        key=lambda row: (
+            _utc(row["exchange_ts"]),
+            int(row.get("sequence") or row.get("revision") or 0),
+            _utc(row.get("receive_ts") or row["exchange_ts"]),
+            str(row["event_id"]),
+        ),
+    )
     executions = {
         str(row.get("simulation_id")): row for row in _rows(tables, "execution_simulations")
     }
     triggered = missing = reproduced = 0
+    unreproduced_examples: list[str] = []
     rows = _rows(tables, "shadow_stop_results")
     required = {
         "stop_level",
@@ -403,12 +412,12 @@ def _reconcile_stops(tables: dict[str, pa.Table], errors: list[str]) -> dict[str
                 (
                     side == "LONG"
                     and item.get("best_bid") is not None
-                    and float(item["best_bid"]) <= stop_level
+                    and float(item["best_bid"]) <= stop_level + EPSILON
                 )
                 or (
                     side == "SHORT"
                     and item.get("best_ask") is not None
-                    and float(item["best_ask"]) >= stop_level
+                    and float(item["best_ask"]) >= stop_level - EPSILON
                 )
             )
         ]
@@ -465,6 +474,8 @@ def _reconcile_stops(tables: dict[str, pa.Table], errors: list[str]) -> dict[str
         )
         if row_ok:
             reproduced += 1
+        elif len(unreproduced_examples) < 5:
+            unreproduced_examples.append(str(row.get("result_id") or row.get("simulation_id")))
     if missing or reproduced != len(rows):
         errors.append(
             f"stops: rows={len(rows)}, triggered={triggered}, "
@@ -505,9 +516,9 @@ def _reconcile_stops(tables: dict[str, pa.Table], errors: list[str]) -> dict[str
                     else None
                 )
                 crosses_both = executable is not None and all(
-                    float(executable) <= float(item["stop_level"])
+                    float(executable) <= float(item["stop_level"]) + EPSILON
                     if side == "LONG"
-                    else float(executable) >= float(item["stop_level"])
+                    else float(executable) >= float(item["stop_level"]) - EPSILON
                     for item in (left, right)
                 )
                 if same_trigger and levels_differ and gap and crosses_both:
@@ -527,6 +538,7 @@ def _reconcile_stops(tables: dict[str, pa.Table], errors: list[str]) -> dict[str
         "gap_explained_identical_count": explained,
         "unexplained_identical_count": unexplained,
         "trigger_examples": examples,
+        "unreproduced_examples": unreproduced_examples,
     }
 
 
