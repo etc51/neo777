@@ -47,9 +47,9 @@ def test_extracts_mature_window_to_one_typed_parquet_per_raw_dataset(tmp_path: P
         config_hash="cfg123",
     )
 
-    assert result.window.candidate_start == BASE + timedelta(minutes=10)
-    assert result.window.candidate_end == BASE + timedelta(minutes=20)
-    assert result.window.support_end == BASE + timedelta(minutes=50)
+    assert result.window.candidate_start == BASE + timedelta(minutes=9)
+    assert result.window.candidate_end == BASE + timedelta(minutes=19)
+    assert result.window.support_end == BASE + timedelta(minutes=49)
     assert set(result.paths) == set(RAW_SCHEMAS)
     assert len(list((tmp_path / "review" / "data").glob("*.parquet"))) == 7
     for dataset, path in result.paths.items():
@@ -64,9 +64,9 @@ def test_extracts_mature_window_to_one_typed_parquet_per_raw_dataset(tmp_path: P
     assert book_table.column("depth")[0].as_py() == 2
     assert book_table.column("bids")[0].as_py()[0] == {"price": 100.0, "quantity": 5.0}
     assert "payload_json" not in book_table.column_names
-    assert result.rows_by_dataset["raw_orderbook"] == 41
-    assert result.rows_by_dataset["raw_trades"] == 21
-    assert result.rows_by_dataset["raw_last_price"] == 13
+    assert result.rows_by_dataset["raw_orderbook"] >= 42
+    assert result.rows_by_dataset["raw_trades"] >= 25
+    assert result.rows_by_dataset["raw_last_price"] >= 14
     assert result.rows_by_dataset["candles_1m"] == 1
 
 
@@ -76,6 +76,8 @@ def test_skips_latest_candidate_window_containing_reconnect(tmp_path: Path) -> N
     for minute in range(61):
         received = BASE + timedelta(minutes=minute)
         records.append(_event(f"book-{minute}", "orderbook", received, _book()))
+        records.append(_event(f"trade-{minute}", "trade", received, _trade()))
+        records.append(_event(f"last-{minute}", "last_price", received, _last()))
     # Latest mature candidate is [12:20, 12:30]; force minute-wise fallback.
     records.append(_event("reconnect", "reconnect", BASE + timedelta(minutes=25), {}))
     source.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")

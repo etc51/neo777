@@ -75,22 +75,36 @@ def _source(root: Path, *, token: str | None = None) -> None:
         for index in range(42 * 60)
     ]
     raw["raw_orderbook"] = pa.Table.from_pylist(books, schema=RAW_SCHEMAS["raw_orderbook"])
-    raw["raw_trades"] = pa.Table.from_pylist(
-        [
-            _common("trade-1", candidate_ts)
-            | {
-                "trade_id": "trade-1",
-                "price": 100.0,
-                "quantity": 1.0,
-                "direction": "BUY",
-                "aggressor_side": "BUY",
-                "feed_latency_ms": 1.0,
-            }
-        ],
-        schema=RAW_SCHEMAS["raw_trades"],
+    trade_rows = [
+        _common(f"trade-{index}", start + timedelta(minutes=index))
+        | {
+            "trade_id": f"trade-{index}",
+            "price": 99.9 if index % 2 else 100.1,
+            "quantity": 1.0,
+            "direction": "SELL" if index % 2 else "BUY",
+            "aggressor_side": "SELL" if index % 2 else "BUY",
+            "feed_latency_ms": 1.0,
+        }
+        for index in range(42)
+    ]
+    trade_rows.append(
+        _common("trade-partial", candidate_ts + timedelta(seconds=1))
+        | {
+            "trade_id": "trade-partial",
+            "price": 99.9,
+            "quantity": 12.0,
+            "direction": "SELL",
+            "aggressor_side": "SELL",
+            "feed_latency_ms": 1.0,
+        }
     )
+    raw["raw_trades"] = pa.Table.from_pylist(trade_rows, schema=RAW_SCHEMAS["raw_trades"])
     raw["raw_last_price"] = pa.Table.from_pylist(
-        [_common("last-1", candidate_ts) | {"last_price": 100.0, "feed_latency_ms": 1.0}],
+        [
+            _common(f"last-{index}", start + timedelta(minutes=index))
+            | {"last_price": 100.0 + index * 0.01, "feed_latency_ms": 1.0}
+            for index in range(42)
+        ],
         schema=RAW_SCHEMAS["raw_last_price"],
     )
     raw["market_status_events"] = pa.Table.from_pylist(
@@ -141,6 +155,10 @@ def _source(root: Path, *, token: str | None = None) -> None:
         "candle_volume_1m": 100.0,
         "candle_volume_5m": 500.0,
         "candle_volume_15m": 1500.0,
+        "bid_price_01": 99.9,
+        "bid_quantity_01": 10.0,
+        "ask_price_01": 100.1,
+        "ask_quantity_01": 10.0,
         "feature_ready": True,
         "raw_signal": "LONG",
     }
@@ -149,6 +167,8 @@ def _source(root: Path, *, token: str | None = None) -> None:
         path,
         candidate_start=start,
         candidate_end=candidate_ts,
+        orderbook_rows=books,
+        trade_rows=trade_rows,
     )
     if token:
         candidates = research["candidate_events"].to_pylist()
@@ -199,7 +219,7 @@ def test_review_bundle_has_twenty_verified_members(tmp_path: Path) -> None:
         manifest = json.loads((Path(directory) / "MANIFEST.json").read_text(encoding="utf-8"))
         assert manifest["validation"] == "PASS"
         assert manifest["dataset_file_count"] == 15
-        assert manifest["rows_by_dataset"]["future_outcomes"] == 90
+        assert manifest["rows_by_dataset"]["future_outcomes"] == 54
         assert {
             item["dataset"] for item in manifest["files"] if item["path"].endswith(".parquet")
         } == set(DATASETS)

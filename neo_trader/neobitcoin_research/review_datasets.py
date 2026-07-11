@@ -138,13 +138,17 @@ EXECUTION_SCHEMA = _schema(
     ("feature_snapshot_id", pa.string(), False),
     ("side", pa.string(), False),
     ("execution_model", pa.string(), False),
+    ("order_ts", TS, False),
     ("order_price", pa.float64(), False),
+    ("requested_quantity", pa.float64(), False),
+    ("filled_quantity", pa.float64(), False),
+    ("remaining_quantity", pa.float64(), False),
     ("fill_status", pa.string(), False),
-    ("fill_ts", TS, False),
-    ("fill_price", pa.float64(), False),
-    ("fill_delay_ms", pa.int64(), False),
-    ("slippage_ticks", pa.float64(), False),
-    ("slippage_percent", pa.float64(), False),
+    ("fill_ts", TS, True),
+    ("fill_price", pa.float64(), True),
+    ("fill_delay_ms", pa.int64(), True),
+    ("slippage_ticks", pa.float64(), True),
+    ("slippage_percent", pa.float64(), True),
     ("spread_cost", pa.float64(), False),
     ("no_fill_reason", pa.string(), True),
 )
@@ -187,6 +191,7 @@ STOP_SCHEMA = _schema(
     ("exit_ts", TS, False),
     ("exit_price", pa.float64(), False),
     ("exit_reason", pa.string(), False),
+    ("stop_triggered", pa.bool_(), False),
     ("gross_pnl", pa.float64(), False),
     ("net_pnl", pa.float64(), False),
     ("mfe_before_exit", pa.float64(), False),
@@ -203,9 +208,12 @@ EXIT_SCHEMA = _schema(
     ("variant_parameters", pa.string(), False),
     ("entry_ts", TS, False),
     ("entry_price", pa.float64(), False),
+    ("activation_ts", TS, True),
     ("exit_ts", TS, False),
     ("exit_price", pa.float64(), False),
     ("exit_reason", pa.string(), False),
+    ("trigger_value", pa.float64(), True),
+    ("trigger_threshold", pa.float64(), True),
     ("gross_pnl", pa.float64(), False),
     ("net_pnl", pa.float64(), False),
     ("mfe_before_exit", pa.float64(), False),
@@ -231,6 +239,11 @@ def build_review_datasets(
     candidate_start: datetime,
     candidate_end: datetime,
     tick_size: float = 0.1,
+    market_events: Sequence[Mapping[str, Any]] | None = None,
+    orderbook_rows: Sequence[Mapping[str, Any]] | None = None,
+    trade_rows: Sequence[Mapping[str, Any]] | None = None,
+    execution_latency_ms: int = 100,
+    virtual_order_quantity: float = 10.0,
 ) -> dict[str, Any]:
     """Build a deterministic review graph from local data.
 
@@ -239,9 +252,16 @@ def build_review_datasets(
     """
 
     start, end = _utc(candidate_start), _utc(candidate_end)
-    path = sorted((_utc(_dt(p["exchange_ts"])), float(p["mid_price"])) for p in price_path)
-    path_ts = [p[0] for p in path]
-    normalized_features = [_feature_row(row) for row in feature_rows]
+    path_source = list(market_events or orderbook_rows or price_path)
+    path = sorted(
+        (_normalize_market_point(p) for p in path_source),
+        key=_market_sort_key,
+    )
+    if trade_rows:
+        path = _merge_trade_events(path, trade_rows)
+    path_ts = [p["exchange_ts"] for p in path]
+    enriched_features = _enrich_feature_market_fields(feature_rows, path, trade_rows or ())
+    normalized_features = [_feature_row(row) for row in enriched_features]
     features = [row for row in normalized_features if start <= row["exchange_ts"] <= end]
     candidates: list[dict[str, Any]] = []
     filters: list[dict[str, Any]] = []
@@ -267,8 +287,19 @@ def build_review_datasets(
                 )
             )
             for model in EXECUTION_MODELS:
-                simulation = _execution(candidate, model, tick_size)
+                simulation = _execution(
+                    candidate,
+                    feature,
+                    model,
+                    path,
+                    path_ts,
+                    tick_size,
+                    execution_latency_ms,
+                    virtual_order_quantity,
+                )
                 executions.append(simulation)
+                if simulation["fill_status"] == "NO_FILL":
+                    continue
                 outcomes.extend(_outcomes(candidate, simulation, path, path_ts, tick_size))
                 stops.extend(_stops(candidate, simulation, path, path_ts, tick_size))
                 exits.extend(_exits(candidate, simulation, path, path_ts, tick_size))
@@ -387,17 +418,39 @@ def _feature_row(source: Mapping[str, Any]) -> dict[str, Any]:
         if field.startswith("ask_depth_"):
             value = record.get("cumulative_" + field)
         if field.startswith("trade_flow_"):
-            value = record.get("trades_" + field.removeprefix("trade_flow_") + "_imbalance")
+            # Exact semantics: buy volume minus sell volume in the trailing
+            # event-time window ending at (and never after) exchange_ts.
+            window = field.removeprefix("trade_flow_")
+            value = record.get(f"trades_{window}_signed_volume")
         if "_quantity_" in field:
             value = record.get(field.replace("_quantity_", "_volume_").replace("_0", "_"))
         if "_price_" in field:
             value = record.get(field.replace("_0", "_"))
         row[field] = value
+    if row.get("data_age_ms") is None:
+        row["data_age_ms"] = record.get("book_age_ms")
+    if row.get("data_age_ms") is None:
+        market_ts = record.get("last_market_event_ts") or record.get("exchange_ts")
+        feature_ts = record.get("timestamp") or record.get("recorded_at")
+        if market_ts is not None and feature_ts is not None:
+            row["data_age_ms"] = max(
+                0.0, (_utc(_dt(feature_ts)) - _utc(_dt(market_ts))).total_seconds() * 1000
+            )
     row["regime"] = str(record.get("regime") or "unknown")
     row["source_status"] = str(record.get("trading_status") or "NORMAL_TRADING")
-    row["feature_ready"] = bool(record.get("feature_ready", True))
-    row["warmup_remaining"] = int(record.get("warmup_remaining") or 0)
-    row["missing_reason"] = record.get("missing_reason")
+    required = (
+        "trade_flow_10s",
+        "trade_flow_180s",
+        "trade_flow_300s",
+        "trade_flow_900s",
+        "data_age_ms",
+    )
+    missing = [name for name in required if row.get(name) is None]
+    row["feature_ready"] = bool(record.get("feature_ready", True)) and not missing
+    row["warmup_remaining"] = max(int(record.get("warmup_remaining") or 0), len(missing))
+    row["missing_reason"] = record.get("missing_reason") or (
+        "missing_required_features:" + ",".join(missing) if missing else None
+    )
     return row
 
 
@@ -460,42 +513,110 @@ def _filters(candidate: Mapping[str, Any], feature: Mapping[str, Any]) -> list[d
     return result
 
 
-def _execution(candidate: Mapping[str, Any], model: str, tick: float) -> dict[str, Any]:
+def _execution(
+    candidate: Mapping[str, Any],
+    feature: Mapping[str, Any],
+    model: str,
+    path: list[dict[str, Any]],
+    times: list[datetime],
+    tick: float,
+    execution_latency_ms: int,
+    requested: float,
+) -> dict[str, Any]:
     sid = _id("simulation", candidate["candidate_id"], model)
     row = _base(candidate, sid)
     long = candidate["side"] == "LONG"
-    touch = candidate["best_ask"] if long else candidate["best_bid"]
-    delay = {
-        "aggressive_marketable": 0,
-        "ideal_touch": 0,
-        "passive_best": 100,
-        "passive_conservative": 250,
-        "passive_delayed": 500,
-    }[model]
-    offset = {
-        "aggressive_marketable": 0,
-        "ideal_touch": 0,
-        "passive_best": -1,
-        "passive_conservative": -2,
-        "passive_delayed": -1,
-    }[model]
-    price = touch + (offset * tick if long else -offset * tick)
-    slip = (price - touch) / tick * (1 if long else -1)
+    touch = float(candidate["best_ask"] if long else candidate["best_bid"])
+    order_ts = candidate["candidate_ts"]
+    if requested <= 0:
+        raise ValueError("virtual_order_quantity must be positive")
+    filled = 0.0
+    fill_ts: datetime | None = None
+    price: float | None = None
+    no_fill_reason: str | None = None
+    if model == "ideal_touch":
+        filled, fill_ts, price = requested, order_ts, touch
+    elif model == "aggressive_marketable":
+        target = order_ts + timedelta(milliseconds=execution_latency_ms)
+        snapshot = next((point for point in path if point["exchange_ts"] >= target), None)
+        levels = _book_levels(snapshot, "asks" if long else "bids") if snapshot else []
+        remaining = requested
+        notional = 0.0
+        for px, qty in levels:
+            take = min(remaining, qty)
+            notional += take * px
+            filled += take
+            remaining -= take
+            if remaining <= 0:
+                break
+        fill_ts = snapshot["exchange_ts"] if snapshot is not None and filled else None
+        price = notional / filled if filled else None
+        no_fill_reason = None if filled else "insufficient_orderbook_depth"
+    else:
+        placement_delay = 500 if model == "passive_delayed" else 0
+        order_ts = order_ts + timedelta(milliseconds=placement_delay)
+        order_price = float(candidate["best_bid"] if long else candidate["best_ask"])
+        queue_ahead = requested * (2.0 if model == "passive_conservative" else 0.5)
+        for point in path[bisect_left(times, order_ts) :]:
+            ts = point["exchange_ts"]
+            if ts > order_ts + timedelta(seconds=30):
+                break
+            traded = point.get("sell_volume" if long else "buy_volume")
+            executable = float(
+                point.get(
+                    "trade_price",
+                    point.get("best_ask" if long else "best_bid", point["mid_price"]),
+                )
+            )
+            crossed = executable <= order_price if long else executable >= order_price
+            if not crossed:
+                continue
+            if traded is None:
+                if model == "passive_conservative":
+                    continue
+                levels = _book_levels(point, "asks" if long else "bids")
+                market_quantity = levels[0][1] if levels else 0.0
+            else:
+                market_quantity = float(traded)
+            queue_consumed = min(queue_ahead, market_quantity)
+            queue_ahead -= queue_consumed
+            available = market_quantity - queue_consumed
+            if available <= 0:
+                continue
+            filled += min(requested - filled, available)
+            fill_ts, price = ts, order_price
+            if filled >= requested:
+                break
+        no_fill_reason = None if filled else "no_market_confirmed_queue_fill"
+    status = "NO_FILL" if filled == 0 else ("FULL_FILL" if filled >= requested else "PARTIAL_FILL")
+    order_price = (
+        touch
+        if model in {"ideal_touch", "aggressive_marketable"}
+        else float(candidate["best_bid"] if long else candidate["best_ask"])
+    )
+    slip = None if price is None else (price - touch) / tick * (1 if long else -1)
+    delay = None if fill_ts is None else int((fill_ts - order_ts).total_seconds() * 1000)
     row.update(
         simulation_id=sid,
         candidate_id=candidate["candidate_id"],
         feature_snapshot_id=candidate["feature_snapshot_id"],
         side=candidate["side"],
         execution_model=model,
-        order_price=price,
-        fill_status="FULL_FILL",
-        fill_ts=candidate["candidate_ts"] + timedelta(milliseconds=delay),
+        order_ts=order_ts,
+        order_price=order_price,
+        requested_quantity=requested,
+        filled_quantity=filled,
+        remaining_quantity=max(0.0, requested - filled),
+        fill_status=status,
+        fill_ts=fill_ts,
         fill_price=price,
         fill_delay_ms=delay,
         slippage_ticks=slip,
-        slippage_percent=(price - touch) / touch * 100 * (1 if long else -1),
+        slippage_percent=(
+            None if price is None else (price - touch) / touch * 100 * (1 if long else -1)
+        ),
         spread_cost=abs(candidate["best_ask"] - candidate["best_bid"]) / 2,
-        no_fill_reason=None,
+        no_fill_reason=no_fill_reason,
     )
     return row
 
@@ -503,7 +624,7 @@ def _execution(candidate: Mapping[str, Any], model: str, tick: float) -> dict[st
 def _outcomes(
     candidate: Mapping[str, Any],
     sim: Mapping[str, Any],
-    path: list[tuple[datetime, float]],
+    path: list[dict[str, Any]],
     times: list[datetime],
     tick: float,
 ) -> list[dict[str, Any]]:
@@ -516,11 +637,11 @@ def _outcomes(
         price = _nearest(path, times, future)
         if price is None or not segment:
             continue
-        changes = [sign * (p - sim["fill_price"]) for _, p in segment]
-        mfe = max(changes)
-        mae = min(changes)
-        mfe_i = changes.index(mfe)
-        mae_i = changes.index(mae)
+        changes = [sign * (_point_price(p) - sim["fill_price"]) for p in segment]
+        mfe = max(0.0, max(changes))
+        mae = max(0.0, -min(changes))
+        mfe_i = changes.index(max(changes))
+        mae_i = changes.index(min(changes))
         raw = sign * (price - sim["fill_price"])
         spread = sim["spread_cost"]
         oid = _id("outcome", sim["simulation_id"], horizon)
@@ -542,12 +663,12 @@ def _outcomes(
             mae_ticks=mae / tick,
             mfe_percent=mfe / sim["fill_price"] * 100,
             mae_percent=mae / sim["fill_price"] * 100,
-            time_to_mfe_ms=int((segment[mfe_i][0] - entry).total_seconds() * 1000),
-            time_to_mae_ms=int((segment[mae_i][0] - entry).total_seconds() * 1000),
+            time_to_mfe_ms=max(0, int((_point_ts(segment[mfe_i]) - entry).total_seconds() * 1000)),
+            time_to_mae_ms=max(0, int((_point_ts(segment[mae_i]) - entry).total_seconds() * 1000)),
             spread_cost=spread,
-            slippage_cost=abs(sim["slippage_ticks"] * tick),
+            slippage_cost=abs((sim["slippage_ticks"] or 0.0) * tick),
             gross_pnl=raw,
-            net_pnl=raw - spread - abs(sim["slippage_ticks"] * tick),
+            net_pnl=raw - spread - abs((sim["slippage_ticks"] or 0.0) * tick),
             outcome_complete=True,
             missing_reason=None,
         )
@@ -558,21 +679,36 @@ def _outcomes(
 def _stops(
     candidate: Mapping[str, Any],
     sim: Mapping[str, Any],
-    path: list[tuple[datetime, float]],
+    path: list[dict[str, Any]],
     times: list[datetime],
     tick: float,
 ) -> list[dict[str, Any]]:
     result = []
     sign = 1 if candidate["side"] == "LONG" else -1
-    segment = _segment(path, times, sim["fill_ts"], sim["fill_ts"] + timedelta(seconds=1800))
+    segment = [
+        p
+        for p in _segment(path, times, sim["fill_ts"], sim["fill_ts"] + timedelta(seconds=1800))
+        if _point_ts(p) > sim["fill_ts"]
+    ]
     for stop in STOP_TICKS:
         threshold = -stop * tick
-        hit = next(
-            ((ts, p) for ts, p in segment if sign * (p - sim["fill_price"]) <= threshold),
-            segment[-1] if segment else (sim["fill_ts"], sim["fill_price"]),
+        triggered = next(
+            (
+                p
+                for p in segment
+                if sign * (_exit_price(p, candidate["side"], tick) - sim["fill_price"]) <= threshold
+            ),
+            None,
         )
-        changes = [sign * (p - sim["fill_price"]) for ts, p in segment if ts <= hit[0]] or [0.0]
-        gross = sign * (hit[1] - sim["fill_price"])
+        hit = triggered or (segment[-1] if segment else None)
+        hit_ts = _point_ts(hit) if hit is not None else sim["fill_ts"]
+        hit_price = (
+            _exit_price(hit, candidate["side"], tick) if hit is not None else sim["fill_price"]
+        )
+        changes = [
+            sign * (_point_price(p) - sim["fill_price"]) for p in segment if _point_ts(p) <= hit_ts
+        ] or [0.0]
+        gross = sign * (hit_price - sim["fill_price"])
         rid = _id("stop", sim["simulation_id"], stop)
         row = _base(candidate, rid)
         row.update(
@@ -583,14 +719,15 @@ def _stops(
             stop_ticks=stop,
             entry_ts=sim["fill_ts"],
             entry_price=sim["fill_price"],
-            exit_ts=hit[0],
-            exit_price=hit[1],
-            exit_reason="stop" if gross <= threshold else "horizon",
+            exit_ts=hit_ts,
+            exit_price=hit_price,
+            exit_reason="stop_triggered" if triggered is not None else "horizon_end",
+            stop_triggered=triggered is not None,
             gross_pnl=gross,
             net_pnl=gross - sim["spread_cost"],
-            mfe_before_exit=max(changes) / tick,
-            mae_before_exit=min(changes) / tick,
-            holding_ms=int((hit[0] - sim["fill_ts"]).total_seconds() * 1000),
+            mfe_before_exit=max(0.0, max(changes)) / tick,
+            mae_before_exit=max(0.0, -min(changes)) / tick,
+            holding_ms=max(0, int((hit_ts - sim["fill_ts"]).total_seconds() * 1000)),
         )
         result.append(row)
     return result
@@ -599,7 +736,7 @@ def _stops(
 def _exits(
     candidate: Mapping[str, Any],
     sim: Mapping[str, Any],
-    path: list[tuple[datetime, float]],
+    path: list[dict[str, Any]],
     times: list[datetime],
     tick: float,
 ) -> list[dict[str, Any]]:
@@ -607,19 +744,95 @@ def _exits(
     sign = 1 if candidate["side"] == "LONG" else -1
     segment = _segment(path, times, sim["fill_ts"], sim["fill_ts"] + timedelta(seconds=1800))
     for variant in EXIT_VARIANTS:
-        if not segment:
-            hit = (sim["fill_ts"], sim["fill_price"])
+        hit: dict[str, Any] | None = None
+        activation: datetime | None = None
+        trigger_value: float | None = None
+        threshold: float | None = None
+        reason = f"{variant}_horizon_end"
+        if variant == "time_exit":
+            target = sim["fill_ts"] + timedelta(seconds=300)
+            hit = next((p for p in segment if _point_ts(p) >= target), None)
+            threshold, reason = 300.0, "time_exit"
         elif variant == "take_profit":
+            threshold = 4.0
             hit = next(
-                ((ts, p) for ts, p in segment if sign * (p - sim["fill_price"]) >= 4 * tick),
-                segment[-1],
+                (
+                    p
+                    for p in segment
+                    if sign * (_exit_price(p, candidate["side"], tick) - sim["fill_price"])
+                    >= threshold * tick
+                ),
+                None,
             )
-        elif variant == "time_exit":
-            hit = _nearest_pair(segment, sim["fill_ts"] + timedelta(seconds=300))
-        else:
-            hit = segment[-1]
-        prefix = [sign * (p - sim["fill_price"]) for ts, p in segment if ts <= hit[0]] or [0.0]
-        gross = sign * (hit[1] - sim["fill_price"])
+            reason = "take_profit" if hit else reason
+        elif variant in {"breakeven", "dynamic_breakeven"}:
+            activation_ticks = 3.0 if variant == "breakeven" else 4.0
+            cost = (
+                0.0
+                if variant == "breakeven"
+                else sim["spread_cost"] + abs((sim["slippage_ticks"] or 0.0) * tick)
+            )
+            protection = sim["fill_price"] + sign * cost
+            threshold = protection
+            active = False
+            for point in segment:
+                favourable = sign * (_point_price(point) - sim["fill_price"]) / tick
+                if not active and favourable >= activation_ticks:
+                    active, activation = True, _point_ts(point)
+                if (
+                    active
+                    and sign * (_exit_price(point, candidate["side"], tick) - protection) <= 0
+                ):
+                    hit, trigger_value = point, _exit_price(point, candidate["side"], tick)
+                    break
+            reason = variant if hit else reason
+        elif variant == "trailing":
+            threshold = 2.0
+            peak = sim["fill_price"]
+            level: float | None = None
+            for point in segment:
+                px = _point_price(point)
+                peak = max(peak, px) if sign > 0 else min(peak, px)
+                favourable = sign * (peak - sim["fill_price"]) / tick
+                if level is None and favourable >= 3.0:
+                    activation = _point_ts(point)
+                    level = peak - sign * threshold * tick
+                elif level is not None:
+                    proposed = peak - sign * threshold * tick
+                    level = max(level, proposed) if sign > 0 else min(level, proposed)
+                if (
+                    level is not None
+                    and sign * (_exit_price(point, candidate["side"], tick) - level) <= 0
+                ):
+                    hit, trigger_value = point, level
+                    break
+            reason = "trailing_stop" if hit else reason
+        elif variant == "microstructure":
+            threshold = -2.0
+            for previous, point in zip(segment, segment[1:], strict=False):
+                momentum = sign * (_point_price(point) - _point_price(previous)) / tick
+                if momentum <= threshold:
+                    hit, activation, trigger_value = point, _point_ts(point), momentum
+                    break
+            reason = "microstructure_deterioration" if hit else reason
+        elif variant == "orderbook":
+            initial_spread = _spread(segment[0], tick) if segment else 2 * tick
+            threshold = initial_spread * 1.5
+            for point in segment:
+                spread = _spread(point, tick)
+                if spread >= threshold:
+                    hit, activation, trigger_value = point, _point_ts(point), spread
+                    break
+            reason = "orderbook_deterioration" if hit else reason
+        hit = hit or (segment[-1] if segment else None)
+        hit_ts = _point_ts(hit) if hit is not None else sim["fill_ts"]
+        hit_price = (
+            _exit_price(hit, candidate["side"], tick) if hit is not None else sim["fill_price"]
+        )
+        prefix = [
+            sign * (_point_price(p) - sim["fill_price"]) for p in segment if _point_ts(p) <= hit_ts
+        ] or [0.0]
+        gross = sign * (hit_price - sim["fill_price"])
         rid = _id("exit", sim["simulation_id"], variant)
         row = _base(candidate, rid)
         row.update(
@@ -629,48 +842,187 @@ def _exits(
             side=candidate["side"],
             exit_variant=variant,
             variant_parameters=json.dumps(
-                {"tick_size": tick, "horizon_seconds": 1800}, separators=(",", ":")
+                {"tick_size": tick, "horizon_seconds": 1800, "trigger_logic": variant},
+                separators=(",", ":"),
             ),
             entry_ts=sim["fill_ts"],
             entry_price=sim["fill_price"],
-            exit_ts=hit[0],
-            exit_price=hit[1],
-            exit_reason=variant,
+            activation_ts=activation,
+            exit_ts=hit_ts,
+            exit_price=hit_price,
+            exit_reason=reason,
+            trigger_value=trigger_value,
+            trigger_threshold=threshold,
             gross_pnl=gross,
             net_pnl=gross - sim["spread_cost"],
-            mfe_before_exit=max(prefix) / tick,
-            mae_before_exit=min(prefix) / tick,
-            holding_ms=int((hit[0] - sim["fill_ts"]).total_seconds() * 1000),
+            mfe_before_exit=max(0.0, max(prefix)) / tick,
+            mae_before_exit=max(0.0, -min(prefix)) / tick,
+            holding_ms=max(0, int((hit_ts - sim["fill_ts"]).total_seconds() * 1000)),
         )
         result.append(row)
     return result
 
 
-def _nearest(
-    path: list[tuple[datetime, float]], times: list[datetime], target: datetime
-) -> float | None:
+def _nearest(path: Sequence[Any], times: list[datetime], target: datetime) -> float | None:
     # Horizon prices are strict as-of values. Taking the first quote after the
     # horizon introduces look-ahead and can fall outside the support window.
     index = bisect_right(times, target) - 1
-    return None if not path or index < 0 else path[index][1]
+    return None if not path or index < 0 else _point_price(path[index])
 
 
-def _nearest_pair(path: list[tuple[datetime, float]], target: datetime) -> tuple[datetime, float]:
-    times = [p[0] for p in path]
+def _nearest_pair(path: Sequence[Any], target: datetime) -> Any:
+    times = [_point_ts(p) for p in path]
     i = min(bisect_left(times, target), len(path) - 1)
     return path[i]
 
 
 def _segment(
-    path: list[tuple[datetime, float]], times: list[datetime], start: datetime, end: datetime
-) -> list[tuple[datetime, float]]:
+    path: Sequence[Any], times: list[datetime], start: datetime, end: datetime
+) -> list[Any]:
     if not path:
         return []
     # Carry the last known quote into the interval. An event-driven order book
     # may be unchanged for a short horizon; that means a flat as-of price, not
     # an unknown outcome and not permission to take the next future snapshot.
     start_index = max(0, bisect_right(times, start) - 1)
-    return path[start_index : bisect_right(times, end)]
+    return list(path[start_index : bisect_right(times, end)])
+
+
+def _point_ts(point: Any) -> datetime:
+    value = point[0] if not isinstance(point, Mapping) else point["exchange_ts"]
+    return _utc(_dt(value))
+
+
+def _point_price(point: Any) -> float:
+    return float(point[1] if not isinstance(point, Mapping) else point["mid_price"])
+
+
+def _spread(point: Mapping[str, Any], tick: float) -> float:
+    bid, ask = point.get("best_bid"), point.get("best_ask")
+    return float(ask) - float(bid) if bid is not None and ask is not None else 2 * tick
+
+
+def _book_levels(point: Mapping[str, Any], side: str) -> list[tuple[float, float]]:
+    nested = point.get(side) or []
+    levels = [
+        (float(level["price"]), float(level.get("quantity") or level.get("volume") or 0.0))
+        for level in nested
+        if level.get("price") is not None
+        and float(level.get("quantity") or level.get("volume") or 0.0) > 0
+    ]
+    if levels:
+        return levels
+    prefix = "ask" if side == "asks" else "bid"
+    result: list[tuple[float, float]] = []
+    for level in range(1, 21):
+        price = point.get(f"{prefix}_price_{level:02d}") or point.get(f"{prefix}_price_{level}")
+        quantity = (
+            point.get(f"{prefix}_quantity_{level:02d}")
+            or point.get(f"{prefix}_volume_{level:02d}")
+            or point.get(f"{prefix}_quantity_{level}")
+            or point.get(f"{prefix}_volume_{level}")
+        )
+        if price is not None and quantity is not None and float(quantity) > 0:
+            result.append((float(price), float(quantity)))
+    return result
+
+
+def _exit_price(point: Mapping[str, Any] | None, side: str, tick: float) -> float:
+    if point is None:
+        raise ValueError("exit price requires a market point")
+    field = "best_bid" if side == "LONG" else "best_ask"
+    if point.get(field) is not None:
+        return float(point[field])
+    return _point_price(point) + (-tick if side == "LONG" else tick)
+
+
+def _normalize_market_point(row: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result["exchange_ts"] = _utc(_dt(row["exchange_ts"]))
+    bids, asks = list(row.get("bids") or []), list(row.get("asks") or [])
+    if result.get("best_bid") is None and bids:
+        result["best_bid"] = bids[0].get("price")
+    if result.get("best_ask") is None and asks:
+        result["best_ask"] = asks[0].get("price")
+    if result.get("mid_price") is None:
+        result["mid_price"] = (float(result["best_bid"]) + float(result["best_ask"])) / 2
+    result["mid_price"] = float(result["mid_price"])
+    return result
+
+
+def _merge_trade_events(
+    path: list[dict[str, Any]], trades: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge trade evidence without changing its event time or looking ahead."""
+    if not path:
+        return path
+    times = [p["exchange_ts"] for p in path]
+    merged = list(path)
+    for trade in trades:
+        ts = _utc(_dt(trade["exchange_ts"]))
+        index = bisect_right(times, ts) - 1
+        if index < 0:
+            continue
+        point = dict(path[index])
+        point["exchange_ts"] = ts
+        quantity = float(trade.get("quantity") or trade.get("volume") or 0.0)
+        side = str(trade.get("side") or trade.get("direction") or "").upper()
+        point["buy_volume" if side in {"BUY", "LONG"} else "sell_volume"] = quantity
+        if trade.get("price") is not None:
+            point["trade_price"] = float(trade["price"])
+        merged.append(point)
+    return sorted(merged, key=_market_sort_key)
+
+
+def _market_sort_key(point: Mapping[str, Any]) -> tuple[datetime, int]:
+    return (
+        _utc(_dt(point["exchange_ts"])),
+        int(point.get("sequence") or point.get("revision") or 0),
+    )
+
+
+def _enrich_feature_market_fields(
+    features: Sequence[Mapping[str, Any]],
+    market_path: Sequence[Mapping[str, Any]],
+    trades: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compute trailing signed flow and age strictly as-of each feature timestamp."""
+    normalized_trades: list[tuple[datetime, float]] = []
+    for trade in trades:
+        ts = _utc(_dt(trade["exchange_ts"]))
+        quantity = float(trade.get("quantity") or trade.get("volume") or 0.0)
+        side = str(trade.get("side") or trade.get("direction") or "").upper()
+        signed = trade.get("signed_volume")
+        if signed is None:
+            signed = quantity if side in {"BUY", "LONG"} else -quantity
+        normalized_trades.append((ts, float(signed)))
+    normalized_trades.sort()
+    event_times = sorted(
+        [p["exchange_ts"] for p in market_path] + [timestamp for timestamp, _ in normalized_trades]
+    )
+    result: list[dict[str, Any]] = []
+    for source in features:
+        row = dict(source)
+        feature_ts = _utc(
+            _dt(row.get("exchange_ts") or row.get("timestamp") or row.get("recorded_at"))
+        )
+        for seconds in (10, 180, 300, 900):
+            field = f"trades_{seconds}s_signed_volume"
+            if row.get(field) is None and normalized_trades:
+                lower = feature_ts - timedelta(seconds=seconds)
+                row[field] = sum(
+                    signed
+                    for timestamp, signed in normalized_trades
+                    if lower < timestamp <= feature_ts
+                )
+        if row.get("data_age_ms") is None and event_times:
+            index = bisect_right(event_times, feature_ts) - 1
+            if index >= 0:
+                row["data_age_ms"] = max(
+                    0.0, (feature_ts - event_times[index]).total_seconds() * 1000
+                )
+        result.append(row)
+    return result
 
 
 def _id(*parts: Any) -> str:

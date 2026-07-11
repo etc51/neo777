@@ -49,6 +49,15 @@ DATASETS: Final = (
 )
 HORIZONS: Final = (5, 10, 30, 60, 180, 300, 600, 900, 1800)
 STOPS: Final = (2, 3, 4, 5)
+EXIT_VARIANTS: Final = (
+    "take_profit",
+    "time_exit",
+    "breakeven",
+    "dynamic_breakeven",
+    "trailing",
+    "microstructure",
+    "orderbook",
+)
 COMMON_COLUMNS: Final = (
     "schema_version",
     "event_id",
@@ -174,7 +183,7 @@ def create_neobitcoin_review_bundle(
 
     stamp0 = _name_ts(t0)
     stamp1 = _name_ts(t1)
-    archive_name = f"neobitcoin_review_10m_{stamp0}_{stamp1}_schema-v3.tar.zst"
+    archive_name = f"neobitcoin_review_10m_{stamp0}_{stamp1}_schema-v3-fixed.tar.zst"
     work = Path(tempfile.mkdtemp(prefix="review-bundle-", dir=destination))
     try:
         data_dir = work / "data"
@@ -294,7 +303,7 @@ def _prepare_source(
 
     from .review_datasets import build_review_datasets
     from .review_raw import COMMON_FIELDS as RAW_COMMON_FIELDS
-    from .review_raw import extract_review_raw
+    from .review_raw import ReviewRawError, extract_review_raw
 
     raw_root = root / "active" / "raw"
     if not raw_root.exists():
@@ -356,31 +365,54 @@ def _prepare_source(
     ]
     if not window_has_signal and mature_signals:
         # A quiet latest window can contain only rejected NO_TRADE rows. Walk
-        # back to the latest mature directional signal so the review bundle
-        # includes one real accepted side and its rejected counterfactual.
-        selection_now = max(mature_signals) + timedelta(
-            minutes=max_outcome_horizon_minutes + 1
-        )
-        extraction = extract_review_raw(
-            raw_root,
-            output,
-            now=min(now, selection_now),
-            candidate_window_minutes=candidate_window_minutes,
-            max_outcome_horizon_minutes=max_outcome_horizon_minutes,
-            candle_context_hours=candle_context_hours,
-        )
+        # back through mature directional signals. A signal can itself sit in
+        # a reconnect window, so keep searching until raw selection actually
+        # returns a stable ten-minute window containing that signal.
+        matched_signal = False
+        for signal_ts in sorted(mature_signals, reverse=True):
+            selection_now = signal_ts + timedelta(
+                minutes=max_outcome_horizon_minutes + 1
+            )
+            try:
+                candidate_extraction = extract_review_raw(
+                    raw_root,
+                    output,
+                    now=min(now, selection_now),
+                    candidate_window_minutes=candidate_window_minutes,
+                    max_outcome_horizon_minutes=max_outcome_horizon_minutes,
+                    candle_context_hours=candle_context_hours,
+                )
+            except ReviewRawError:
+                continue
+            if (
+                candidate_extraction.window.candidate_start
+                <= signal_ts
+                <= candidate_extraction.window.candidate_end
+            ):
+                extraction = candidate_extraction
+                matched_signal = True
+                break
+        if not matched_signal:
+            raise ArchiveValidationError(
+                "no stable mature review window contains a directional signal"
+            )
     _backfill_review_candles(extraction, token_files)
     _enrich_candle_features(feature_rows, extraction.paths)
-    price_path = (
-        pq.read_table(extraction.paths["raw_orderbook"])
-        .select(["exchange_ts", "mid_price"])
-        .to_pylist()
-    )
+    orderbook_rows = pq.read_table(extraction.paths["raw_orderbook"]).to_pylist()
+    trade_rows = pq.read_table(extraction.paths["raw_trades"]).to_pylist()
+    price_path = [
+        {"exchange_ts": row["exchange_ts"], "mid_price": row["mid_price"]} for row in orderbook_rows
+    ]
     research = build_review_datasets(
         feature_rows,
         price_path,
         candidate_start=extraction.window.candidate_start,
         candidate_end=extraction.window.candidate_end,
+        orderbook_rows=orderbook_rows,
+        trade_rows=trade_rows,
+        # About 0.7% of observed median depth: large enough to expose partial
+        # fills while remaining a modest diagnostic order for this instrument.
+        virtual_order_quantity=5_000.0,
     )
     for dataset, table in research.items():
         pq.write_table(table, data / f"{dataset}.parquet", compression="zstd")
@@ -402,9 +434,7 @@ def _prepare_source(
     return data
 
 
-def _backfill_review_candles(
-    extraction: Any, token_files: tuple[Path | str, ...]
-) -> None:
+def _backfill_review_candles(extraction: Any, token_files: tuple[Path | str, ...]) -> None:
     """Replace stream candle replays with a complete local readonly REST backfill."""
 
     from neo_trader.neobitcoin_research.review_raw import RAW_SCHEMAS
@@ -517,9 +547,7 @@ def _enrich_candle_features(
         timelines[minutes] = sorted(unique.values(), key=lambda row: _utc(row["candle_start"]))
 
     required = tuple(
-        name
-        for minutes in (1, 5, 15)
-        for name in (f"atr_{minutes}m", f"candle_volume_{minutes}m")
+        name for minutes in (1, 5, 15) for name in (f"atr_{minutes}m", f"candle_volume_{minutes}m")
     )
     for feature in feature_rows:
         feature_ts = _timestamp_value(
@@ -624,6 +652,15 @@ def _select_window(
 def _window_is_complete(
     tables: dict[str, pa.Table], candidate_ids: set[str], t0: datetime, t1: datetime
 ) -> bool:
+    raw_start = t0 - timedelta(seconds=60)
+    raw_end = t1 + timedelta(minutes=30)
+    for dataset in ("raw_orderbook", "raw_trades", "raw_last_price"):
+        table = tables[dataset]
+        if "receive_ts" not in table.column_names or not table.num_rows:
+            return False
+        values = [_utc(value) for value in table["receive_ts"].to_pylist() if value is not None]
+        if not values or min(values) > raw_start or max(values) < raw_end:
+            return False
     candidates = _filter_time(tables["candidate_events"], "candidate_ts", t0, t1)
     sides = set(candidates["side"].to_pylist()) if "side" in candidates.column_names else set()
     decisions = (
@@ -633,6 +670,25 @@ def _window_is_complete(
     )
     if not {"LONG", "SHORT"}.issubset(sides) or len(decisions) < 2:
         return False
+    if "feature_ready" not in candidates.column_names or not all(
+        candidates["feature_ready"].to_pylist()
+    ):
+        return False
+    feature_ids = {str(value) for value in candidates["feature_snapshot_id"].to_pylist() if value}
+    features = _filter_ids(tables["feature_snapshots"], "feature_snapshot_id", feature_ids)
+    if features.num_rows != len(feature_ids):
+        return False
+    for column in (
+        "trade_flow_10s",
+        "trade_flow_180s",
+        "trade_flow_300s",
+        "trade_flow_900s",
+        "data_age_ms",
+    ):
+        if column not in features.column_names or any(
+            value is None for value in features[column].to_pylist()
+        ):
+            return False
     outcomes = _filter_ids(tables["future_outcomes"], "candidate_id", candidate_ids)
     present = (
         set(outcomes["horizon_seconds"].to_pylist())
@@ -666,6 +722,7 @@ def _select_tables(
     support_start: datetime,
     support_end: datetime,
 ) -> dict[str, pa.Table]:
+    raw_start = t0 - timedelta(seconds=60)
     candidate_ids = _candidate_ids(tables["candidate_events"], t0, t1)
     candidates = _filter_ids(
         _filter_time(tables["candidate_events"], "candidate_ts", t0, t1),
@@ -679,14 +736,17 @@ def _select_tables(
     for name, table in tables.items():
         if name.startswith("candles_"):
             result[name] = _filter_time(table, "candle_start", support_start, support_end)
-        elif name in {
-            "raw_orderbook",
-            "raw_trades",
-            "raw_last_price",
-            "market_status_events",
-            "data_quality_events",
-        }:
-            result[name] = _filter_time(table, "receive_ts", t0, support_end)
+        elif name == "raw_trades":
+            # The longest signed-volume feature needs a directly auditable 900s history.
+            result[name] = _filter_time_with_context(
+                table, "receive_ts", t0 - timedelta(seconds=900), support_end
+            )
+        elif name in {"raw_orderbook", "raw_last_price"}:
+            result[name] = _filter_time_with_context(
+                table, "receive_ts", raw_start, support_end
+            )
+        elif name in {"market_status_events", "data_quality_events"}:
+            result[name] = _filter_time(table, "receive_ts", raw_start, support_end)
         elif name == "feature_snapshots":
             result[name] = _filter_ids(table, "feature_snapshot_id", feature_ids)
         elif name == "candidate_events":
@@ -717,6 +777,45 @@ def _filter_time(table: pa.Table, column: str, start: datetime, end: datetime) -
     return table.filter(mask)
 
 
+def _filter_time_with_prefix(
+    table: pa.Table, column: str, start: datetime, end: datetime
+) -> pa.Table:
+    """Filter an event stream while retaining its last as-of event before start."""
+
+    selected = _filter_time(table, column, start, end)
+    if column not in table.column_names or not table.num_rows:
+        return selected
+    values = table[column].to_pylist()
+    before = [
+        (index, _utc(value))
+        for index, value in enumerate(values)
+        if value is not None and _utc(value) < start
+    ]
+    if not before:
+        return selected
+    prefix_index = max(before, key=lambda item: item[1])[0]
+    return pa.concat_tables([table.take(pa.array([prefix_index])), selected])
+
+
+def _filter_time_with_context(
+    table: pa.Table, column: str, start: datetime, end: datetime
+) -> pa.Table:
+    """Retain as-of prefix and the first event proving coverage beyond end."""
+
+    selected = _filter_time_with_prefix(table, column, start, end)
+    if column not in table.column_names or not table.num_rows:
+        return selected
+    after = [
+        (index, _utc(value))
+        for index, value in enumerate(table[column].to_pylist())
+        if value is not None and _utc(value) > end
+    ]
+    if not after:
+        return selected
+    suffix_index = min(after, key=lambda item: item[1])[0]
+    return pa.concat_tables([selected, table.take(pa.array([suffix_index]))])
+
+
 def _filter_ids(table: pa.Table, column: str, values: set[str]) -> pa.Table:
     if column not in table.column_names or not table.num_rows:
         return table.slice(0, 0)
@@ -737,6 +836,58 @@ def _validate_tables(
     secrets: list[bytes],
 ) -> dict[str, Any]:
     errors: list[str] = []
+    checks: list[dict[str, str]] = []
+
+    def check(
+        name: str,
+        passed: bool,
+        measured: Any,
+        threshold: str,
+        explanation: str,
+    ) -> None:
+        status = "PASS" if passed else "FAIL"
+        checks.append(
+            {
+                "check": name,
+                "status": status,
+                "measured_value": str(measured),
+                "threshold": threshold,
+                "explanation": explanation,
+            }
+        )
+        if not passed:
+            errors.append(f"{name}: {explanation} (measured {measured})")
+
+    check(
+        "candidate_window_duration",
+        t1 - t0 == timedelta(minutes=10),
+        (t1 - t0).total_seconds(),
+        "exactly 600 seconds",
+        "candidate window must be exactly ten minutes",
+    )
+    raw_coverage: dict[str, dict[str, str | None]] = {}
+    raw_required_start = t0 - timedelta(seconds=60)
+    raw_required_end = t1 + timedelta(minutes=30)
+    for dataset in ("raw_orderbook", "raw_trades", "raw_last_price"):
+        table = tables[dataset]
+        values = (
+            [_utc(value) for value in table["receive_ts"].to_pylist() if value is not None]
+            if "receive_ts" in table.column_names
+            else []
+        )
+        start = min(values) if values else None
+        end = max(values) if values else None
+        raw_coverage[dataset] = {
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+        }
+        check(
+            f"{dataset}_coverage",
+            bool(start and end and start <= raw_required_start and end >= raw_required_end),
+            f"{start.isoformat() if start else 'empty'} .. {end.isoformat() if end else 'empty'}",
+            f"{raw_required_start.isoformat()} .. {raw_required_end.isoformat()}",
+            "raw stream must include 60 seconds of pre-roll and 30 minutes of outcomes",
+        )
     duplicate_counts: dict[str, int] = {}
     for dataset, table in tables.items():
         pk = PRIMARY_KEYS.get(dataset)
@@ -789,9 +940,12 @@ def _validate_tables(
     if stops != list(STOPS):
         errors.append(f"stops incomplete: {stops}")
     simulation_ids = {
-        str(value)
-        for value in tables["execution_simulations"]["simulation_id"].to_pylist()
-        if value
+        str(row["simulation_id"])
+        for row in tables["execution_simulations"].to_pylist()
+        if row.get("simulation_id")
+        and row.get("fill_status") in {"FULL_FILL", "PARTIAL_FILL"}
+        and row.get("fill_ts") is not None
+        and float(row.get("filled_quantity") or 0.0) > 0.0
     }
     actual_outcomes = {
         (str(row["simulation_id"]), int(row["horizon_seconds"]))
@@ -820,6 +974,63 @@ def _validate_tables(
         errors.append("shadow exits missing")
     if tables["raw_orderbook"].num_rows == 0:
         errors.append("raw orderbook missing")
+    check(
+        "primary_keys_unique",
+        sum(duplicate_counts.values()) == 0,
+        sum(duplicate_counts.values()),
+        "0 duplicates",
+        "every declared primary key must be populated and unique",
+    )
+    missing_foreign_keys = sum(int(item["missing"]) for item in fk_results)
+    check(
+        "foreign_keys_complete",
+        missing_foreign_keys == 0,
+        missing_foreign_keys,
+        "0 missing references",
+        "all cross-dataset IDs must resolve",
+    )
+    check(
+        "candidate_sides_and_decisions",
+        {"LONG", "SHORT"}.issubset(sides) and len(decisions) >= 2,
+        f"sides={sorted(sides)}, decisions={sorted(str(value) for value in decisions)}",
+        "LONG+SHORT and accepted+rejected",
+        "review must include both sides and both decision outcomes",
+    )
+    check(
+        "future_horizons_complete",
+        horizons == list(HORIZONS) and actual_outcomes == expected_outcomes,
+        f"horizons={horizons}, missing_pairs={len(expected_outcomes - actual_outcomes)}",
+        f"{list(HORIZONS)} and 0 missing pairs",
+        "every filled simulation needs every required future horizon",
+    )
+    check(
+        "stop_variants_complete",
+        stops == list(STOPS) and actual_stops == expected_stops,
+        f"stops={stops}, missing_pairs={len(expected_stops - actual_stops)}",
+        f"{list(STOPS)} and 0 missing pairs",
+        "every filled simulation needs each stop distance",
+    )
+    check(
+        "shadow_exits_present",
+        tables["shadow_exit_results"].num_rows > 0,
+        tables["shadow_exit_results"].num_rows,
+        "> 0",
+        "independent shadow exit simulations are required",
+    )
+    actual_exit_pairs = {
+        (str(row["simulation_id"]), str(row["exit_variant"]))
+        for row in tables["shadow_exit_results"].to_pylist()
+    }
+    expected_exit_pairs = {
+        (simulation_id, variant) for simulation_id in simulation_ids for variant in EXIT_VARIANTS
+    }
+    check(
+        "exit_variants_complete",
+        actual_exit_pairs == expected_exit_pairs,
+        f"missing={len(expected_exit_pairs - actual_exit_pairs)}",
+        f"all {len(EXIT_VARIANTS)} variants for every filled simulation",
+        "every filled simulation needs every independent exit model",
+    )
     book_rows = sorted(
         tables["raw_orderbook"].select(["receive_ts", "session_id"]).to_pylist(),
         key=lambda row: _utc(row["receive_ts"]),
@@ -828,20 +1039,374 @@ def _validate_tables(
         left["session_id"] != right["session_id"]
         for left, right in zip(book_rows, book_rows[1:], strict=False)
     )
-    candidate_books = [
-        row for row in book_rows if t0 <= _utc(row["receive_ts"]) <= t1
-    ]
+    candidate_books = [row for row in book_rows if t0 <= _utc(row["receive_ts"]) <= t1]
     candidate_reconnect_count = sum(
         left["session_id"] != right["session_id"]
         for left, right in zip(candidate_books, candidate_books[1:], strict=False)
     )
     if candidate_reconnect_count:
         errors.append(f"candidate window contains {candidate_reconnect_count} reconnects")
+    quality_rows = tables["data_quality_events"].to_pylist()
+    gap_count = sum(str(row.get("event_type")) in {"gap", "critical_gap"} for row in quality_rows)
+    critical_candidate_quality = sum(
+        row.get("receive_ts") is not None
+        and t0 <= _utc(row["receive_ts"]) <= t1
+        and (
+            str(row.get("severity", "")).lower() == "critical"
+            or str(row.get("event_type"))
+            in {"gap", "critical_gap", "reconnect", "disconnect", "collector_stop"}
+        )
+        for row in quality_rows
+    )
+    check(
+        "candidate_window_no_critical_gap_or_reconnect",
+        candidate_reconnect_count == 0 and critical_candidate_quality == 0,
+        (
+            f"session_reconnects={candidate_reconnect_count}, "
+            f"quality_events={critical_candidate_quality}"
+        ),
+        "0",
+        "candidate window cannot contain a critical gap, reconnect or disconnect",
+    )
+
+    executions = tables["execution_simulations"].to_pylist()
+    candidate_times = {
+        str(row["candidate_id"]): _utc(row["candidate_ts"])
+        for row in tables["candidate_events"].to_pylist()
+    }
+    fill_before_order = 0
+    for row in executions:
+        fill = row.get("fill_ts")
+        if fill is None or row.get("fill_status") == "NO_FILL":
+            continue
+        order = row.get("order_ts") or candidate_times.get(str(row.get("candidate_id")))
+        if order is None or _utc(fill) < _utc(order):
+            fill_before_order += 1
+    check(
+        "fill_not_before_order",
+        fill_before_order == 0,
+        fill_before_order,
+        "0",
+        "every fill must occur at or after order placement",
+    )
+    passive = [
+        row for row in executions if str(row.get("execution_model", "")).startswith("passive")
+    ]
+    passive_statuses = [str(row.get("fill_status")) for row in passive]
+    passive_filled = [
+        row for row in passive if row.get("fill_status") in {"FULL_FILL", "PARTIAL_FILL"}
+    ]
+    all_passive_full = bool(passive) and all(value == "FULL_FILL" for value in passive_statuses)
+    check(
+        "passive_not_all_full_fill",
+        not all_passive_full,
+        f"{sum(value == 'FULL_FILL' for value in passive_statuses)}/{len(passive)}",
+        "less than 100% FULL_FILL",
+        "passive placement cannot guarantee complete execution",
+    )
+    no_fill_count = sum(value == "NO_FILL" for value in passive_statuses)
+    check(
+        "passive_has_no_fill",
+        not passive or no_fill_count > 0,
+        no_fill_count,
+        ">= 1 when passive models exist",
+        "at least one passive simulation must remain unfilled",
+    )
+    fill_status_counts: dict[str, dict[str, int]] = {}
+    for row in executions:
+        model = str(row.get("execution_model"))
+        status = str(row.get("fill_status"))
+        counts = fill_status_counts.setdefault(model, {})
+        counts[status] = counts.get(status, 0) + 1
+    observed_statuses = {
+        status
+        for counts in fill_status_counts.values()
+        for status, count in counts.items()
+        if count
+    }
+    check(
+        "execution_statuses_complete",
+        {"FULL_FILL", "PARTIAL_FILL", "NO_FILL"}.issubset(observed_statuses),
+        sorted(observed_statuses),
+        "FULL_FILL, PARTIAL_FILL and NO_FILL",
+        "review simulations must expose full, partial and unfilled outcomes",
+    )
+    passive_delays = {
+        int(row["fill_delay_ms"]) for row in passive_filled if row.get("fill_delay_ms") is not None
+    }
+    check(
+        "passive_fill_delays_vary",
+        len(passive_filled) < 2 or len(passive_delays) > 1,
+        sorted(passive_delays),
+        "> 1 distinct delay for multiple fills",
+        "passive fills must be driven by market events, not one timer",
+    )
+    artificial = bool(passive_filled) and passive_delays.issubset({100, 250, 500})
+    check(
+        "no_fixed_artificial_passive_timing",
+        not artificial,
+        sorted(passive_delays),
+        "not exclusively 100/250/500 ms",
+        "fixed artificial passive fill timing is forbidden",
+    )
+    raw_bounds = [
+        _utc(value)
+        for name in ("raw_orderbook", "raw_trades")
+        for value in tables[name]["receive_ts"].to_pylist()
+        if value is not None
+    ]
+    unconfirmed = sum(
+        not raw_bounds
+        or row.get("fill_ts") is None
+        or not min(raw_bounds) <= _utc(row["fill_ts"]) <= max(raw_bounds)
+        for row in passive_filled
+    )
+    check(
+        "passive_fill_has_raw_support",
+        unconfirmed == 0,
+        unconfirmed,
+        "0",
+        "filled passive orders need temporally available raw trade/order-book evidence",
+    )
+
+    exit_before_entry = 0
+    negative_holding = 0
+    for dataset in ("shadow_stop_results", "shadow_exit_results"):
+        for row in tables[dataset].to_pylist():
+            if row.get("entry_ts") is not None and row.get("exit_ts") is not None:
+                exit_before_entry += _utc(row["exit_ts"]) < _utc(row["entry_ts"])
+            if row.get("holding_ms") is not None:
+                negative_holding += int(row["holding_ms"]) < 0
+    check(
+        "exit_not_before_entry",
+        exit_before_entry == 0,
+        exit_before_entry,
+        "0",
+        "exit_ts must be >= entry_ts",
+    )
+    check(
+        "holding_time_nonnegative",
+        negative_holding == 0,
+        negative_holding,
+        "0",
+        "holding_ms must be non-negative",
+    )
+    invalid_stop_direction = sum(
+        row.get("exit_reason") == "stop_triggered"
+        and (
+            (row.get("side") == "LONG" and float(row["exit_price"]) > float(row["entry_price"]))
+            or (row.get("side") == "SHORT" and float(row["exit_price"]) < float(row["entry_price"]))
+        )
+        for row in tables["shadow_stop_results"].to_pylist()
+    )
+    check(
+        "stop_direction_valid",
+        invalid_stop_direction == 0,
+        invalid_stop_direction,
+        "0",
+        "triggered LONG stops exit at/below entry and SHORT stops at/above entry",
+    )
+    early_outcomes = sum(
+        _utc(row["future_ts"]) < _utc(row["entry_ts"])
+        for row in tables["future_outcomes"].to_pylist()
+        if row.get("future_ts") is not None and row.get("entry_ts") is not None
+    )
+    check(
+        "outcome_not_before_entry",
+        early_outcomes == 0,
+        early_outcomes,
+        "0",
+        "future outcome must not precede entry",
+    )
+
+    exit_rows = tables["shadow_exit_results"].to_pylist()
+    signatures: dict[str, dict[str, tuple[Any, ...]]] = {}
+    for row in exit_rows:
+        variant = str(row.get("exit_variant"))
+        signatures.setdefault(variant, {})[str(row.get("simulation_id"))] = (
+            row.get("activation_ts"),
+            row.get("exit_ts"),
+            row.get("exit_price"),
+            row.get("exit_reason"),
+            row.get("trigger_value"),
+            row.get("trigger_threshold"),
+        )
+    identical_pairs: list[str] = []
+    exit_comparisons = 0
+    matching_exits = 0
+    variants = sorted(signatures)
+    for index, left in enumerate(variants):
+        for right in variants[index + 1 :]:
+            common_ids = set(signatures[left]) & set(signatures[right])
+            exit_comparisons += len(common_ids)
+            matching_exits += sum(
+                signatures[left][key] == signatures[right][key] for key in common_ids
+            )
+            if common_ids and all(
+                signatures[left][key] == signatures[right][key] for key in common_ids
+            ):
+                identical_pairs.append(f"{left}={right}")
+    check(
+        "exit_models_independent",
+        not identical_pairs,
+        ", ".join(identical_pairs) or "no identical pairs",
+        "no pair fully identical",
+        "each exit model must have independent trigger/results",
+    )
+    exit_match_percent = 100.0 * matching_exits / exit_comparisons if exit_comparisons else 0.0
+    generic_reasons = {"horizon_end", "time_exit", ""}
+    missing_logic = sum(
+        not str(row.get("variant_parameters") or "").strip()
+        or not str(row.get("exit_reason") or "").strip()
+        for row in exit_rows
+    )
+    all_generic = bool(exit_rows) and all(
+        str(row.get("exit_reason") or "") in generic_reasons for row in exit_rows
+    )
+    reason_mismatches = sum(
+        not str(row.get("exit_reason") or "").startswith(str(row.get("exit_variant") or ""))
+        and not (
+            row.get("exit_variant") == "trailing"
+            and str(row.get("exit_reason") or "") == "trailing_stop"
+        )
+        for row in exit_rows
+    )
+    check(
+        "exit_models_have_trigger_logic",
+        missing_logic == 0 and not all_generic and reason_mismatches == 0,
+        (
+            f"missing={missing_logic}, all_generic={all_generic}, "
+            f"reason_mismatches={reason_mismatches}"
+        ),
+        "0 missing/mismatched and model-specific reasons",
+        "exit variants need parameters and model-specific trigger reasons",
+    )
+
+    required_features = (
+        "trade_flow_10s",
+        "trade_flow_180s",
+        "trade_flow_300s",
+        "trade_flow_900s",
+        "data_age_ms",
+    )
+    feature_rows = tables["feature_snapshots"].to_pylist()
+    wholly_null = [
+        name
+        for name in required_features
+        if name not in tables["feature_snapshots"].column_names
+        or all(row.get(name) is None for row in feature_rows)
+    ]
+    ready_missing = sum(
+        bool(row.get("feature_ready")) and any(row.get(name) is None for name in required_features)
+        for row in feature_rows
+    )
+    invalid_missing_markers = sum(
+        any(row.get(name) is None for name in required_features)
+        and (
+            not str(row.get("missing_reason") or "").strip()
+            or row.get("warmup_remaining") is None
+            or not str(row.get("source_status") or "").strip()
+        )
+        for row in feature_rows
+    )
+    negative_age = sum((row.get("data_age_ms") or 0) < 0 for row in feature_rows)
+    required_feature_null_fraction = {
+        name: (
+            sum(row.get(name) is None for row in feature_rows) / len(feature_rows)
+            if feature_rows
+            else 1.0
+        )
+        for name in required_features
+    }
+    check(
+        "required_features_not_all_null",
+        not wholly_null,
+        wholly_null or "none",
+        "no wholly-null required columns",
+        "required trade flow and event-age features must be populated",
+    )
+    check(
+        "feature_ready_has_no_required_nulls",
+        ready_missing == 0,
+        ready_missing,
+        "0",
+        "ready feature rows cannot contain required nulls",
+    )
+    check(
+        "missing_features_have_markers",
+        invalid_missing_markers == 0,
+        invalid_missing_markers,
+        "0",
+        "missing features require reason, warmup and source status",
+    )
+    check(
+        "feature_data_age_no_lookahead",
+        negative_age == 0,
+        negative_age,
+        "0",
+        "data_age_ms cannot be negative",
+    )
+    incomplete_warmup = sum(
+        not bool(row.get("feature_ready")) or int(row.get("warmup_remaining") or 0) != 0
+        for row in feature_rows
+    )
+    check(
+        "candidate_features_warmup_complete",
+        incomplete_warmup == 0,
+        incomplete_warmup,
+        "0",
+        "the selected review window must contain only ready post-warmup features",
+    )
+
+    negative_excursions: dict[str, int] = {}
+    for dataset, columns in (
+        ("future_outcomes", ("mfe_ticks", "mae_ticks", "mfe_percent", "mae_percent")),
+        ("shadow_stop_results", ("mfe_before_exit", "mae_before_exit")),
+        ("shadow_exit_results", ("mfe_before_exit", "mae_before_exit")),
+    ):
+        count = sum(
+            value is not None and float(value) < 0
+            for column in columns
+            if column in tables[dataset].column_names
+            for value in tables[dataset][column].to_pylist()
+        )
+        negative_excursions[dataset] = count
+    check(
+        "mfe_mae_nonnegative",
+        sum(negative_excursions.values()) == 0,
+        negative_excursions,
+        "0 negative values",
+        "MFE and MAE are non-negative magnitudes",
+    )
+    mfe_values = [
+        float(value)
+        for column in ("mfe_ticks", "mfe_before_exit")
+        for dataset in ("future_outcomes", "shadow_stop_results", "shadow_exit_results")
+        if column in tables[dataset].column_names
+        for value in tables[dataset][column].to_pylist()
+        if value is not None
+    ]
+    mae_values = [
+        float(value)
+        for column in ("mae_ticks", "mae_before_exit")
+        for dataset in ("future_outcomes", "shadow_stop_results", "shadow_exit_results")
+        if column in tables[dataset].column_names
+        for value in tables[dataset][column].to_pylist()
+        if value is not None
+    ]
     # In-memory secret scan catches token material before files are written.
+    secret_datasets: list[str] = []
     for dataset, table in tables.items():
         body = table.to_pydict().__repr__().encode("utf-8", errors="ignore")
         if SECRET_PATTERN.search(body) or any(secret and secret in body for secret in secrets):
-            errors.append(f"secret material in {dataset}")
+            secret_datasets.append(dataset)
+    check(
+        "secret_scan",
+        not secret_datasets,
+        secret_datasets or "none",
+        "no secret material",
+        "secret material such as tokens and credentials must never enter the bundle",
+    )
     return {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
@@ -858,9 +1423,26 @@ def _validate_tables(
         "decisions": sorted(str(v) for v in decisions),
         "duplicate_counts": duplicate_counts,
         "foreign_keys": fk_results,
-        "gap_count": 0,
+        "gap_count": gap_count,
         "reconnect_count": reconnect_count,
         "candidate_reconnect_count": candidate_reconnect_count,
+        "raw_coverage": raw_coverage,
+        "checks": checks,
+        "fill_status_counts_by_model": fill_status_counts,
+        "minimum_holding_ms": min(
+            (
+                int(row["holding_ms"])
+                for dataset in ("shadow_stop_results", "shadow_exit_results")
+                for row in tables[dataset].to_pylist()
+                if row.get("holding_ms") is not None
+            ),
+            default=None,
+        ),
+        "exit_before_entry_count": exit_before_entry,
+        "exit_model_match_percent": exit_match_percent,
+        "required_feature_null_fraction": required_feature_null_fraction,
+        "mfe_range": [min(mfe_values), max(mfe_values)] if mfe_values else None,
+        "mae_range": [min(mae_values), max(mae_values)] if mae_values else None,
     }
 
 
@@ -936,8 +1518,15 @@ def _build_manifest(
         "instrument": instrument,
         "candidate_window_start": t0.isoformat(),
         "candidate_window_end": t1.isoformat(),
+        "outcome_support_end": support_end.isoformat(),
         "support_data_start": support_start.isoformat(),
         "support_data_end": support_end.isoformat(),
+        "raw_orderbook_coverage_start": validation["raw_coverage"]["raw_orderbook"]["start"],
+        "raw_orderbook_coverage_end": validation["raw_coverage"]["raw_orderbook"]["end"],
+        "raw_trades_coverage_start": validation["raw_coverage"]["raw_trades"]["start"],
+        "raw_trades_coverage_end": validation["raw_coverage"]["raw_trades"]["end"],
+        "raw_last_price_coverage_start": validation["raw_coverage"]["raw_last_price"]["start"],
+        "raw_last_price_coverage_end": validation["raw_coverage"]["raw_last_price"]["end"],
         "exchange_timestamp_min": min(exchange_values).isoformat(),
         "exchange_timestamp_max": max(exchange_values).isoformat(),
         "receive_timestamp_min": min(receive_values).isoformat(),
@@ -967,6 +1556,14 @@ def _build_manifest(
         "shadow_stop_simulations": tables["shadow_stop_results"].num_rows,
         "shadow_exit_simulations": tables["shadow_exit_results"].num_rows,
         "validation": "PASS",
+        "validation_checks": validation["checks"],
+        "fill_status_counts_by_model": validation["fill_status_counts_by_model"],
+        "minimum_holding_ms": validation["minimum_holding_ms"],
+        "exit_before_entry_count": validation["exit_before_entry_count"],
+        "exit_model_match_percent": validation["exit_model_match_percent"],
+        "required_feature_null_fraction": validation["required_feature_null_fraction"],
+        "mfe_range": validation["mfe_range"],
+        "mae_range": validation["mae_range"],
         "files": files,
     }
 
@@ -1024,6 +1621,14 @@ def _schema_dictionary(tables: dict[str, pa.Table]) -> str:
         "",
         "All timestamps use `timestamp[us, UTC]`. Schema version: `v3`.",
         "",
+        "`trade_flow_<N>s` is signed traded volume (aggressive BUY volume minus "
+        "aggressive SELL volume) from events in `(feature_ts-Ns, feature_ts]`; future "
+        "events are excluded. `data_age_ms` is feature timestamp minus the newest "
+        "market-event timestamp used by the feature.",
+        "",
+        "MFE and MAE fields are non-negative magnitudes. MFE is the maximum favourable "
+        "move; MAE is the absolute maximum adverse move, side-adjusted for LONG/SHORT.",
+        "",
     ]
     for dataset, table in tables.items():
         lines.extend((f"## {dataset}", "", "| Column | Arrow type |", "|---|---|"))
@@ -1055,26 +1660,42 @@ def _manifest_md(manifest: dict[str, Any]) -> str:
 
 
 def _validation_report(validation: dict[str, Any], tables: dict[str, pa.Table]) -> str:
-    return "\n".join(
+    def cell(value: Any) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "# Validation report",
+        "",
+        f"- Overall: `{validation['status']}`",
+        "- PyArrow: `PASS`",
+        "- DuckDB: `PASS`",
+        "- zstd stream test: `PASS`",
+        "- Secret scan: `PASS`",
+        f"- Files: 20; datasets: {len(tables)}",
+        "",
+        "| Check | Status | Measured value | Threshold | Explanation |",
+        "|---|---|---|---|---|",
+    ]
+    lines.extend(
+        "| {check} | **{status}** | {measured} | {threshold} | {explanation} |".format(
+            check=cell(item["check"]),
+            status=cell(item["status"]),
+            measured=cell(item["measured_value"]),
+            threshold=cell(item["threshold"]),
+            explanation=cell(item["explanation"]),
+        )
+        for item in validation["checks"]
+    )
+    lines.extend(
         (
-            "# Validation report",
             "",
-            "- Overall: `PASS`",
-            "- PyArrow: `PASS`",
-            "- DuckDB: `PASS`",
-            "- zstd stream test: `PASS`",
-            "- Files: 20",
-            f"- Datasets: {len(tables)}",
-            f"- Horizons: {validation['horizons']}",
-            f"- Stops: {validation['stops']}",
-            f"- Foreign keys: `PASS` ({len(validation['foreign_keys'])} constraints)",
-            f"- Duplicates: {sum(validation['duplicate_counts'].values())}",
-            f"- Gaps: {validation['gap_count']}",
-            f"- Reconnects: {validation['reconnect_count']}",
-            "- Secret scan: `PASS`",
+            f"Foreign keys: `PASS` ({len(validation['foreign_keys'])} constraints).",
+            f"Duplicates: {sum(validation['duplicate_counts'].values())}; "
+            f"gaps: {validation['gap_count']}; reconnects: {validation['reconnect_count']}.",
             "",
         )
     )
+    return "\n".join(lines)
 
 
 def _scan_files(paths: list[Path], secrets: list[bytes]) -> None:

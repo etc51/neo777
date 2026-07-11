@@ -209,8 +209,13 @@ def select_review_window(
         candidate = [
             record for record in records if start <= _as_utc(record["receive_ts"]) <= latest_end
         ]
+        raw_start = start - timedelta(seconds=60)
         support = [
-            record for record in records if start <= _as_utc(record["receive_ts"]) <= support_end
+            record
+            for record in records
+            if raw_start - timedelta(seconds=critical_gap_seconds)
+            <= _as_utc(record["receive_ts"])
+            <= support_end
         ]
         if _window_is_usable(
             candidate,
@@ -248,6 +253,25 @@ def _window_is_usable(
         or max(_as_utc(record["receive_ts"]) for record in support) < support_end - tolerance
     ):
         return False
+    raw_start = candidate_start - timedelta(seconds=60)
+    required_types = (
+        {"orderbook"},
+        {"trade", "trades"},
+        {"last_price"},
+    )
+    for event_types in required_types:
+        event_times = [
+            _as_utc(record["receive_ts"])
+            for record in support
+            if record.get("event_type") in event_types
+        ]
+        if (
+            not event_times
+            or min(event_times) > candidate_start
+            or max(event_times) < support_end - tolerance
+            or min(event_times) > raw_start + tolerance
+        ):
+            return False
     if not require_stable:
         return True
     bad_types = {"reconnect", "disconnect", "collector_stop", "critical_gap", "stream_error"}
@@ -306,7 +330,12 @@ def _build_rows(
             )
             continue
 
-        if not (window.candidate_start <= receive_ts <= window.support_end):
+        raw_context_seconds = 900 if event_type in {"trade", "trades"} else 60
+        if not (
+            window.candidate_start - timedelta(seconds=raw_context_seconds + 180)
+            <= receive_ts
+            <= window.support_end + timedelta(seconds=180)
+        ):
             continue
         if event_type == "orderbook":
             bids = _levels(payload.get("bids"))
