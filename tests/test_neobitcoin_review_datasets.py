@@ -4,6 +4,8 @@ import pyarrow as pa
 
 from neo_trader.neobitcoin_research.review_datasets import (
     HORIZONS,
+    _nearest,
+    _segment,
     build_review_datasets,
     validate_review_links,
 )
@@ -62,3 +64,13 @@ def test_review_datasets_are_typed_and_linked() -> None:
     assert validate_review_links(tables) == []
     assert {r["side"] for r in tables["candidate_events"].to_pylist()} == {"LONG", "SHORT"}
     assert {r["horizon_seconds"] for r in tables["future_outcomes"].to_pylist()} == set(HORIZONS)
+
+
+def test_horizon_prices_do_not_look_ahead() -> None:
+    start = datetime(2026, 7, 11, 10, 0, tzinfo=UTC)
+    path = [(start, 100.0), (start + timedelta(seconds=11), 101.0)]
+    times = [row[0] for row in path]
+    horizon = start + timedelta(seconds=10)
+
+    assert _nearest(path, times, horizon) == 100.0
+    assert _segment(path, times, start, horizon) == [(start, 100.0)]

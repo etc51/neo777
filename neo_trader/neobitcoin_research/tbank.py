@@ -39,6 +39,7 @@ FIND_INSTRUMENT_RPC: Final = f"/{RPC_NAMESPACE}InstrumentsService/FindInstrument
 GET_INSTRUMENT_BY_RPC: Final = f"/{RPC_NAMESPACE}InstrumentsService/GetInstrumentBy"
 TRADING_SCHEDULES_RPC: Final = f"/{RPC_NAMESPACE}InstrumentsService/TradingSchedules"
 GET_TRADING_STATUS_RPC: Final = f"/{RPC_NAMESPACE}MarketDataService/GetTradingStatus"
+GET_CANDLES_RPC: Final = f"/{RPC_NAMESPACE}MarketDataService/GetCandles"
 MARKET_DATA_STREAM_RPC: Final = f"/{RPC_NAMESPACE}MarketDataStreamService/MarketDataStream"
 
 NEOBITCOIN_QUERY: Final = "Neo Bitcoin"
@@ -585,6 +586,27 @@ class TBankResearchClient:
             is True,
             trading_schedules=schedules,
         )
+
+    def get_candles(
+        self,
+        instrument_uid: str,
+        *,
+        from_time: datetime,
+        to_time: datetime,
+        interval: str,
+    ) -> tuple[JsonObject, ...]:
+        """Return historical candles through the readonly safety allowlist."""
+
+        response = self._unary_call(
+            GET_CANDLES_RPC,
+            {
+                "instrumentId": instrument_uid,
+                "from": _as_utc(from_time).isoformat().replace("+00:00", "Z"),
+                "to": _as_utc(to_time).isoformat().replace("+00:00", "Z"),
+                "interval": interval,
+            },
+        )
+        return tuple(to_json_safe_object(item) for item in _mapping_items(response, "candles"))
 
     async def stream_market_data(
         self,

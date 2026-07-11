@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, cast
@@ -649,7 +649,10 @@ def _exits(
 def _nearest(
     path: list[tuple[datetime, float]], times: list[datetime], target: datetime
 ) -> float | None:
-    return None if not path or (i := bisect_left(times, target)) >= len(path) else path[i][1]
+    # Horizon prices are strict as-of values. Taking the first quote after the
+    # horizon introduces look-ahead and can fall outside the support window.
+    index = bisect_right(times, target) - 1
+    return None if not path or index < 0 else path[index][1]
 
 
 def _nearest_pair(path: list[tuple[datetime, float]], target: datetime) -> tuple[datetime, float]:
@@ -661,7 +664,13 @@ def _nearest_pair(path: list[tuple[datetime, float]], target: datetime) -> tuple
 def _segment(
     path: list[tuple[datetime, float]], times: list[datetime], start: datetime, end: datetime
 ) -> list[tuple[datetime, float]]:
-    return path[bisect_left(times, start) : bisect_left(times, end) + 1]
+    if not path:
+        return []
+    # Carry the last known quote into the interval. An event-driven order book
+    # may be unchanged for a short horizon; that means a flat as-of price, not
+    # an unknown outcome and not permission to take the next future snapshot.
+    start_index = max(0, bisect_right(times, start) - 1)
+    return path[start_index : bisect_right(times, end)]
 
 
 def _id(*parts: Any) -> str:

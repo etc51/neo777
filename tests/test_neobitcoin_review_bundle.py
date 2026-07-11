@@ -14,6 +14,7 @@ import zstandard
 from neo_trader.neobitcoin_research.archive import ArchiveValidationError
 from neo_trader.neobitcoin_research.review_bundle import (
     DATASETS,
+    _enrich_candle_features,
     create_neobitcoin_review_bundle,
 )
 from neo_trader.neobitcoin_research.review_datasets import build_review_datasets
@@ -69,6 +70,10 @@ def _source(root: Path, *, token: str | None = None) -> None:
                 "asks": [{"price": 100.1, "quantity": 10.0}],
             }
         )
+    path = [
+        {"exchange_ts": start + timedelta(seconds=index), "mid_price": 100 + index / 100_000}
+        for index in range(42 * 60)
+    ]
     raw["raw_orderbook"] = pa.Table.from_pylist(books, schema=RAW_SCHEMAS["raw_orderbook"])
     raw["raw_trades"] = pa.Table.from_pylist(
         [
@@ -216,3 +221,41 @@ def test_review_bundle_rejects_token_material(tmp_path: Path) -> None:
         )
 
     assert not list((tmp_path / "review_bundles").glob("*.tar.zst"))
+
+
+def test_candle_features_are_completed_and_lookahead_safe(tmp_path: Path) -> None:
+    feature_ts = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    paths: dict[str, Path] = {}
+    for minutes in (1, 5, 15):
+        candles = []
+        for index in range(15):
+            start = feature_ts - timedelta(minutes=minutes * (15 - index))
+            candles.append(
+                _common(f"candle-{minutes}-{index}", start)
+                | {
+                    "candle_start": start,
+                    "candle_end": start + timedelta(minutes=minutes),
+                    "open": 100.0 + index,
+                    "high": 102.0 + index,
+                    "low": 99.0 + index,
+                    "close": 101.0 + index,
+                    "volume": 1000.0 + index,
+                    "is_complete": True,
+                    "source_timeframe": f"{minutes}m",
+                    "is_backfilled": True,
+                }
+            )
+        path = tmp_path / f"candles_{minutes}m.parquet"
+        pq.write_table(
+            pa.Table.from_pylist(candles, schema=RAW_SCHEMAS[f"candles_{minutes}m"]), path
+        )
+        paths[f"candles_{minutes}m"] = path
+
+    features: list[dict[str, object]] = [{"timestamp": feature_ts}]
+    _enrich_candle_features(features, paths)
+
+    assert features[0]["feature_ready"] is True
+    assert features[0]["missing_reason"] is None
+    for minutes in (1, 5, 15):
+        assert features[0][f"atr_{minutes}m"] == pytest.approx(3.0)
+        assert features[0][f"candle_volume_{minutes}m"] == 1014.0

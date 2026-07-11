@@ -16,6 +16,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -148,16 +149,17 @@ def create_neobitcoin_review_bundle(
     destination = Path(output_dir).resolve() if output_dir else base / "review_bundles"
     destination.mkdir(parents=True, exist_ok=True)
     current = _utc(now or datetime.now(UTC))
-    try:
-        source = _discover_source(base)
-    except ArchiveValidationError:
+    if (base / "active" / "raw").exists() or (base / "raw").exists():
         source = _prepare_source(
             base,
             now=current,
             candidate_window_minutes=candidate_window_minutes,
             max_outcome_horizon_minutes=max_outcome_horizon_minutes,
             candle_context_hours=candle_context_hours,
+            token_files=token_files,
         )
+    else:
+        source = _discover_source(base)
     tables = {name: _read_dataset(source, name) for name in DATASETS}
     t0, t1 = _select_window(
         tables,
@@ -286,6 +288,7 @@ def _prepare_source(
     candidate_window_minutes: int,
     max_outcome_horizon_minutes: int,
     candle_context_hours: int,
+    token_files: tuple[Path | str, ...],
 ) -> Path:
     """Integrate the local raw and counterfactual review builders."""
 
@@ -325,16 +328,49 @@ def _prepare_source(
     if not signal_paths:
         signal_paths = sorted((root / "compacted" / "candidate_events").rglob("*.parquet"))
     signals: dict[str, str] = {}
+    directional_signal_times: list[datetime] = []
     for path in signal_paths:
         for row in pq.read_table(path).to_pylist():
             feature_id = str(row.get("feature_snapshot_id") or "")
             raw_signal = row.get("raw_signal")
             if feature_id and raw_signal:
                 signals[feature_id] = str(raw_signal)
+                if str(raw_signal) in {"LONG", "SHORT"}:
+                    directional_signal_times.append(
+                        _timestamp_value(row.get("timestamp") or row.get("recorded_at"))
+                    )
     for row in feature_rows:
         feature_id = str(row.get("feature_snapshot_id") or row.get("raw_event_id") or "")
         if feature_id in signals:
             row["raw_signal"] = signals[feature_id]
+    window_has_signal = any(
+        row.get("raw_signal") in {"LONG", "SHORT"}
+        and extraction.window.candidate_start
+        <= _timestamp_value(row.get("timestamp") or row.get("recorded_at"))
+        <= extraction.window.candidate_end
+        for row in feature_rows
+    )
+    mature_cutoff = now - timedelta(minutes=max_outcome_horizon_minutes)
+    mature_signals = [
+        timestamp for timestamp in directional_signal_times if timestamp <= mature_cutoff
+    ]
+    if not window_has_signal and mature_signals:
+        # A quiet latest window can contain only rejected NO_TRADE rows. Walk
+        # back to the latest mature directional signal so the review bundle
+        # includes one real accepted side and its rejected counterfactual.
+        selection_now = max(mature_signals) + timedelta(
+            minutes=max_outcome_horizon_minutes + 1
+        )
+        extraction = extract_review_raw(
+            raw_root,
+            output,
+            now=min(now, selection_now),
+            candidate_window_minutes=candidate_window_minutes,
+            max_outcome_horizon_minutes=max_outcome_horizon_minutes,
+            candle_context_hours=candle_context_hours,
+        )
+    _backfill_review_candles(extraction, token_files)
+    _enrich_candle_features(feature_rows, extraction.paths)
     price_path = (
         pq.read_table(extraction.paths["raw_orderbook"])
         .select(["exchange_ts", "mid_price"])
@@ -364,6 +400,157 @@ def _prepare_source(
         compression="zstd",
     )
     return data
+
+
+def _backfill_review_candles(
+    extraction: Any, token_files: tuple[Path | str, ...]
+) -> None:
+    """Replace stream candle replays with a complete local readonly REST backfill."""
+
+    from neo_trader.neobitcoin_research.review_raw import RAW_SCHEMAS
+    from neo_trader.neobitcoin_research.safety import TBankTokenFileError, load_tbank_token
+    from neo_trader.neobitcoin_research.tbank import TBankResearchClient
+
+    client = None
+    for token_file in token_files:
+        try:
+            load_tbank_token(token_file)
+            client = TBankResearchClient.from_token_file(token_file)
+            break
+        except TBankTokenFileError:
+            continue
+    if client is None:
+        raise ArchiveValidationError(
+            "a valid local T-Bank token file is required for candle warmup"
+        )
+
+    books = pq.read_table(extraction.paths["raw_orderbook"])
+    if not books.num_rows:
+        raise ArchiveValidationError("raw order book is empty")
+    common = books.slice(0, 1).to_pylist()[0]
+    instrument_uid = str(common["instrument_uid"])
+    interval_names = {
+        1: "CANDLE_INTERVAL_1_MIN",
+        5: "CANDLE_INTERVAL_5_MIN",
+        15: "CANDLE_INTERVAL_15_MIN",
+    }
+    received = datetime.now(UTC)
+    try:
+        for minutes, interval_name in interval_names.items():
+            payloads = client.get_candles(
+                instrument_uid,
+                from_time=extraction.window.support_start,
+                to_time=extraction.window.support_end,
+                interval=interval_name,
+            )
+            rows: list[dict[str, Any]] = []
+            for payload in payloads:
+                start = _timestamp_value(payload["time"])
+                end = start + timedelta(minutes=minutes)
+                if not extraction.window.support_start <= start <= extraction.window.support_end:
+                    continue
+                event_id = hashlib.sha256(
+                    f"review-candle|{instrument_uid}|{minutes}|{start.isoformat()}".encode()
+                ).hexdigest()
+                rows.append(
+                    {
+                        "schema_version": "schema-v3",
+                        "event_id": event_id,
+                        "instrument_uid": instrument_uid,
+                        "instrument_ticker": common["instrument_ticker"],
+                        "exchange_ts": start,
+                        "receive_ts": received,
+                        "processing_ts": received,
+                        "session_id": common["session_id"],
+                        "collector_instance_id": common["collector_instance_id"],
+                        "source": "tbank_get_candles_local_backfill",
+                        "code_commit": common["code_commit"],
+                        "config_hash": common["config_hash"],
+                        "data_quality_flags": ["historical_backfill"],
+                        "candle_start": start,
+                        "candle_end": end,
+                        "open": _quotation_number(payload["open"]),
+                        "high": _quotation_number(payload["high"]),
+                        "low": _quotation_number(payload["low"]),
+                        "close": _quotation_number(payload["close"]),
+                        "volume": float(str(payload.get("volume") or 0)),
+                        "is_complete": bool(payload.get("isComplete")) or end <= received,
+                        "source_timeframe": f"{minutes}m",
+                        "is_backfilled": True,
+                    }
+                )
+            if not rows:
+                raise ArchiveValidationError(f"T-Bank returned no {minutes}m candle warmup")
+            pq.write_table(
+                pa.Table.from_pylist(rows, schema=RAW_SCHEMAS[f"candles_{minutes}m"]),
+                extraction.paths[f"candles_{minutes}m"],
+                compression="zstd",
+                use_dictionary=True,
+                write_statistics=True,
+            )
+    finally:
+        client.close()
+
+
+def _quotation_number(value: Any) -> float:
+    if isinstance(value, Mapping):
+        units = float(str(value.get("units", 0)))
+        nanos = float(str(value.get("nano", 0)))
+        return units + nanos / 1_000_000_000
+    return float(value)
+
+
+def _enrich_candle_features(
+    feature_rows: list[dict[str, Any]], raw_paths: Mapping[str, Path]
+) -> None:
+    """Fill candle features from completed candles without using future data."""
+
+    timelines: dict[int, list[dict[str, Any]]] = {}
+    for minutes in (1, 5, 15):
+        table = pq.read_table(raw_paths[f"candles_{minutes}m"])
+        # Reconnects can replay the same historical candle. Keep the latest
+        # received copy, then order the unique exchange-time candles.
+        unique: dict[datetime, dict[str, Any]] = {}
+        for candle in sorted(table.to_pylist(), key=lambda row: _utc(row["receive_ts"])):
+            if candle.get("is_complete"):
+                unique[_utc(candle["candle_start"])] = candle
+        timelines[minutes] = sorted(unique.values(), key=lambda row: _utc(row["candle_start"]))
+
+    required = tuple(
+        name
+        for minutes in (1, 5, 15)
+        for name in (f"atr_{minutes}m", f"candle_volume_{minutes}m")
+    )
+    for feature in feature_rows:
+        feature_ts = _timestamp_value(
+            feature.get("exchange_ts")
+            or feature.get("exchange_timestamp")
+            or feature.get("timestamp")
+            or feature.get("recorded_at")
+        )
+        for minutes, candles in timelines.items():
+            available = [row for row in candles if _utc(row["candle_end"]) <= feature_ts]
+            if not available:
+                continue
+            feature[f"candle_volume_{minutes}m"] = float(available[-1]["volume"])
+            true_ranges: list[float] = []
+            for index, candle in enumerate(available):
+                high = float(candle["high"])
+                low = float(candle["low"])
+                previous_close = (
+                    float(available[index - 1]["close"]) if index else float(candle["open"])
+                )
+                true_ranges.append(
+                    max(high - low, abs(high - previous_close), abs(low - previous_close))
+                )
+            feature[f"atr_{minutes}m"] = sum(true_ranges[-14:]) / min(14, len(true_ranges))
+        missing = [name for name in required if feature.get(name) is None]
+        source_ready = bool(feature.get("feature_ready", True))
+        feature["feature_ready"] = source_ready and not missing
+        if missing:
+            feature["missing_reason"] = "missing completed candle features: " + ", ".join(missing)
+        else:
+            feature["missing_reason"] = None
 
 
 def _read_dataset(source: Path, dataset: str) -> pa.Table:
@@ -633,6 +820,23 @@ def _validate_tables(
         errors.append("shadow exits missing")
     if tables["raw_orderbook"].num_rows == 0:
         errors.append("raw orderbook missing")
+    book_rows = sorted(
+        tables["raw_orderbook"].select(["receive_ts", "session_id"]).to_pylist(),
+        key=lambda row: _utc(row["receive_ts"]),
+    )
+    reconnect_count = sum(
+        left["session_id"] != right["session_id"]
+        for left, right in zip(book_rows, book_rows[1:], strict=False)
+    )
+    candidate_books = [
+        row for row in book_rows if t0 <= _utc(row["receive_ts"]) <= t1
+    ]
+    candidate_reconnect_count = sum(
+        left["session_id"] != right["session_id"]
+        for left, right in zip(candidate_books, candidate_books[1:], strict=False)
+    )
+    if candidate_reconnect_count:
+        errors.append(f"candidate window contains {candidate_reconnect_count} reconnects")
     # In-memory secret scan catches token material before files are written.
     for dataset, table in tables.items():
         body = table.to_pydict().__repr__().encode("utf-8", errors="ignore")
@@ -655,7 +859,8 @@ def _validate_tables(
         "duplicate_counts": duplicate_counts,
         "foreign_keys": fk_results,
         "gap_count": 0,
-        "reconnect_count": 0,
+        "reconnect_count": reconnect_count,
+        "candidate_reconnect_count": candidate_reconnect_count,
     }
 
 
@@ -672,6 +877,12 @@ def _build_manifest(
     if validation["status"] != "PASS":
         raise ArchiveValidationError("review validation failed: " + "; ".join(validation["errors"]))
     files: list[dict[str, Any]] = []
+    exchange_values: list[datetime] = []
+    receive_values: list[datetime] = []
+    code_commits: set[str] = set()
+    config_hashes: set[str] = set()
+    collector_instances: set[str] = set()
+    quality_flags: dict[str, int] = {}
     for dataset, table in tables.items():
         path = work / "data" / f"{dataset}.parquet"
         nulls = {
@@ -679,6 +890,25 @@ def _build_manifest(
             for name in table.column_names
         }
         timestamp_values: list[datetime] = []
+        for column, timestamp_target in (
+            ("exchange_ts", exchange_values),
+            ("receive_ts", receive_values),
+        ):
+            if column in table.column_names and table.num_rows:
+                timestamp_target.extend(
+                    _utc(value) for value in table[column].to_pylist() if value is not None
+                )
+        for column, text_target in (
+            ("code_commit", code_commits),
+            ("config_hash", config_hashes),
+            ("collector_instance_id", collector_instances),
+        ):
+            if column in table.column_names:
+                text_target.update(str(value) for value in table[column].to_pylist() if value)
+        if "data_quality_flags" in table.column_names:
+            for values in table["data_quality_flags"].to_pylist():
+                for flag in values or []:
+                    quality_flags[str(flag)] = quality_flags.get(str(flag), 0) + 1
         for name in TIMESTAMP_COLUMNS:
             if name in table.column_names and table.num_rows:
                 minimum, maximum = pc.min_max(table[name]).as_py().values()
@@ -708,11 +938,34 @@ def _build_manifest(
         "candidate_window_end": t1.isoformat(),
         "support_data_start": support_start.isoformat(),
         "support_data_end": support_end.isoformat(),
+        "exchange_timestamp_min": min(exchange_values).isoformat(),
+        "exchange_timestamp_max": max(exchange_values).isoformat(),
+        "receive_timestamp_min": min(receive_values).isoformat(),
+        "receive_timestamp_max": max(receive_values).isoformat(),
+        "code_commits": sorted(code_commits),
+        "config_hashes": sorted(config_hashes),
+        "collector_instances": sorted(collector_instances),
         "file_count": 20,
         "dataset_file_count": 15,
         "rows_by_dataset": {name: table.num_rows for name, table in tables.items()},
+        "bytes_by_dataset": {
+            item["dataset"]: item["bytes"] for item in files if item.get("dataset")
+        },
         "reconnect_count": validation["reconnect_count"],
+        "candidate_reconnect_count": validation["candidate_reconnect_count"],
         "gap_count": validation["gap_count"],
+        "skipped_identical_orderbooks": sum(
+            bool(value) for value in tables["raw_orderbook"]["is_duplicate_snapshot"].to_pylist()
+        ),
+        "data_quality_summary": quality_flags,
+        "duplicate_counts": validation["duplicate_counts"],
+        "foreign_key_results": validation["foreign_keys"],
+        "horizons": validation["horizons"],
+        "stop_ticks": validation["stops"],
+        "sides": validation["sides"],
+        "decisions": validation["decisions"],
+        "shadow_stop_simulations": tables["shadow_stop_results"].num_rows,
+        "shadow_exit_simulations": tables["shadow_exit_results"].num_rows,
         "validation": "PASS",
         "files": files,
     }
@@ -859,6 +1112,14 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         raise ArchiveValidationError("naive timestamp is forbidden")
     return value.astimezone(UTC)
+
+
+def _timestamp_value(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return _utc(value)
+    if isinstance(value, str):
+        return _utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    raise ArchiveValidationError(f"invalid timestamp value: {value!r}")
 
 
 def _name_ts(value: datetime) -> str:

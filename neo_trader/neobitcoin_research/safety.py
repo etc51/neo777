@@ -34,6 +34,7 @@ ALLOWED_RPC_PATHS: Final = frozenset(
         f"{RPC_PREFIX}InstrumentsService/TradingSchedules",
         f"{RPC_PREFIX}MarketDataService/GetOrderBook",
         f"{RPC_PREFIX}MarketDataService/GetTradingStatus",
+        f"{RPC_PREFIX}MarketDataService/GetCandles",
         f"{RPC_PREFIX}MarketDataStreamService/MarketDataStream",
     }
 )

@@ -295,9 +295,11 @@ def _build_rows(
                     "low": _quotation(payload.get("low")),
                     "close": _quotation(payload.get("close")),
                     "volume": float(payload.get("volume") or 0),
-                    "is_complete": bool(
-                        payload.get("is_complete", candle_end <= record["receive_ts"])
-                    ),
+                    # Some stream snapshots report ``is_complete=false``
+                    # even for historical candles. Exchange-time closure is
+                    # authoritative once the candle end precedes receipt.
+                    "is_complete": bool(payload.get("is_complete"))
+                    or candle_end <= receive_ts,
                     "source_timeframe": f"{interval}m",
                     "is_backfilled": candle_end < receive_ts - timedelta(minutes=interval),
                 }
