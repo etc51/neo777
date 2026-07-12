@@ -80,6 +80,8 @@ def test_windows_autostart_uses_task_scheduler_not_codex() -> None:
     )
     assert "Register-ScheduledTask" in script
     assert "MultipleInstances IgnoreNew" in script
+    assert ".venv\\Scripts\\pythonw.exe" in script
+    assert "pythonw.exe is required for hidden background tasks" in script
     assert "neobitcoin_research.local_control _worker" in script
     assert "neobitcoin_research.local_control start" in script
     assert "RepetitionInterval (New-TimeSpan -Minutes 1)" in script

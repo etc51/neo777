@@ -6,9 +6,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$Python = Join-Path $Repo ".venv\Scripts\python.exe"
+$Python = Join-Path $Repo ".venv\Scripts\pythonw.exe"
 if (-not (Test-Path -LiteralPath $Python)) {
-    $Python = (Get-Command python -ErrorAction Stop).Source
+    $ConsolePython = (Get-Command python -ErrorAction Stop).Source
+    $Python = Join-Path (Split-Path -Parent $ConsolePython) "pythonw.exe"
+    if (-not (Test-Path -LiteralPath $Python)) {
+        throw "pythonw.exe is required for hidden background tasks"
+    }
 }
 
 $Arguments = '-m neo_trader.neobitcoin_research.local_control _worker'
