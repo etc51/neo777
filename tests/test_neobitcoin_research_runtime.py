@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ from neo_trader.neobitcoin_research.config import ResearchConfig
 from neo_trader.neobitcoin_research.runtime import ResearchRuntime
 from neo_trader.neobitcoin_research.storage import ResearchStorage
 from neo_trader.neobitcoin_research.tbank import (
+    JsonValue,
     TBankInstrumentMetadata,
     TBankStreamRecord,
 )
@@ -41,7 +43,9 @@ class _FakeClient:
             trading_schedules=(),
         )
 
-    async def stream_market_data(self, _instrument: object):
+    async def stream_market_data(
+        self, _instrument: object
+    ) -> AsyncIterator[TBankStreamRecord]:
         for record in self.records:
             yield record
 
@@ -49,12 +53,26 @@ class _FakeClient:
         self.closed = True
 
 
+class _ReconnectClient(_FakeClient):
+    def __init__(self, record: TBankStreamRecord) -> None:
+        super().__init__((record,))
+        self.stream_calls = 0
+
+    async def stream_market_data(
+        self, _instrument: object
+    ) -> AsyncIterator[TBankStreamRecord]:
+        self.stream_calls += 1
+        if self.stream_calls == 1:
+            return
+        yield self.records[0]
+
+
 def _orderbook_record(now: datetime) -> TBankStreamRecord:
-    bids = [
+    bids: list[JsonValue] = [
         {"price": str(Decimal("100") - Decimal(index) / 10), "quantity": 100 + index}
         for index in range(20)
     ]
-    asks = [
+    asks: list[JsonValue] = [
         {"price": str(Decimal("100.1") + Decimal(index) / 10), "quantity": 90 + index}
         for index in range(20)
     ]
@@ -116,4 +134,30 @@ def test_runtime_writes_raw_features_all_execution_models_and_report(tmp_path: P
     assert (config.data_root / "research.duckdb").is_file()
     assert list(config.reports_root.glob("*.json"))
     assert list(config.reports_root.glob("*.md"))
+    storage.close()
+
+
+def test_runtime_reconnects_when_stream_ends_and_resumes_collection(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 10, 10, tzinfo=UTC)
+    client = _ReconnectClient(_orderbook_record(now))
+    config = ResearchConfig(
+        data_root=tmp_path / "data",
+        reports_root=tmp_path / "reports",
+        requested_depth=20,
+        minimum_usable_depth=20,
+        position_sizes_rub=(10_000,),
+        latencies_ms=(0,),
+        horizons_seconds=(5,),
+        reconnect_initial_seconds=0.001,
+        reconnect_max_seconds=0.002,
+    )
+    storage = ResearchStorage(config.data_root, state_db_path=config.data_root / "state.sqlite")
+    runtime = ResearchRuntime(config=config, client=client, storage=storage)  # type: ignore[arg-type]
+
+    asyncio.run(runtime.run(max_events=1))
+
+    assert client.stream_calls == 2
+    assert runtime.reconnects == 1
+    assert runtime.events_seen == 1
+    assert runtime.valid_books == 1
     storage.close()

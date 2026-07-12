@@ -81,6 +81,11 @@ def test_windows_autostart_uses_task_scheduler_not_codex() -> None:
     assert "Register-ScheduledTask" in script
     assert "MultipleInstances IgnoreNew" in script
     assert "neobitcoin_research.local_control _worker" in script
+    assert "neobitcoin_research.local_control start" in script
+    assert "RepetitionInterval (New-TimeSpan -Minutes 1)" in script
+    assert "AllowStartIfOnBatteries" in script
+    assert "DontStopIfGoingOnBatteries" in script
+    assert "Watchdog" in script
     assert "Codex" not in script
     assert "ssh" not in script.lower()
 

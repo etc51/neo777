@@ -1,5 +1,6 @@
 param(
     [string]$TaskName = "Neobitcoin Local Research Collector",
+    [string]$WatchdogTaskName = "Neobitcoin Local Research Collector Watchdog",
     [switch]$StartNow
 )
 
@@ -18,6 +19,8 @@ $Settings = New-ScheduledTaskSettingsSet `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
     -StartWhenAvailable
 $Principal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
@@ -33,7 +36,33 @@ Register-ScheduledTask `
     -Description "Local read-only T-Bank Neobitcoin research collector" `
     -Force | Out-Null
 
+$WatchdogArguments = '-m neo_trader.neobitcoin_research.local_control start'
+$WatchdogAction = New-ScheduledTaskAction `
+    -Execute $Python `
+    -Argument $WatchdogArguments `
+    -WorkingDirectory $Repo
+$WatchdogTrigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+$WatchdogSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable
+Register-ScheduledTask `
+    -TaskName $WatchdogTaskName `
+    -Action $WatchdogAction `
+    -Trigger $WatchdogTrigger `
+    -Settings $WatchdogSettings `
+    -Principal $Principal `
+    -Description "Watchdog for the local read-only Neobitcoin collector" `
+    -Force | Out-Null
+
 Write-Output "installed=$TaskName"
+Write-Output "watchdog_installed=$WatchdogTaskName"
 Write-Output "data_root=C:\Users\HONOR\Documents\neobitcoin_research"
 if ($StartNow) {
     Start-ScheduledTask -TaskName $TaskName
