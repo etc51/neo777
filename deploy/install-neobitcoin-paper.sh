@@ -88,6 +88,17 @@ install -d -o "${USER_NAME}" -g "${USER_NAME}" -m 0750 \
   "${DATA_DIR}/logs"
 install -d -o "${USER_NAME}" -g "${ARCHIVE_GROUP}" -m 2750 \
   "${DATA_DIR}/daily_archives"
+chown -R "${USER_NAME}:${USER_NAME}" \
+  "${DATA_DIR}/state" \
+  "${DATA_DIR}/active" \
+  "${DATA_DIR}/parquet" \
+  "${DATA_DIR}/event_windows" \
+  "${DATA_DIR}/delivery_outbox" \
+  "${DATA_DIR}/delivered" \
+  "${DATA_DIR}/quarantine" \
+  "${DATA_DIR}/reports" \
+  "${DATA_DIR}/logs"
+chown -R "${USER_NAME}:${ARCHIVE_GROUP}" "${DATA_DIR}/daily_archives"
 
 stage=$(mktemp -d "${RELEASES_DIR}/.stage.XXXXXX")
 cleanup_stage() {
@@ -239,7 +250,7 @@ ln -sfn "${release}" "${TARGET_DIR}.new"
 mv -Tf "${TARGET_DIR}.new" "${TARGET_DIR}"
 
 deployment_ok=true
-if ! /usr/bin/env -i \
+if ! runuser -u "${USER_NAME}" -- /usr/bin/env -i \
      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
      TZ=Europe/Moscow \
      PAPER_ONLY=true \
