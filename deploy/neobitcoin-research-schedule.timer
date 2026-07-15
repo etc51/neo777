@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile BTCUSDperpA collection with its live schedule every minute
+
+[Timer]
+OnBootSec=20s
+OnCalendar=*-*-* *:*:00 Europe/Moscow
+Persistent=true
+AccuracySec=1s
+Unit=neobitcoin-research-schedule.service
+
+[Install]
+WantedBy=timers.target

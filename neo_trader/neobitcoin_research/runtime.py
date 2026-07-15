@@ -599,13 +599,14 @@ class ResearchRuntime:
             return
         self._closed = True
         try:
-            self.storage.compact_all()
-            self.storage.refresh_duckdb_catalog()
-            generate_daily_research_report(
-                self.storage,
-                datetime.now(UTC).date(),
-                reports_dir=self.config.reports_root,
-            )
+            if self.config.compact_closed_hours:
+                self.storage.compact_all()
+                self.storage.refresh_duckdb_catalog()
+                generate_daily_research_report(
+                    self.storage,
+                    datetime.now(UTC).date(),
+                    reports_dir=self.config.reports_root,
+                )
             self.storage.append_data_quality_metric(
                 {
                     "timestamp": datetime.now(UTC).isoformat(),

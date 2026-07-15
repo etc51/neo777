@@ -98,3 +98,13 @@ systemctl status neobitcoin-research.service
 
 The installer only manages `neobitcoin-research.service`; it does not stop or
 restart resolver, swarm, universal, production, or paper services.
+
+The research collector is server-only and schedule-driven. The broker reports
+`BTCUSDperpA` as `SPB_FUTURE`, not MOEX: ordinary sessions run 07:00-00:00 MSK
+on weekdays and 10:00-00:00 MSK on weekends/holidays. The schedule controller
+refreshes the instrument calendar every minute and uses a local cache across
+network interruptions. It connects two minutes before the published opening
+so subscriptions are ready for the first event, and keeps a one-minute closing
+grace for the final exchange timestamp. At 00:05 MSK the archive job publishes a validated
+whole-session ZIP containing only Raw JSONL plus a manifest. SQLite, active
+Parquet and `*.parquet.inprogress` are never included.

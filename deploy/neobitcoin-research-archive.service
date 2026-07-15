@@ -1,0 +1,21 @@
+[Unit]
+Description=Build and validate the completed Neobitcoin session archive
+After=network-online.target neobitcoin-research-schedule.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/neobitcoin-research
+EnvironmentFile=/etc/neobitcoin-research/research.env
+ExecStartPre=/usr/bin/systemctl stop neobitcoin-research.service
+ExecStart=/opt/neobitcoin-research/.venv/bin/python scripts/create_neobitcoin_session_archive.py --token-file /etc/neobitcoin-research/tbank-token.txt
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/neobitcoin-research
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=neobitcoin-research-archive

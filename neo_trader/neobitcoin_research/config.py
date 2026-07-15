@@ -113,6 +113,11 @@ class ResearchConfig:
             token_path=Path(token_path) if token_path else None,
             instrument_query=source.get("NEOBITCOIN_RESEARCH_INSTRUMENT", "Neo Bitcoin"),
             requested_depth=int(source.get("NEOBITCOIN_RESEARCH_DEPTH", "50")),
+            stale_after_seconds=float(source.get("NEOBITCOIN_RESEARCH_STALE_SECONDS", "180")),
+            compact_closed_hours=source.get(
+                "NEOBITCOIN_RESEARCH_COMPACT_ON_SHUTDOWN", "true"
+            ).lower()
+            not in SAFE_FALSE,
             experiment_id=source.get("NEOBITCOIN_RESEARCH_EXPERIMENT_ID", "directional-edge-v1"),
             daily_holding_fee_annual_rate=float(holding_fee) if holding_fee else None,
             real_orders_enabled=source.get("REAL_ORDERS_ENABLED", "false").lower()

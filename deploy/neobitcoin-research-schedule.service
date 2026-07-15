@@ -1,0 +1,21 @@
+[Unit]
+Description=Apply the current BTCUSDperpA server collection schedule
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/neobitcoin-research
+EnvironmentFile=/etc/neobitcoin-research/research.env
+ExecStart=/opt/neobitcoin-research/.venv/bin/python scripts/neobitcoin_server_schedule.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/neobitcoin-research
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=neobitcoin-research-schedule

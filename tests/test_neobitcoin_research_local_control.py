@@ -92,13 +92,10 @@ def test_windows_autostart_uses_task_scheduler_not_codex() -> None:
     assert "ssh" not in script.lower()
 
 
-def test_cmd_lifecycle_commands_use_the_safe_local_controller() -> None:
-    for name, action in (
-        ("neobitcoin-start.cmd", "start"),
-        ("neobitcoin-stop.cmd", "stop"),
-        ("neobitcoin-status.cmd", "status"),
+def test_local_cmd_lifecycle_shortcuts_are_removed_for_server_only_collection() -> None:
+    for name in (
+        "neobitcoin-start.cmd",
+        "neobitcoin-stop.cmd",
+        "neobitcoin-status.cmd",
     ):
-        script = Path("scripts", name).read_text(encoding="utf-8")
-        assert f"local_control {action}" in script
-        assert "ssh" not in script.lower()
-        assert "codex" not in script.lower()
+        assert not Path("scripts", name).exists()

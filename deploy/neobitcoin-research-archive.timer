@@ -1,0 +1,11 @@
+[Unit]
+Description=Archive each completed BTCUSDperpA session on the server
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 Europe/Moscow
+Persistent=true
+AccuracySec=1s
+Unit=neobitcoin-research-archive.service
+
+[Install]
+WantedBy=timers.target
