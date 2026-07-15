@@ -18,6 +18,8 @@ EnvironmentFile=/etc/neobitcoin-paper/paper.env
 Environment=PAPER_ONLY=true
 Environment=NEOBITCOIN_PAPER_DATA=/var/lib/neobitcoin-paper
 Environment=NEOBITCOIN_PAPER_TOKEN_FILE=%d/tbank-token.txt
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
 Environment=NEOBITCOIN_PAPER_HEALTH_HOST=127.0.0.1
 Environment=NEOBITCOIN_PAPER_HEALTH_PORT=8787
 LoadCredential=tbank-token.txt:/etc/neobitcoin-paper/tbank-token

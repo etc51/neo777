@@ -59,6 +59,11 @@ def test_main_unit_is_paper_only_loopback_and_restart_unlimited() -> None:
         "/etc/neobitcoin-paper/paper.env"
     )
     assert "PAPER_ONLY=true" in service["Environment"]
+    assert "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" in service["Environment"]
+    assert (
+        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt"
+        in service["Environment"]
+    )
     assert "NEOBITCOIN_PAPER_HEALTH_HOST=127.0.0.1" in service["Environment"]
     assert "NEOBITCOIN_PAPER_HEALTH_PORT=8787" in service["Environment"]
     assert _one(unit, "Service", "LoadCredential") == (

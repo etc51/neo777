@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from neo_trader.neobitcoin_research import tbank as tbank_module
 from neo_trader.neobitcoin_research.safety import (
     TBankRpcBlockedError,
     TBankToken,
@@ -187,6 +189,29 @@ def test_token_loader_accepts_one_labeled_token(tmp_path: Path) -> None:
     secret = load_tbank_token(token_path)
 
     assert secret.get_secret_value() == FAKE_TOKEN
+
+
+def test_default_rest_transport_uses_verified_system_ca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(tbank_module.httpx, "Client", FakeHttpClient)
+
+    client = TBankResearchClient(TBankToken(FAKE_TOKEN))
+    client.close()
+
+    context = captured["verify"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
 
 
 def test_rpc_allowlist_is_unconditional_for_live_flags(

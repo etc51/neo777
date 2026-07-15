@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
+import ssl
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
@@ -173,7 +174,10 @@ class _ReadonlyRestTransport:
     ) -> None:
         self.__token = token
         self.__base_url = base_url.rstrip("/")
-        self.__http_client = http_client or httpx.Client(timeout=timeout_seconds)
+        self.__http_client = http_client or httpx.Client(
+            timeout=timeout_seconds,
+            verify=ssl.create_default_context(),
+        )
         self.__owns_client = http_client is None
 
     def call(self, rpc_path: str, payload: Mapping[str, object]) -> object:
