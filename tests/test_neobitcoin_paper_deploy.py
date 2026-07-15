@@ -147,6 +147,7 @@ def test_installer_is_atomic_runs_tests_and_migrations_and_can_roll_back() -> No
         "CONFIG_DIR=/etc/neobitcoin-paper",
         "USER_NAME=neopaper",
         "ARCHIVE_GROUP=neoarchive",
+        'chmod -R u+rwX,go+rX,go-w "${release}"',
         'install -d -o "${USER_NAME}" -g "${ARCHIVE_GROUP}" -m 2750',
         "chmod 0600",
         "tests/test_neobitcoin_paper_*.py",

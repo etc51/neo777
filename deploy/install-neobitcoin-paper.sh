@@ -130,7 +130,7 @@ mv "${stage}" "${release}"
 stage=
 trap - EXIT
 chown -R root:root "${release}"
-chmod -R go-w "${release}"
+chmod -R u+rwX,go+rX,go-w "${release}"
 chmod 0755 "${release}"
 
 if [[ ! -f ${ENV_FILE} ]]; then
