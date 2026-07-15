@@ -288,3 +288,28 @@ def test_delivery_and_acknowledgement_use_durable_outbox_without_network(
         "PAPER_ONLY",
     )
     assert code == 0 and acknowledged["status"] == "ACKNOWLEDGED"
+
+
+def test_delivery_is_successful_idle_before_first_oos_archive(tmp_path: Path) -> None:
+    root = tmp_path / "paper"
+    _run(root, "migrate", "--confirm", "PAPER_ONLY")
+    credentials = root / "credentials"
+    credentials.mkdir(parents=True)
+    (credentials / "task-id").write_text("existing-task", encoding="utf-8")
+
+    code, delivery, text = _run(
+        root,
+        "deliver",
+        "--confirm",
+        "PAPER_ONLY",
+    )
+
+    assert code == 0
+    assert delivery == {
+        "archive_id": None,
+        "delivery_id": None,
+        "ok": True,
+        "results": [],
+        "status": "IDLE_NO_VALIDATED_ARCHIVE",
+    }
+    assert "existing-task" not in text

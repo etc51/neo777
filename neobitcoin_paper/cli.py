@@ -549,6 +549,13 @@ def _deliver(config: PaperConfig, archive_id: str | None) -> dict[str, object]:
         raise CLIError("configured task ID is missing")
     with _write_state(config) as state:
         selected = archive_id or _latest_deliverable_archive_id(state, thread_id)
+        if selected is None:
+            return {
+                "archive_id": None,
+                "delivery_id": None,
+                "results": [],
+                "status": "IDLE_NO_VALIDATED_ARCHIVE",
+            }
         row = validated_archive_row(state, selected)
         validation = json.loads(str(row["validation_json"]))
         if validation.get("test_archive"):
@@ -581,7 +588,9 @@ def _acknowledge_delivery(config: PaperConfig, delivery_id: str) -> dict[str, ob
     return {"delivery_id": delivery_id, "status": "ACKNOWLEDGED"}
 
 
-def _latest_deliverable_archive_id(state: PaperStateStore, thread_id: str) -> str:
+def _latest_deliverable_archive_id(
+    state: PaperStateStore, thread_id: str
+) -> str | None:
     rows = state.connection.execute(
         """
         SELECT a.archive_id, a.validation_json
@@ -598,7 +607,7 @@ def _latest_deliverable_archive_id(state: PaperStateStore, thread_id: str) -> st
         validation = json.loads(str(row["validation_json"]))
         if not validation.get("test_archive"):
             return str(row["archive_id"])
-    raise CLIError("no validated non-TEST archive is available")
+    return None
 
 
 def _readonly_archive_row(config: PaperConfig, archive_id: str) -> dict[str, object]:
