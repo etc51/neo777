@@ -19,6 +19,7 @@ from neo_trader.neobitcoin_research.tbank import (
     TBankInstrumentMetadata,
     TBankResearchClient,
     TBankStreamRecord,
+    normalize_security_trading_status,
 )
 
 EXPECTED_UID: Final = "4effa274-4e8f-422c-93ff-04aa34fe8e39"
@@ -27,9 +28,10 @@ EXPECTED_CLASS_CODE: Final = "SPBDMFUT"
 EXPECTED_NAME: Final = "Neo Bitcoin"
 OPEN_TRADING_STATUSES: Final = frozenset(
     {
-        "SECURITY_TRADING_STATUS_NORMAL_TRADING",
-        "SECURITY_TRADING_STATUS_DEALER_NORMAL_TRADING",
-        "SECURITY_TRADING_STATUS_OPENING_PERIOD",
+        "NORMAL_TRADING",
+        "TRADING_AT_CLOSING_AUCTION_PRICE",
+        "DEALER_NORMAL_TRADING",
+        "OPEN",
     }
 )
 
@@ -489,7 +491,7 @@ def _extract_trading_status(payload: Mapping[str, object]) -> str:
         candidates.extend((nested.get("trading_status"), nested.get("tradingStatus")))
     for value in candidates:
         if value is not None and not isinstance(value, Mapping):
-            return str(value)
+            return normalize_security_trading_status(value)
     return "UNKNOWN"
 
 

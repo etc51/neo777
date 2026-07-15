@@ -8,6 +8,7 @@ import ssl
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,7 +36,9 @@ from neo_trader.neobitcoin_research.tbank import (
     build_bidirectional_subscriptions,
     build_subscription_check_request,
     market_data_request_iterator,
+    normalize_security_trading_status,
     require_successful_subscription_ack,
+    to_json_safe_object,
 )
 
 FAKE_TOKEN = "t." + "A1_b-" * 8
@@ -212,6 +215,27 @@ def test_default_rest_transport_uses_verified_system_ca(
     assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
+
+
+def test_numeric_security_status_uses_official_enum_and_unknown_is_closed() -> None:
+    class FakeSecurityTradingStatus(IntEnum):
+        SECURITY_TRADING_STATUS_NORMAL_TRADING = 5
+
+    sdk = SimpleNamespace(SecurityTradingStatus=FakeSecurityTradingStatus)
+
+    assert normalize_security_trading_status(5, sdk_module=sdk) == "NORMAL_TRADING"
+    assert normalize_security_trading_status("5", sdk_module=sdk) == "NORMAL_TRADING"
+    assert (
+        normalize_security_trading_status(
+            FakeSecurityTradingStatus.SECURITY_TRADING_STATUS_NORMAL_TRADING,
+            sdk_module=sdk,
+        )
+        == "NORMAL_TRADING"
+    )
+    assert normalize_security_trading_status(999, sdk_module=sdk) == "UNKNOWN"
+    assert to_json_safe_object(
+        {"trading_status": FakeSecurityTradingStatus.SECURITY_TRADING_STATUS_NORMAL_TRADING}
+    )["trading_status"] == "SECURITY_TRADING_STATUS_NORMAL_TRADING"
 
 
 def test_rpc_allowlist_is_unconditional_for_live_flags(

@@ -579,7 +579,9 @@ class TBankResearchClient:
                 _field(details, "sellAvailableFlag", "sell_available_flag")
             )
             is True,
-            trading_status=_enum_text(_field(status, "tradingStatus", "trading_status")),
+            trading_status=normalize_security_trading_status(
+                _field(status, "tradingStatus", "trading_status")
+            ),
             limit_order_available=_optional_bool(
                 _field(status, "limitOrderAvailableFlag", "limit_order_available_flag")
             )
@@ -975,6 +977,48 @@ def _enum_text(value: object | None) -> str | None:
     return text or None
 
 
+def normalize_security_trading_status(
+    value: object | None,
+    *,
+    sdk_module: ModuleType | object | None = None,
+) -> str:
+    """Return the canonical symbolic T-Invest security trading status.
+
+    The official SDK represents protobuf enums as ``IntEnum`` values in some
+    stream message implementations.  Numeric values are resolved through the
+    installed SDK enum instead of a locally maintained number map.  Unknown
+    values remain fail-closed as ``UNKNOWN``.
+    """
+
+    if value is None or isinstance(value, bool):
+        return "UNKNOWN"
+    name = getattr(value, "name", None)
+    raw = name if isinstance(name, str) else str(value).strip()
+    if raw.isdigit():
+        sdk = sdk_module or _load_official_sdk()
+        enum_type = getattr(sdk, "SecurityTradingStatus", None)
+        if enum_type is None:
+            return "UNKNOWN"
+        try:
+            member = cast(Callable[[int], object], enum_type)(int(raw))
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+        member_name = getattr(member, "name", None)
+        if not isinstance(member_name, str):
+            return "UNKNOWN"
+        raw = member_name
+    normalized = raw.strip().upper().rsplit(".", maxsplit=1)[-1]
+    prefix = "SECURITY_TRADING_STATUS_"
+    if normalized.startswith(prefix):
+        normalized = normalized[len(prefix) :]
+    valid_identifier = all(
+        character.isalnum() or character == "_" for character in normalized
+    )
+    if not normalized or not valid_identifier:
+        return "UNKNOWN"
+    return normalized
+
+
 def _construct_message(
     message_type: object,
     alternatives: Sequence[Mapping[str, object | None]],
@@ -1002,7 +1046,12 @@ def _sdk_enum_or_none(sdk: Any, enum_name: str, member_name: str) -> object | No
 
 
 def _to_json_safe(value: object) -> JsonValue:
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None:
+        return value
+    # IntEnum is also an int, so enum handling must precede primitive handling.
+    if isinstance(value, Enum):
+        return value.name
+    if isinstance(value, str | int | float | bool):
         return value
     if isinstance(value, Decimal):
         return str(value)
@@ -1010,8 +1059,6 @@ def _to_json_safe(value: object) -> JsonValue:
         return _as_utc(value).isoformat()
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
-    if isinstance(value, Enum):
-        return value.name
     if isinstance(value, Mapping):
         return {str(key): _to_json_safe(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
@@ -1078,6 +1125,7 @@ __all__ = [
     "build_bidirectional_subscriptions",
     "build_subscription_check_request",
     "market_data_request_iterator",
+    "normalize_security_trading_status",
     "require_successful_subscription_ack",
     "to_json_safe_object",
 ]

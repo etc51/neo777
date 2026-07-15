@@ -18,6 +18,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from neo_trader.neobitcoin_research.tbank import normalize_security_trading_status
+
 from .archive import (
     ArchiveBuildRequest,
     BuiltArchive,
@@ -759,9 +761,7 @@ def allowlisted_archive_path(config: PaperConfig, path: str | Path) -> Path:
 
 
 def _normalize_trading_status(value: object) -> str:
-    raw = str(value or "UNKNOWN").strip().upper().rsplit(".", maxsplit=1)[-1]
-    prefix = "SECURITY_TRADING_STATUS_"
-    return raw[len(prefix) :] if raw.startswith(prefix) else raw
+    return normalize_security_trading_status(value)
 
 
 def _is_explicitly_closed(value: object) -> bool:

@@ -139,6 +139,37 @@ def test_data_quality_reconnect_requires_acks_and_warmup() -> None:
     assert gate.snapshot().entry_allowed is False
 
 
+def test_data_quality_numeric_normal_trading_status_is_open_fail_closed() -> None:
+    gate = DataQualityGate(warmup_events=1, stale_after_seconds=5, max_latency_ms=3_000)
+    gate.on_connect()
+    for kind in ("orderbook", "trade", "last_price", "trading_status", "candle"):
+        gate.observe(
+            _canonical_event(
+                "subscription_ack",
+                payload={"subscription_kind": kind},
+                status="SUBSCRIPTION_STATUS_SUCCESS",
+            )
+        )
+    gate.observe(_canonical_event("trading_status", payload={"tradingStatus": 5}))
+    ready = gate.observe(
+        _canonical_event(
+            "orderbook",
+            payload={
+                "bids": [{"price": 100, "quantity": 5}],
+                "asks": [{"price": 101, "quantity": 5}],
+            },
+            consistent=True,
+        )
+    )
+
+    assert ready.trading_status == "NORMAL_TRADING"
+    assert ready.entry_allowed is True
+
+    gate.observe(_canonical_event("trading_status", payload={"tradingStatus": 999}))
+    assert gate.snapshot().trading_status == "UNKNOWN"
+    assert gate.snapshot().entry_allowed is False
+
+
 class _FakeChannel:
     last: _FakeChannel | None = None
 
