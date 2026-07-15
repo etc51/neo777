@@ -1,6 +1,6 @@
 # Neo Bitcoin PAPER_ONLY bot — final deployment evidence
 
-Evidence cutoff: 2026-07-15 17:48 MSK (14:48 UTC)
+Evidence cutoff: 2026-07-15 18:30 MSK (15:30 UTC)
 Acceptance status: **PASS with the explicitly listed residual risks**
 
 This report contains no credential value, private key, or full Codex task ID.
@@ -12,12 +12,12 @@ This report contains no credential value, private key, or full Codex task ID.
 | Project | `C:\Users\HONOR\Documents\777\111_neobitcoin_edge` |
 | Remote | `https://github.com/etc51/neo777.git` |
 | Branch | `codex/neobitcoin-edge-research` |
-| Deployed runtime commit | `a9e13e5e` |
-| Runtime commit push | PASS, remote branch advanced through `a9e13e5e` |
+| Deployed runtime commit | `196f8c5a` |
+| Runtime commit push | PASS, remote branch advanced through `196f8c5a` |
 | VPS SSH alias / host | `3pips-vds` / `etc00051.fvds.ru` |
 | Deploy/config/state roots | `/opt/neobitcoin-paper`, `/etc/neobitcoin-paper`, `/var/lib/neobitcoin-paper` |
-| Immutable release | `/opt/neobitcoin-paper-releases/20260715T144751Z` |
-| Release bundle | 688,018 bytes; SHA-256 `cd1078dce886f9418cd33c5f9baa663f1af9a15dc5e8351b25644fd8fafd7af4` |
+| Immutable release | `/opt/neobitcoin-paper-releases/20260715T152827Z` |
+| Release bundle | 693,742 bytes; SHA-256 `bc898b1e9351b5d05b61a059580a799e2e4a4b0e11e9e7bd8161a32a3b534e7e` |
 | Service identity | `neopaper`; archive group `neoarchive` |
 | User-owned dirty file | `reports/golden_real_candle_audit.md` preserved and never staged |
 
@@ -29,8 +29,8 @@ This report contains no credential value, private key, or full Codex task ID.
 | UID | `4effa274-4e8f-422c-93ff-04aa34fe8e39` |
 | Class/type/exchange | `SPBDMFUT` / `futures` / `spb_future` |
 | Lot / tick | `1` / `0.1` |
-| Persisted live check | `2026-07-15T14:47:56.559859+00:00` |
-| Live TradingStatus | `SECURITY_TRADING_STATUS_NORMAL_TRADING` |
+| Persisted live check | `2026-07-15T15:28:32Z` |
+| Live TradingStatus | canonical `NORMAL_TRADING` |
 | Live source | exact-UID T-Invest `MarketDataService/GetTradingStatus` plus read-only `MarketDataStreamService` Info subscription; live status has priority over the fallback calendar |
 | Official SDK | `t-tech-investments==1.49.2` |
 | Token type/scope | T-Invest API access token; provider scope undeclared/UNKNOWN and therefore treated as potentially full-access; value not disclosed |
@@ -43,6 +43,12 @@ This report contains no credential value, private key, or full Codex task ID.
 
 No order RPC was used to probe token scope. The only execution adapter in the
 runtime is the internal `PaperExecutionAdapter`.
+
+The official SDK emits stream status `5` for
+`SECURITY_TRADING_STATUS_NORMAL_TRADING`. Commit `196f8c5a` resolves numeric
+statuses through the installed SDK enum and keeps unknown codes fail-closed. A
+live post-deploy event recorded `trading_status=NORMAL_TRADING` and
+`is_trading_allowed=true`; the erroneous closed/unknown status block is removed.
 
 ## Active immutable strategies
 
@@ -74,7 +80,7 @@ Rule `neo-moscow-2026-07-14-v1`, effective 2026-07-14, timezone
 
 | Unit | State/evidence |
 |---|---|
-| `neobitcoin-paper.service` | enabled; active/running; PID `2336245`; start `2026-07-15 17:47:55 MSK`; `NRestarts=0` after final atomic release switch |
+| `neobitcoin-paper.service` | enabled; active/running; PID `2466559`; start `2026-07-15 18:28:32 MSK`; `NRestarts=0` after final atomic release switch |
 | `neobitcoin-paper-archive.service` | isolated retrying oneshot |
 | `neobitcoin-paper-archive.timer` | enabled/active; next observed trigger `2026-07-16 00:05:10 MSK`; persistent |
 | `neobitcoin-paper-delivery.service` | manual production check: `Result=success`, `ExecMainStatus=0`, `IDLE_NO_VALIDATED_ARCHIVE` |
@@ -96,7 +102,7 @@ and `PRAGMA quick_check=ok`. The crashed generation remains honestly unclosed;
 the new generation is the single running instance. Subsequent atomic deployment
 performed a clean state recovery into the current final PID.
 
-The 428-test suite covers deterministic restart with open positions and orders
+The 430-test suite covers deterministic restart with open positions and orders
 awaiting fills, duplicate event/replay idempotence, stream disconnect/backfill/ACK and
 warmup gates, DNS/API failures with bounded jittered backoff, malformed events,
 SQLite locking/transactions, interrupted writers, disk warning/critical/
@@ -112,8 +118,8 @@ simulation.
 
 | Suite | Result |
 |---|---|
-| Full local pytest | **428 passed** in 142.86 s |
-| Final server paper/deploy suite | **50 passed** in 12.36 s |
+| Full local pytest | **430 passed** in 106.46 s |
+| Final server paper/deploy suite | **51 passed** in 13.24 s |
 | Ruff | PASS |
 | strict mypy | PASS, 109 source files (paper package: 19 modules) |
 | compileall | PASS |
@@ -189,10 +195,14 @@ deployment began; the preserved deployment baseline is PID `1828340`.
 4. Broker/exchange schedules, CA roots, and instrument metadata may change.
    The system fails closed on unknown live status and requires an effective-dated
    calendar/code update for reviewed changes.
+5. The pre-fix portion of session 2026-07-15 had entries blocked by numeric
+   status misclassification and must not be treated as a clean OOS performance
+   sample. Clean strategy measurement starts with the next complete session.
 
 ## Verdict
 
-**PASS.** The paper-only runtime is deployed and healthy, live-order access is
+**PASS.** The paper-only runtime is deployed and healthy, the numeric
+TradingStatus defect is corrected with live evidence, live-order access remains
 blocked, recovery and archive validation passed, the TEST artifact is accessible
 and delivered in the same task, daily delivery is active, Git runtime commits
 are pushed, and the existing collector remained unchanged during deployment.
