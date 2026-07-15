@@ -34,7 +34,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["neo_trader", "neo_swarm_scalper"]
+packages = ["neo_trader", "neo_swarm_scalper", "neobitcoin_paper"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

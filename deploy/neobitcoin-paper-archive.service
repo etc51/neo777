@@ -1,0 +1,51 @@
+[Unit]
+Description=Build and validate the completed Neobitcoin paper session archive
+After=local-fs.target
+RequiresMountsFor=/var/lib/neobitcoin-paper
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=60s
+User=neopaper
+Group=neopaper
+WorkingDirectory=/opt/neobitcoin-paper
+EnvironmentFile=/etc/neobitcoin-paper/paper.env
+Environment=PAPER_ONLY=true
+Environment=NEOBITCOIN_PAPER_DATA=/var/lib/neobitcoin-paper
+ExecStart=/usr/bin/env PAPER_ONLY=true /opt/neobitcoin-paper/.venv/bin/python -m neobitcoin_paper.cli archive --confirm PAPER_ONLY
+TimeoutStartSec=30min
+TimeoutStopSec=2min
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/opt/neobitcoin-paper /etc/neobitcoin-paper
+ReadWritePaths=/var/lib/neobitcoin-paper/state /var/lib/neobitcoin-paper/active /var/lib/neobitcoin-paper/parquet /var/lib/neobitcoin-paper/event_windows /var/lib/neobitcoin-paper/daily_archives /var/lib/neobitcoin-paper/delivery_outbox /var/lib/neobitcoin-paper/quarantine /var/lib/neobitcoin-paper/reports /var/lib/neobitcoin-paper/logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=neobitcoin-paper-archive

@@ -6,6 +6,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
+tbank-token
+codex-thread-id
+artifacts/paper_archives/*.tar.zst
+artifacts/paper_archives/*.sha256
+artifacts/paper_archives/last_sent.json
 configs/accounts.local.yaml
 dist/
 build/

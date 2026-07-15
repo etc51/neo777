@@ -1,0 +1,50 @@
+[Unit]
+Description=Deliver completed Neobitcoin paper archives to the configured Codex task
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/neobitcoin-paper
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=neopaper
+Group=neopaper
+WorkingDirectory=/opt/neobitcoin-paper
+EnvironmentFile=/etc/neobitcoin-paper/paper.env
+Environment=PAPER_ONLY=true
+Environment=NEOBITCOIN_PAPER_DATA=/var/lib/neobitcoin-paper
+Environment=NEOBITCOIN_PAPER_THREAD_ID_FILE=%d/codex-thread-id
+LoadCredential=codex-thread-id:/etc/neobitcoin-paper/codex-thread-id
+ExecStart=/usr/bin/env PAPER_ONLY=true /opt/neobitcoin-paper/.venv/bin/python -m neobitcoin_paper.cli deliver --confirm PAPER_ONLY
+Restart=no
+TimeoutStartSec=2min
+TimeoutStopSec=30s
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/opt/neobitcoin-paper /etc/neobitcoin-paper
+ReadWritePaths=/var/lib/neobitcoin-paper/state /var/lib/neobitcoin-paper/delivery_outbox /var/lib/neobitcoin-paper/delivered /var/lib/neobitcoin-paper/quarantine /var/lib/neobitcoin-paper/logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=neobitcoin-paper-delivery

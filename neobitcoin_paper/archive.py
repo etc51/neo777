@@ -1,0 +1,1264 @@
+"""Daily typed archive materialization and independent validation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Final
+from zoneinfo import ZoneInfo
+
+import duckdb
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import zstandard
+
+from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS, DatasetStore
+
+REQUIRED_DOCUMENTS: Final = (
+    "README.md",
+    "DAILY_SUMMARY.md",
+    "MANIFEST.json",
+    "MANIFEST.md",
+    "SCHEMA_DICTIONARY.md",
+    "VALIDATION_REPORT.md",
+    "SESSION_CALENDAR.json",
+    "STRATEGY_REGISTRY.json",
+    "CONFIG_SNAPSHOT.json",
+    "CODE_VERSION.json",
+    "SHA256SUMS",
+)
+_TOKEN_PATTERN: Final = re.compile(rb"(?<![A-Za-z0-9_.=-])t\.[A-Za-z0-9_.=-]{20,}")
+_SECRET_ASSIGNMENT: Final = re.compile(
+    rb"(?i)[\"']?(authorization|token|api[_-]?key|secret)[\"']?"
+    rb"\s*[:=]\s*[\"']?[^\s,;\"']{8,}"
+)
+_SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
+_MOSCOW: Final = ZoneInfo("Europe/Moscow")
+
+
+class ArchiveError(RuntimeError):
+    """Archive creation or validation failed closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveBuildRequest:
+    data_root: Path
+    session_date: date
+    start_utc: datetime
+    end_utc: datetime
+    strategy_registry: tuple[dict[str, object], ...]
+    session_calendar: dict[str, object]
+    config_snapshot: dict[str, object]
+    code_version: dict[str, object]
+    instrument_snapshot: dict[str, object]
+    test_archive: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveValidationResult:
+    passed: bool
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    row_counts: dict[str, int]
+    archive_sha256: str | None = None
+    zstd_verified: bool = False
+    duckdb_verified: bool = False
+    pyarrow_verified: bool = False
+    independent_reconciliation_verified: bool = False
+    unexplained_discrepancies: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltArchive:
+    archive_id: str
+    archive_path: Path
+    sha256_path: Path
+    sha256: str
+    size_bytes: int
+    validation: ArchiveValidationResult
+    manifest: dict[str, object]
+
+
+class DailyArchiveBuilder:
+    def __init__(self, validator: ArchiveValidator | None = None) -> None:
+        self._validator = validator or ArchiveValidator()
+
+    def build(
+        self,
+        request: ArchiveBuildRequest,
+        *,
+        dataset_store: DatasetStore | None = None,
+    ) -> BuiltArchive:
+        root = request.data_root.resolve()
+        start_utc = _utc(request.start_utc)
+        end_utc = _utc(request.end_utc)
+        if end_utc <= start_utc:
+            raise ArchiveError("archive end must follow start")
+        if dataset_store is not None:
+            dataset_store.close()
+        parquet_dir = root / "parquet" / request.session_date.isoformat()
+        missing = [name for name in REQUIRED_DATASETS if not (parquet_dir / name).is_file()]
+        if missing:
+            raise ArchiveError("daily datasets are not finalized: " + ", ".join(missing))
+        active_dir = root / "active" / request.session_date.isoformat()
+        session_markers = (
+            *active_dir.rglob("*.inprogress"),
+            *parquet_dir.rglob("*.inprogress"),
+        )
+        if session_markers:
+            raise ArchiveError("session inprogress files remain before archive build")
+
+        archive_id = _archive_id(request)
+        destination = root / "daily_archives"
+        destination.mkdir(parents=True, exist_ok=True)
+        filename = _archive_filename(request)
+        final_path = destination / filename
+        temporary = final_path.with_suffix(final_path.suffix + ".inprogress")
+        sidecar = Path(str(final_path) + ".sha256")
+        sidecar_tmp = Path(str(sidecar) + ".inprogress")
+        quarantine_dir = root / "quarantine"
+        existing = _reuse_existing_archive(
+            archive_id=archive_id,
+            final_path=final_path,
+            sidecar=sidecar,
+            quarantine_dir=quarantine_dir,
+            validator=self._validator,
+        )
+        if existing is not None:
+            return existing
+
+        stage = Path(tempfile.mkdtemp(prefix=f".{archive_id}-", dir=destination))
+        try:
+            data_dir = stage / "data"
+            data_dir.mkdir()
+            for name in REQUIRED_DATASETS:
+                shutil.copy2(parquet_dir / name, data_dir / name)
+
+            row_counts = {
+                name: int(pq.ParquetFile(data_dir / name).metadata.num_rows)
+                for name in REQUIRED_DATASETS
+            }
+            summary = _daily_summary(data_dir, request.strategy_registry, row_counts)
+            _write_json(stage / "SESSION_CALENDAR.json", request.session_calendar)
+            _write_json(stage / "STRATEGY_REGISTRY.json", request.strategy_registry)
+            safe_config = dict(request.config_snapshot)
+            safe_config["paper_only"] = True
+            _write_json(stage / "CONFIG_SNAPSHOT.json", safe_config)
+            _write_json(stage / "CODE_VERSION.json", request.code_version)
+            (stage / "README.md").write_text(
+                _readme(request, archive_id), encoding="utf-8"
+            )
+            (stage / "DAILY_SUMMARY.md").write_text(summary, encoding="utf-8")
+            (stage / "SCHEMA_DICTIONARY.md").write_text(
+                _schema_dictionary(), encoding="utf-8"
+            )
+            manifest: dict[str, object] = {
+                "archive_id": archive_id,
+                "archive_type": "TEST" if request.test_archive else "OOS_DAILY",
+                "schema_version": "neobitcoin-paper-schema-v1",
+                "session_date": request.session_date.isoformat(),
+                "start_utc": start_utc.isoformat(),
+                "end_utc": end_utc.isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
+                "paper_only": True,
+                "instrument": request.instrument_snapshot,
+                "row_counts": row_counts,
+                "strategies": len(request.strategy_registry),
+                "datasets": [f"data/{name}" for name in REQUIRED_DATASETS],
+                "validation_policy": "zero unexplained discrepancies",
+            }
+            _write_json(stage / "MANIFEST.json", manifest)
+            (stage / "MANIFEST.md").write_text(
+                _manifest_markdown(manifest, row_counts), encoding="utf-8"
+            )
+
+            preliminary = self._validator.validate_bundle(stage, verify_sums=False)
+            if not preliminary.passed:
+                raise ArchiveError("bundle validation failed: " + "; ".join(preliminary.errors))
+            (stage / "VALIDATION_REPORT.md").write_text(
+                _validation_report(preliminary), encoding="utf-8"
+            )
+            _write_sums(stage)
+            final_bundle = self._validator.validate_bundle(stage, verify_sums=True)
+            if not final_bundle.passed:
+                raise ArchiveError(
+                    "final bundle validation failed: " + "; ".join(final_bundle.errors)
+                )
+
+            _write_tar_zst(stage, temporary)
+            os.replace(temporary, final_path)
+            final_path.chmod(0o640)
+            sha = _sha256_file(final_path)
+            sidecar_tmp.write_text(f"{sha}  {final_path.name}\n", encoding="ascii")
+            os.replace(sidecar_tmp, sidecar)
+            sidecar.chmod(0o640)
+            archive_validation = self._validator.validate_archive(final_path, expected_sha256=sha)
+            if not archive_validation.passed:
+                raise ArchiveError(
+                    "compressed archive validation failed: "
+                    + "; ".join(archive_validation.errors)
+                )
+            return BuiltArchive(
+                archive_id=archive_id,
+                archive_path=final_path,
+                sha256_path=sidecar,
+                sha256=sha,
+                size_bytes=final_path.stat().st_size,
+                validation=archive_validation,
+                manifest=manifest,
+            )
+        except Exception as exc:
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            _quarantine_file(final_path, quarantine_dir, final_path.name)
+            _quarantine_file(
+                temporary,
+                quarantine_dir,
+                final_path.name + ".partial",
+            )
+            _quarantine_file(sidecar, quarantine_dir, sidecar.name)
+            _quarantine_file(
+                sidecar_tmp,
+                quarantine_dir,
+                sidecar.name + ".partial",
+            )
+            failure_payload = {
+                "archive_id": archive_id,
+                "failed_at": datetime.now(UTC).isoformat(),
+                "status": "QUARANTINED",
+                "error_type": type(exc).__name__,
+            }
+            report_dir = root / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            failure = report_dir / f"archive_failure_{archive_id}.json"
+            _write_json(failure, failure_payload)
+            _write_json(quarantine_dir / f"{archive_id}.failure.json", failure_payload)
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _reuse_existing_archive(
+    *,
+    archive_id: str,
+    final_path: Path,
+    sidecar: Path,
+    quarantine_dir: Path,
+    validator: ArchiveValidator,
+) -> BuiltArchive | None:
+    """Reuse a previously verified finalization; quarantine incomplete pairs."""
+
+    if not final_path.exists() and not sidecar.exists():
+        return None
+    digest = _read_sidecar_digest(sidecar, final_path.name)
+    if final_path.is_file() and digest is not None:
+        validation = validator.validate_archive(final_path, expected_sha256=digest)
+        if validation.passed:
+            try:
+                manifest = _read_archive_manifest(final_path)
+            except (ArchiveError, OSError, json.JSONDecodeError):
+                pass
+            else:
+                if manifest.get("archive_id") == archive_id:
+                    return BuiltArchive(
+                        archive_id=archive_id,
+                        archive_path=final_path,
+                        sha256_path=sidecar,
+                        sha256=digest,
+                        size_bytes=final_path.stat().st_size,
+                        validation=validation,
+                        manifest=manifest,
+                    )
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    _quarantine_file(final_path, quarantine_dir, final_path.name)
+    _quarantine_file(sidecar, quarantine_dir, sidecar.name)
+    return None
+
+
+def _read_sidecar_digest(sidecar: Path, archive_name: str) -> str | None:
+    if not sidecar.is_file():
+        return None
+    try:
+        line = sidecar.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    if "  " not in line:
+        return None
+    digest, filename = line.split("  ", 1)
+    normalized = digest.strip().lower()
+    if filename.strip() != archive_name or not _SHA256_PATTERN.fullmatch(normalized):
+        return None
+    return normalized
+
+
+def _read_archive_manifest(archive: Path) -> dict[str, object]:
+    extracted = Path(tempfile.mkdtemp(prefix="neobitcoin-paper-manifest-"))
+    try:
+        _extract_tar_zst(archive, extracted)
+        loaded = json.loads((extracted / "MANIFEST.json").read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ArchiveError("archive manifest is not an object")
+        return {str(key): value for key, value in loaded.items()}
+    finally:
+        shutil.rmtree(extracted, ignore_errors=True)
+
+
+def _quarantine_file(path: Path, quarantine_dir: Path, target_name: str) -> Path | None:
+    if not path.exists():
+        return None
+    target = quarantine_dir / target_name
+    if target.exists():
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        target = quarantine_dir / f"{target_name}.{stamp}"
+    os.replace(path, target)
+    return target
+
+
+class ArchiveValidator:
+    """Independent bundle checks using PyArrow, DuckDB, hashes, and zstd."""
+
+    def validate_bundle(
+        self, root: Path, *, verify_sums: bool = True
+    ) -> ArchiveValidationResult:
+        root = root.resolve()
+        errors: list[str] = []
+        warnings: list[str] = []
+        row_counts: dict[str, int] = {}
+        for name in REQUIRED_DOCUMENTS:
+            if name == "VALIDATION_REPORT.md" and not verify_sums:
+                continue
+            if name == "SHA256SUMS" and not verify_sums:
+                continue
+            if not (root / name).is_file():
+                errors.append(f"missing document {name}")
+        if tuple(root.rglob("*.inprogress")):
+            errors.append("bundle contains .inprogress")
+        expected_files = _expected_bundle_files(verify_sums=verify_sums)
+        actual_files = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+        for relative in sorted(actual_files - expected_files):
+            errors.append(f"unexpected bundle file {relative}")
+
+        tables: dict[str, pa.Table] = {}
+        pyarrow_ok = True
+        duckdb_ok = True
+        connection = duckdb.connect(":memory:")
+        try:
+            for name in REQUIRED_DATASETS:
+                path = root / "data" / name
+                if not path.is_file():
+                    errors.append(f"missing dataset {name}")
+                    pyarrow_ok = False
+                    duckdb_ok = False
+                    continue
+                try:
+                    table = pq.read_table(path)
+                except Exception as exc:
+                    pyarrow_ok = False
+                    duckdb_ok = False
+                    errors.append(f"PyArrow cannot read {name}: {type(exc).__name__}")
+                    continue
+                expected = DATASET_SCHEMAS[name]
+                if not table.schema.equals(expected, check_metadata=True):
+                    errors.append(f"schema mismatch {name}")
+                tables[name] = table
+                _validate_primary_key(name, table, errors)
+                _validate_parquet_compression(name, path, errors)
+                try:
+                    result = connection.execute(
+                        "SELECT count(*) FROM read_parquet(?)", [str(path)]
+                    ).fetchone()
+                    if result is None:
+                        raise ArchiveError("DuckDB returned no count row")
+                    count = int(
+                        result[0]
+                    )
+                    if count != table.num_rows:
+                        errors.append(f"DuckDB/PyArrow row mismatch {name}")
+                    row_counts[name] = count
+                except Exception as exc:
+                    duckdb_ok = False
+                    errors.append(f"DuckDB cannot read {name}: {type(exc).__name__}")
+        finally:
+            connection.close()
+
+        _validate_foreign_keys(tables, errors)
+        reconciliation_errors: list[str] = []
+        _validate_financial_reconciliation(tables, reconciliation_errors)
+        _validate_temporal_and_position_reconciliation(tables, reconciliation_errors)
+        _validate_source_lineage(tables, reconciliation_errors)
+        errors.extend(reconciliation_errors)
+        _validate_event_window_coverage(tables, errors)
+        _validate_strategy_registry(root, errors)
+        _validate_manifest(root, row_counts, errors)
+        if _contains_secret(root):
+            errors.append("secret scan failed")
+        if verify_sums:
+            _verify_sums(root, errors)
+        return ArchiveValidationResult(
+            passed=not errors,
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+            row_counts=row_counts,
+            duckdb_verified=duckdb_ok and len(tables) == len(REQUIRED_DATASETS),
+            pyarrow_verified=pyarrow_ok and len(tables) == len(REQUIRED_DATASETS),
+            independent_reconciliation_verified=not reconciliation_errors,
+            unexplained_discrepancies=len(reconciliation_errors),
+        )
+
+    def validate_archive(
+        self, archive: Path, *, expected_sha256: str | None = None
+    ) -> ArchiveValidationResult:
+        errors: list[str] = []
+        sha = _sha256_file(archive)
+        if expected_sha256 is not None and sha != expected_sha256:
+            errors.append("archive SHA-256 mismatch")
+        extracted = Path(tempfile.mkdtemp(prefix="neobitcoin-paper-verify-"))
+        zstd_ok = False
+        try:
+            try:
+                _extract_tar_zst(archive, extracted)
+                zstd_ok = True
+            except Exception as exc:
+                errors.append(f"zstd/tar verification failed: {type(exc).__name__}")
+            if errors:
+                return ArchiveValidationResult(
+                    False,
+                    tuple(errors),
+                    (),
+                    {},
+                    archive_sha256=sha,
+                    zstd_verified=zstd_ok,
+                )
+            bundle = self.validate_bundle(extracted, verify_sums=True)
+            return ArchiveValidationResult(
+                passed=bundle.passed,
+                errors=bundle.errors,
+                warnings=bundle.warnings,
+                row_counts=bundle.row_counts,
+                archive_sha256=sha,
+                zstd_verified=zstd_ok,
+                duckdb_verified=bundle.duckdb_verified,
+                pyarrow_verified=bundle.pyarrow_verified,
+                independent_reconciliation_verified=(
+                    bundle.independent_reconciliation_verified
+                ),
+                unexplained_discrepancies=bundle.unexplained_discrepancies,
+            )
+        finally:
+            shutil.rmtree(extracted, ignore_errors=True)
+
+
+def _expected_bundle_files(*, verify_sums: bool) -> set[str]:
+    documents = set(REQUIRED_DOCUMENTS)
+    if not verify_sums:
+        documents.discard("VALIDATION_REPORT.md")
+        documents.discard("SHA256SUMS")
+    return documents | {f"data/{name}" for name in REQUIRED_DATASETS}
+
+
+def _validate_manifest(
+    root: Path,
+    row_counts: dict[str, int],
+    errors: list[str],
+) -> None:
+    path = root / "MANIFEST.json"
+    if not path.is_file():
+        return
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        errors.append("MANIFEST.json is unreadable")
+        return
+    if not isinstance(manifest, dict):
+        errors.append("MANIFEST.json is not an object")
+        return
+    if manifest.get("paper_only") is not True:
+        errors.append("manifest PAPER_ONLY assertion is missing")
+    if manifest.get("archive_type") not in {"TEST", "OOS_DAILY"}:
+        errors.append("manifest archive_type is invalid")
+    expected_datasets = [f"data/{name}" for name in REQUIRED_DATASETS]
+    if manifest.get("datasets") != expected_datasets:
+        errors.append("manifest dataset list mismatch")
+    declared_counts = manifest.get("row_counts")
+    if not isinstance(declared_counts, dict):
+        errors.append("manifest row_counts is invalid")
+        return
+    normalized_counts: dict[str, int] = {}
+    try:
+        normalized_counts = {str(key): int(value) for key, value in declared_counts.items()}
+    except (TypeError, ValueError):
+        errors.append("manifest row_counts contains a non-integer")
+        return
+    if normalized_counts != row_counts:
+        errors.append("manifest row_counts mismatch")
+
+
+def _validate_parquet_compression(name: str, path: Path, errors: list[str]) -> None:
+    metadata = pq.ParquetFile(path).metadata
+    codecs = {
+        str(metadata.row_group(group).column(column).compression).upper()
+        for group in range(metadata.num_row_groups)
+        for column in range(metadata.row_group(group).num_columns)
+    }
+    if codecs and codecs != {"ZSTD"}:
+        errors.append(f"non-ZSTD Parquet compression {name}")
+
+
+def _validate_primary_key(name: str, table: pa.Table, errors: list[str]) -> None:
+    metadata = table.schema.metadata or {}
+    primary = metadata.get(b"primary_key", b"").decode()
+    if not primary or primary not in table.column_names:
+        errors.append(f"missing primary key metadata {name}")
+        return
+    values = table[primary]
+    if values.null_count:
+        errors.append(f"null primary key {name}")
+    if pc.count_distinct(values).as_py() != table.num_rows:
+        errors.append(f"duplicate primary key {name}")
+    if "event_ts" in table.column_names and table.num_rows > 1:
+        timestamps = table["event_ts"].to_pylist()
+        if timestamps != sorted(timestamps):
+            errors.append(f"timestamp sort failure {name}")
+
+
+def _validate_foreign_keys(tables: dict[str, pa.Table], errors: list[str]) -> None:
+    for name, table in tables.items():
+        metadata = table.schema.metadata or {}
+        raw = metadata.get(b"foreign_keys", b"{}").decode()
+        for field, target in json.loads(raw).items():
+            target_table, target_field = str(target).split(".", 1)
+            target_name = f"{target_table}.parquet"
+            if target_name not in tables:
+                continue
+            source_values = {value for value in table[field].to_pylist() if value not in (None, "")}
+            target_values = {
+                value
+                for value in tables[target_name][target_field].to_pylist()
+                if value not in (None, "")
+            }
+            if not source_values.issubset(target_values):
+                errors.append(f"foreign key failure {name}.{field}")
+
+
+def _validate_financial_reconciliation(
+    tables: dict[str, pa.Table], errors: list[str]
+) -> None:
+    trades = tables.get("paper_trades.parquet")
+    if trades is not None:
+        for row in trades.to_pylist():
+            required = ("quantity", "entry_price", "exit_price", "gross_pnl", "fees", "net_pnl")
+            if any(row.get(key) is None for key in required):
+                continue
+            side = str(row.get("side", "")).upper()
+            if side in {"BUY", "LONG"}:
+                direction = 1.0
+            elif side in {"SELL", "SHORT"}:
+                direction = -1.0
+            else:
+                errors.append(f"unknown trade side {row['trade_id']}")
+                continue
+            gross = (float(row["exit_price"]) - float(row["entry_price"])) * float(
+                row["quantity"]
+            ) * direction
+            if not math.isclose(gross, float(row["gross_pnl"]), abs_tol=1e-8):
+                errors.append(f"PnL reconciliation failed {row['trade_id']}")
+            if not math.isclose(
+                gross - float(row["fees"]), float(row["net_pnl"]), abs_tol=1e-8
+            ):
+                errors.append(f"net PnL reconciliation failed {row['trade_id']}")
+            explicit_costs = sum(
+                _numeric(row.get(field))
+                for field in (
+                    "spread_cost",
+                    "slippage_cost",
+                    "simulated_latency_cost",
+                    "holding_cost",
+                )
+            )
+            if not math.isclose(
+                explicit_costs, _numeric(row.get("fees")), abs_tol=1e-8
+            ):
+                errors.append(f"cost reconciliation failed {row['trade_id']}")
+    metrics = tables.get("mfe_mae.parquet")
+    if metrics is not None:
+        for row in metrics.to_pylist():
+            if (row.get("mfe") is not None and float(row["mfe"]) < 0) or (
+                row.get("mae") is not None and float(row["mae"]) < 0
+            ):
+                errors.append(f"negative MFE/MAE {row['result_id']}")
+            extra = _extra_fields(row)
+            for field in ("time_to_mfe_seconds", "time_to_mae_seconds"):
+                value = extra.get(field)
+                if value is not None and _numeric(value) < 0:
+                    errors.append(f"negative {field} {row['result_id']}")
+    equity = tables.get("equity_curve.parquet")
+    if equity is not None:
+        for row in equity.to_pylist():
+            if all(row.get(key) is not None for key in ("cash", "equity", "unrealized_pnl")):
+                expected = float(row["cash"]) + float(row["unrealized_pnl"])
+                if not math.isclose(expected, float(row["equity"]), abs_tol=1e-8):
+                    errors.append(f"equity reconciliation failed {row['equity_id']}")
+
+
+def _validate_temporal_and_position_reconciliation(
+    tables: dict[str, pa.Table], errors: list[str]
+) -> None:
+    """Independently reconcile fill chronology, positions, and closed trades."""
+
+    fills_table = tables.get("paper_fills.parquet")
+    positions_table = tables.get("paper_positions.parquet")
+    trades_table = tables.get("paper_trades.parquet")
+    if fills_table is None or positions_table is None or trades_table is None:
+        return
+    fills = {
+        str(row["fill_id"]): row
+        for row in fills_table.to_pylist()
+        if row.get("fill_id") not in (None, "")
+    }
+    position_events: dict[str, list[dict[str, object]]] = {}
+    for row in positions_table.to_pylist():
+        position_id = str(row.get("position_id") or "")
+        if not position_id:
+            errors.append(f"position event has no position_id {row.get('position_event_id')}")
+            continue
+        position_events.setdefault(position_id, []).append(row)
+
+    trade_pnl_by_position: dict[str, float] = {}
+    for row in trades_table.to_pylist():
+        trade_id = str(row.get("trade_id") or "UNKNOWN")
+        entry = fills.get(str(row.get("entry_fill_id") or ""))
+        exit_fill = fills.get(str(row.get("exit_fill_id") or ""))
+        direct_entry_ts = row.get("entry_ts")
+        direct_exit_ts = row.get("exit_ts")
+        if isinstance(direct_entry_ts, datetime) and isinstance(direct_exit_ts, datetime):
+            if direct_exit_ts < direct_entry_ts:
+                errors.append(f"exit precedes entry {trade_id}")
+            holding = row.get("holding_duration_seconds")
+            expected_holding = (direct_exit_ts - direct_entry_ts).total_seconds()
+            if holding is not None and not math.isclose(
+                _numeric(holding), expected_holding, abs_tol=1e-6
+            ):
+                errors.append(f"holding duration reconciliation failed {trade_id}")
+        if entry is None or exit_fill is None:
+            # The foreign-key validator reports the missing identifier precisely.
+            continue
+        entry_ts = entry.get("event_ts")
+        exit_ts = exit_fill.get("event_ts")
+        trade_ts = row.get("event_ts")
+        if not isinstance(entry_ts, datetime) or not isinstance(exit_ts, datetime):
+            errors.append(f"fill timestamp missing {trade_id}")
+        elif exit_ts < entry_ts:
+            errors.append(f"exit precedes entry {trade_id}")
+        if isinstance(exit_ts, datetime) and isinstance(trade_ts, datetime) and trade_ts < exit_ts:
+            errors.append(f"trade timestamp precedes exit fill {trade_id}")
+        position_id = str(row.get("position_id") or "")
+        if not position_id or position_id not in position_events:
+            errors.append(f"trade has no position history {trade_id}")
+            continue
+        trade_pnl_by_position[position_id] = (
+            trade_pnl_by_position.get(position_id, 0.0) + _numeric(row.get("net_pnl"))
+        )
+
+    for position_id, rows in position_events.items():
+        ordered = sorted(
+            rows,
+            key=_row_event_timestamp,
+        )
+        closed_seen = False
+        for row in ordered:
+            status = str(row.get("status") or "").upper()
+            quantity = row.get("quantity")
+            if quantity is not None and _numeric(quantity) < 0:
+                errors.append(f"negative position quantity {position_id}")
+            if closed_seen and status not in {"CLOSED", ""}:
+                errors.append(f"position reopened after close {position_id}")
+            closed_seen = closed_seen or status == "CLOSED"
+        if position_id in trade_pnl_by_position:
+            last = ordered[-1]
+            if str(last.get("status") or "").upper() != "CLOSED":
+                errors.append(f"closed trade has non-closed position {position_id}")
+            realized = last.get("realized_pnl")
+            if realized is not None and not math.isclose(
+                _numeric(realized), trade_pnl_by_position[position_id], abs_tol=1e-8
+            ):
+                errors.append(f"position PnL reconciliation failed {position_id}")
+
+
+def _row_event_timestamp(row: dict[str, object]) -> datetime:
+    value = row.get("event_ts")
+    return value if isinstance(value, datetime) else datetime.min.replace(tzinfo=UTC)
+
+
+def _validate_source_lineage(tables: dict[str, pa.Table], errors: list[str]) -> None:
+    raw_ids: set[str] = set()
+    for name in (
+        "raw_orderbook_event_windows.parquet",
+        "raw_trades_event_windows.parquet",
+        "raw_last_price_event_windows.parquet",
+        "raw_candles_event_windows.parquet",
+    ):
+        table = tables.get(name)
+        if table is not None:
+            for row in table.to_pylist():
+                raw_id = row.get("raw_event_id")
+                if raw_id not in (None, ""):
+                    raw_ids.add(str(raw_id))
+                source_id = row.get("source_event_id")
+                if source_id not in (None, ""):
+                    raw_ids.add(str(source_id))
+                extra = row.get("extra_json")
+                if isinstance(extra, str) and extra:
+                    try:
+                        extra_fields = json.loads(extra)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(extra_fields, dict):
+                        source_id = extra_fields.get("source_event_id")
+                        if source_id not in (None, ""):
+                            raw_ids.add(str(source_id))
+    signals = tables.get("candidate_signals.parquet")
+    if signals is None or signals.num_rows == 0:
+        return
+    for dataset, primary_key, source_fields in (
+        ("paper_fills.parquet", "fill_id", ("source_event_id",)),
+        (
+            "mfe_mae.parquet",
+            "result_id",
+            ("mfe_source_event_id", "mae_source_event_id"),
+        ),
+        ("shadow_stop_results.parquet", "result_id", ("source_event_id",)),
+        ("shadow_exit_results.parquet", "result_id", ("source_event_id",)),
+    ):
+        table = tables.get(dataset)
+        if table is None:
+            continue
+        for row in table.to_pylist():
+            for field in source_fields:
+                source_id = str(row.get(field) or "")
+                if source_id and source_id not in raw_ids:
+                    errors.append(
+                        f"source lineage failure {dataset}:{row.get(primary_key)}:{field}"
+                    )
+
+
+def _validate_strategy_registry(root: Path, errors: list[str]) -> None:
+    path = root / "STRATEGY_REGISTRY.json"
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        errors.append("STRATEGY_REGISTRY.json is unreadable")
+        return
+    if not isinstance(payload, list):
+        errors.append("strategy registry is not a list")
+        return
+    keys: set[tuple[str, str]] = set()
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            errors.append(f"strategy registry row is invalid {index}")
+            continue
+        strategy_id = str(item.get("strategy_id") or "").strip()
+        version = str(item.get("strategy_version") or item.get("version") or "").strip()
+        key = (strategy_id, version)
+        if not all(key) or key in keys:
+            errors.append(f"strategy registry key is invalid {index}")
+        keys.add(key)
+        for field in ("code_hash", "config_hash"):
+            digest = str(item.get(field) or "").lower()
+            if not _SHA256_PATTERN.fullmatch(digest):
+                errors.append(f"strategy {field} is invalid {strategy_id}/{version}")
+        activated = item.get("activated_at")
+        try:
+            parsed = datetime.fromisoformat(str(activated).replace("Z", "+00:00"))
+        except ValueError:
+            errors.append(f"strategy activation is invalid {strategy_id}/{version}")
+        else:
+            if parsed.tzinfo is None:
+                errors.append(f"strategy activation is not UTC-aware {strategy_id}/{version}")
+
+
+def _validate_event_window_coverage(
+    tables: dict[str, pa.Table], errors: list[str]
+) -> None:
+    signals = tables.get("candidate_signals.parquet")
+    if signals is None or signals.num_rows == 0:
+        return
+    required = {
+        value
+        for value in signals["signal_id"].to_pylist()
+        if value not in (None, "")
+    }
+    covered: set[str] = set()
+    for name in (
+        "raw_orderbook_event_windows.parquet",
+        "raw_trades_event_windows.parquet",
+        "raw_last_price_event_windows.parquet",
+        "raw_candles_event_windows.parquet",
+    ):
+        table = tables.get(name)
+        if table is not None:
+            covered.update(
+                value for value in table["signal_id"].to_pylist() if value not in (None, "")
+            )
+    if not required.issubset(covered):
+        errors.append("event-window coverage failure")
+
+
+def _contains_secret(root: Path) -> bool:
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                if _TOKEN_PATTERN.search(chunk) or _SECRET_ASSIGNMENT.search(chunk):
+                    return True
+    return False
+
+
+def _write_sums(root: Path) -> None:
+    lines = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        if path.name == "SHA256SUMS":
+            continue
+        lines.append(f"{_sha256_file(path)}  {path.relative_to(root).as_posix()}")
+    (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def _verify_sums(root: Path, errors: list[str]) -> None:
+    sums = root / "SHA256SUMS"
+    if not sums.is_file():
+        errors.append("missing SHA256SUMS")
+        return
+    expected_paths = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path != sums
+    }
+    declared_paths: set[str] = set()
+    try:
+        lines = sums.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError):
+        errors.append("SHA256SUMS is unreadable")
+        return
+    for line in lines:
+        if "  " not in line:
+            errors.append("invalid SHA256SUMS line")
+            continue
+        expected, relative = line.split("  ", 1)
+        expected = expected.strip().lower()
+        relative = relative.strip()
+        if not _SHA256_PATTERN.fullmatch(expected):
+            errors.append(f"invalid SHA256 digest {relative}")
+            continue
+        if relative in declared_paths:
+            errors.append(f"duplicate SHA256SUMS path {relative}")
+            continue
+        declared_paths.add(relative)
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root.resolve())
+        except ValueError:
+            errors.append("unsafe SHA256SUMS path")
+            continue
+        if not path.is_file() or _sha256_file(path) != expected:
+            errors.append(f"file hash mismatch {relative}")
+    for relative in sorted(expected_paths - declared_paths):
+        errors.append(f"missing SHA256SUMS entry {relative}")
+    for relative in sorted(declared_paths - expected_paths):
+        errors.append(f"unexpected SHA256SUMS entry {relative}")
+
+
+def _write_tar_zst(source: Path, destination: Path) -> None:
+    compressor = zstandard.ZstdCompressor(level=10, write_checksum=True)
+    with (
+        destination.open("wb") as raw,
+        compressor.stream_writer(raw, closefd=False) as compressed,
+        tarfile.open(fileobj=compressed, mode="w|") as archive,
+    ):
+        for path in sorted(source.rglob("*")):
+            archive.add(
+                path,
+                arcname=path.relative_to(source).as_posix(),
+                recursive=False,
+            )
+
+
+def _extract_tar_zst(archive: Path, destination: Path) -> None:
+    decompressor = zstandard.ZstdDecompressor()
+    seen: set[str] = set()
+    with (
+        archive.open("rb") as raw,
+        decompressor.stream_reader(raw) as decompressed,
+        tarfile.open(fileobj=decompressed, mode="r|") as tar,
+    ):
+        for member in tar:
+            if member.name in seen:
+                raise ArchiveError("duplicate tar member")
+            seen.add(member.name)
+            target = (destination / member.name).resolve()
+            try:
+                target.relative_to(destination.resolve())
+            except ValueError as exc:
+                raise ArchiveError("unsafe tar member") from exc
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None:
+                    raise ArchiveError("tar member is unreadable")
+                with target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            else:
+                raise ArchiveError("unsupported tar member type")
+
+
+def _archive_filename(request: ArchiveBuildRequest) -> str:
+    marker = "_TEST" if request.test_archive else ""
+    return (
+        f"neobitcoin_paper_{request.session_date.isoformat()}_"
+        f"{_stamp(request.start_utc)}_{_stamp(request.end_utc)}_schema-v1{marker}.tar.zst"
+    )
+
+
+def _archive_id(request: ArchiveBuildRequest) -> str:
+    prefix = "TEST" if request.test_archive else "DAILY"
+    raw = f"{request.session_date}:{_stamp(request.start_utc)}:{_stamp(request.end_utc)}"
+    return f"{prefix}-{request.session_date}-{hashlib.sha256(raw.encode()).hexdigest()[:12]}"
+
+
+def _stamp(value: datetime) -> str:
+    return _utc(value).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise ArchiveError("archive timestamps must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _readme(request: ArchiveBuildRequest, archive_id: str) -> str:
+    marker = "TEST — excluded from real OOS statistics.\n\n" if request.test_archive else ""
+    return (
+        "# Neobitcoin paper archive\n\n"
+        f"{marker}Archive ID: `{archive_id}`. Session date: "
+        f"`{request.session_date.isoformat()}`. All timestamps and Parquet fields are typed; "
+        "market decisions use point-in-time data and PAPER_ONLY execution.\n"
+    )
+
+
+def _manifest_markdown(manifest: dict[str, object], row_counts: dict[str, int]) -> str:
+    lines = [
+        "# Manifest",
+        "",
+        f"- Archive ID: `{manifest['archive_id']}`",
+        f"- Type: `{manifest['archive_type']}`",
+        f"- Session: `{manifest['session_date']}`",
+        "- PAPER_ONLY: `true`",
+        "",
+        "| Dataset | Rows |",
+        "|---|---:|",
+    ]
+    lines.extend(f"| {name} | {count} |" for name, count in row_counts.items())
+    return "\n".join(lines) + "\n"
+
+
+def _schema_dictionary() -> str:
+    lines = ["# Schema dictionary", ""]
+    for name, schema in DATASET_SCHEMAS.items():
+        lines.extend((f"## {name}", "", "| Field | Arrow type | Nullable |", "|---|---|---|"))
+        lines.extend(
+            f"| {field.name} | `{field.type}` | {field.nullable} |" for field in schema
+        )
+        metadata = schema.metadata or {}
+        lines.append("")
+        lines.append(f"Primary key: `{metadata[b'primary_key'].decode()}`.")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _daily_summary(
+    data_dir: Path,
+    registry: tuple[dict[str, object], ...],
+    row_counts: dict[str, int],
+) -> str:
+    trades = pq.read_table(data_dir / "paper_trades.parquet").to_pylist()
+    signals = pq.read_table(data_dir / "candidate_signals.parquet").to_pylist()
+    evaluations = pq.read_table(data_dir / "strategy_evaluations.parquet").to_pylist()
+    orders = pq.read_table(data_dir / "paper_orders.parquet").to_pylist()
+    fills = pq.read_table(data_dir / "paper_fills.parquet").to_pylist()
+    positions = pq.read_table(data_dir / "paper_positions.parquet").to_pylist()
+    equity = pq.read_table(data_dir / "equity_curve.parquet").to_pylist()
+    excursions = pq.read_table(data_dir / "mfe_mae.parquet").to_pylist()
+    quality = pq.read_table(data_dir / "data_quality_events.parquet").to_pylist()
+    health = pq.read_table(data_dir / "health_events.parquet").to_pylist()
+    lines = ["# Daily summary", ""]
+    for strategy in registry:
+        strategy_id = str(strategy.get("strategy_id", "UNKNOWN"))
+        version = str(
+            strategy.get("strategy_version") or strategy.get("version") or "UNKNOWN"
+        )
+        selected_evaluations = _strategy_rows(evaluations, strategy_id, version)
+        selected_orders = _strategy_rows(orders, strategy_id, version)
+        selected_positions = _strategy_rows(positions, strategy_id, version)
+        selected_equity = _strategy_rows(equity, strategy_id, version)
+        selected_excursions = _strategy_rows(excursions, strategy_id, version)
+        selected_trades = [
+            row
+            for row in trades
+            if row.get("strategy_id") == strategy_id
+            and row.get("strategy_version") == version
+        ]
+        selected_signals = [
+            row
+            for row in signals
+            if row.get("strategy_id") == strategy_id
+            and row.get("strategy_version") == version
+        ]
+        pnl_values = [_numeric(row.get("net_pnl")) for row in selected_trades]
+        pnl = sum(pnl_values)
+        wins = [value for value in pnl_values if value > 0]
+        losses = [value for value in pnl_values if value < 0]
+        win_rate = len(wins) / len(selected_trades) if selected_trades else 0.0
+        rejected = sum(1 for row in selected_signals if not row.get("accepted"))
+        account_ids = {
+            str(row.get("account_id"))
+            for row in (*selected_signals, *selected_orders, *selected_equity)
+            if row.get("account_id") not in (None, "")
+        }
+        fill_count = sum(1 for row in fills if str(row.get("account_id")) in account_ids)
+        order_statuses = Counter(str(row.get("status") or "UNKNOWN") for row in selected_orders)
+        position_last: dict[str, dict[str, object]] = {}
+        for row in selected_positions:
+            position_last[str(row.get("position_id") or row.get("position_event_id"))] = row
+        open_positions = sum(
+            1
+            for row in position_last.values()
+            if str(row.get("status") or "").upper() != "CLOSED"
+        )
+        entries = sum(
+            1
+            for row in selected_positions
+            if str(row.get("event_kind") or _extra_fields(row).get("event_kind") or "").upper()
+            == "OPEN"
+        )
+        sides = Counter(str(row.get("side") or "UNKNOWN") for row in selected_trades)
+        if not selected_trades:
+            sides.update(
+                str(row.get("side") or "UNKNOWN")
+                for row in selected_positions
+                if str(
+                    row.get("event_kind") or _extra_fields(row).get("event_kind") or ""
+                ).upper()
+                == "OPEN"
+            )
+        gross = sum(_numeric(row.get("gross_pnl")) for row in selected_trades)
+        expectancy = pnl / len(selected_trades) if selected_trades else 0.0
+        gross_wins = sum(wins)
+        gross_losses = abs(sum(losses))
+        profit_factor = gross_wins / gross_losses if gross_losses else 0.0
+        maximum_drawdown = max(
+            (_numeric(row.get("drawdown")) for row in selected_equity), default=0.0
+        )
+        average_mfe = _mean(_numeric(row.get("mfe")) for row in selected_excursions)
+        average_mae = _mean(_numeric(row.get("mae")) for row in selected_excursions)
+        by_session = Counter(
+            str(row.get("session_label") or _extra_fields(row).get("session_label") or "UNKNOWN")
+            for row in selected_orders
+        )
+        by_execution = Counter(
+            str(row.get("order_type") or "UNKNOWN") for row in selected_orders
+        )
+        by_hour: Counter[str] = Counter()
+        for row in selected_trades:
+            timestamp = row.get("event_ts")
+            if isinstance(timestamp, datetime):
+                by_hour[timestamp.astimezone(_MOSCOW).strftime("%H:00")] += 1
+        lines.extend(
+            (
+                f"## {strategy_id}_{version}",
+                "",
+                f"- Status: `{strategy.get('status', 'UNKNOWN')}`",
+                f"- Activation: `{strategy.get('activated_at', 'UNKNOWN')}`",
+                f"- Evaluations: {len(selected_evaluations)}",
+                f"- Signals: {len(selected_signals)}",
+                "- Independent episodes: "
+                f"{len({row.get('signal_id') for row in selected_signals})}",
+                f"- Rejected signals: {rejected}",
+                f"- Orders: {len(selected_orders)}",
+                "- FULL/PARTIAL/NO_FILL: "
+                f"{order_statuses['FULL_FILL']}/{order_statuses['PARTIAL_FILL']}/"
+                f"{order_statuses['NO_FILL']}",
+                f"- Fills: {fill_count}",
+                f"- Entries / exits / open positions: "
+                f"{entries}/{len(selected_trades)}/{open_positions}",
+                f"- LONG / SHORT: {sides['LONG']}/{sides['SHORT']}",
+                f"- Trades: {len(selected_trades)}",
+                f"- Gross PnL: {gross:.8f}",
+                f"- Net PnL: {pnl:.8f}",
+                f"- Win rate: {win_rate:.6f}",
+                f"- Average win: {(sum(wins) / len(wins) if wins else 0):.8f}",
+                f"- Average loss: {(sum(losses) / len(losses) if losses else 0):.8f}",
+                f"- Expectancy: {expectancy:.8f}",
+                f"- Profit factor: {profit_factor:.8f}",
+                f"- Maximum drawdown: {maximum_drawdown:.8f}",
+                f"- Mean MFE / MAE: {average_mfe:.8f}/{average_mae:.8f}",
+                "- Result without best 1/3/5: "
+                + "/".join(f"{_without_best(selected_trades, count):.8f}" for count in (1, 3, 5)),
+                f"- Orders by session: {_counter_summary(by_session)}",
+                f"- Trades by Moscow hour: {_counter_summary(by_hour)}",
+                f"- Orders by execution model: {_counter_summary(by_execution)}",
+                "",
+            )
+        )
+    quality_kinds = Counter(str(row.get("kind") or "UNKNOWN") for row in quality)
+    health_statuses = Counter(str(row.get("status") or "UNKNOWN") for row in health)
+    reconnect_generations = {
+        int(_numeric(value))
+        for row in quality
+        if (
+            value := row.get("reconnect_generation")
+            or _extra_fields(row).get("reconnect_generation")
+        )
+        is not None
+    }
+    gaps = sum(
+        1
+        for row in quality
+        if str(row.get("gap_status") or _extra_fields(row).get("gap_status") or "OK")
+        != "OK"
+    )
+    lines.extend(
+        (
+            "## Runtime continuity",
+            "",
+            f"- Stream reconnects: {max(0, len(reconnect_generations) - 1)}",
+            f"- Gaps: {gaps + quality_kinds['ORDERBOOK_GAP']}",
+            f"- Stale intervals: {quality_kinds['STALE_DATA']}",
+            f"- Health events: {_counter_summary(health_statuses)}",
+            "- Downtime: derived from timestamped health/data-quality intervals in Parquet",
+            "",
+            "## Archive quality",
+            "",
+            f"- Dataset count: {len(row_counts)}",
+            f"- Total rows: {sum(row_counts.values())}",
+            "- Validation: independent reconciliation is completed before publication",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _strategy_rows(
+    rows: list[dict[str, object]], strategy_id: str, version: str
+) -> list[dict[str, object]]:
+    return [
+        row
+        for row in rows
+        if row.get("strategy_id") == strategy_id
+        and row.get("strategy_version") == version
+    ]
+
+
+def _extra_fields(row: dict[str, object]) -> dict[str, object]:
+    raw = row.get("extra_json")
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _mean(values: Iterable[float]) -> float:
+    materialized = list(values)
+    return sum(materialized) / len(materialized) if materialized else 0.0
+
+
+def _counter_summary(values: Counter[str]) -> str:
+    return ", ".join(f"{key}={count}" for key, count in sorted(values.items())) or "none"
+
+
+def _without_best(rows: list[dict[str, object]], count: int) -> float:
+    values = sorted((_numeric(row.get("net_pnl")) for row in rows), reverse=True)
+    return sum(values[min(count, len(values)) :])
+
+
+def _numeric(value: object) -> float:
+    return float(str(value or 0))
+
+
+def _validation_report(result: ArchiveValidationResult) -> str:
+    lines = [
+        "# Validation report",
+        "",
+        f"Overall: **{'PASS' if result.passed else 'FAIL'}**",
+        "",
+        f"- PyArrow: {'PASS' if result.pyarrow_verified else 'FAIL'}",
+        f"- DuckDB: {'PASS' if result.duckdb_verified else 'FAIL'}",
+        f"- Independent reconciliation: "
+        f"{'PASS' if result.independent_reconciliation_verified else 'FAIL'}",
+        f"- Unexplained discrepancies: {result.unexplained_discrepancies}",
+        "- Typed schemas / PK / FK / timestamps: covered by overall result",
+        "- PnL / positions / equity / MFE / MAE: independently reconciled",
+        "- Event-window coverage / source lineage: covered by overall result",
+        "- Secret scan: covered by overall result",
+        "",
+    ]
+    if result.errors:
+        lines.extend(("## Errors", "", *(f"- {item}" for item in result.errors)))
+    return "\n".join(lines) + "\n"
+
+
+__all__ = [
+    "ArchiveBuildRequest",
+    "ArchiveError",
+    "ArchiveValidationResult",
+    "ArchiveValidator",
+    "BuiltArchive",
+    "DailyArchiveBuilder",
+    "REQUIRED_DOCUMENTS",
+]

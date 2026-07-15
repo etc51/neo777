@@ -1,0 +1,13 @@
+[Unit]
+Description=Retry pending Neobitcoin paper archive deliveries without blocking trading
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=60s
+AccuracySec=10s
+RandomizedDelaySec=15s
+Persistent=true
+Unit=neobitcoin-paper-delivery.service
+
+[Install]
+WantedBy=timers.target
