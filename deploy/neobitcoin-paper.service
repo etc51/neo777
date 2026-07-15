@@ -17,10 +17,10 @@ WorkingDirectory=/opt/neobitcoin-paper
 EnvironmentFile=/etc/neobitcoin-paper/paper.env
 Environment=PAPER_ONLY=true
 Environment=NEOBITCOIN_PAPER_DATA=/var/lib/neobitcoin-paper
-Environment=NEOBITCOIN_PAPER_TOKEN_FILE=%d/tbank-token
+Environment=NEOBITCOIN_PAPER_TOKEN_FILE=%d/tbank-token.txt
 Environment=NEOBITCOIN_PAPER_HEALTH_HOST=127.0.0.1
 Environment=NEOBITCOIN_PAPER_HEALTH_PORT=8787
-LoadCredential=tbank-token:/etc/neobitcoin-paper/tbank-token
+LoadCredential=tbank-token.txt:/etc/neobitcoin-paper/tbank-token
 ExecStart=/usr/bin/env PAPER_ONLY=true /opt/neobitcoin-paper/.venv/bin/python -m neobitcoin_paper.cli run --confirm PAPER_ONLY
 Restart=always
 RestartSec=5s

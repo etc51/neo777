@@ -62,7 +62,7 @@ def test_main_unit_is_paper_only_loopback_and_restart_unlimited() -> None:
     assert "NEOBITCOIN_PAPER_HEALTH_HOST=127.0.0.1" in service["Environment"]
     assert "NEOBITCOIN_PAPER_HEALTH_PORT=8787" in service["Environment"]
     assert _one(unit, "Service", "LoadCredential") == (
-        "tbank-token:/etc/neobitcoin-paper/tbank-token"
+        "tbank-token.txt:/etc/neobitcoin-paper/tbank-token"
     )
     assert _one(unit, "Service", "ExecStart") == (
         "/usr/bin/env PAPER_ONLY=true /opt/neobitcoin-paper/.venv/bin/python "

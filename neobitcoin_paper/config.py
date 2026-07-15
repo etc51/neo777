@@ -70,7 +70,7 @@ class PaperConfig:
         token_file = Path(
             values.get(
                 "NEOBITCOIN_PAPER_TOKEN_FILE",
-                "/run/credentials/neobitcoin-paper.service/tbank-token",
+                "/run/credentials/neobitcoin-paper.service/tbank-token.txt",
             )
         )
         thread_id_file = Path(
