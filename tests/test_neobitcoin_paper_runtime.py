@@ -21,6 +21,7 @@ from neobitcoin_paper.runtime import (
     build_daily_archive,
 )
 from neobitcoin_paper.state import PaperStateStore
+from neobitcoin_paper.strategies import frozen_counterflow_v1
 
 UID = "4effa274-4e8f-422c-93ff-04aa34fe8e39"
 
@@ -38,8 +39,10 @@ def _config(root: Path) -> PaperConfig:
     )
 
 
-def _event(event_id: str = "runtime-event") -> CanonicalMarketEvent:
-    now = datetime.now(UTC)
+def _event(
+    event_id: str = "runtime-event", observed_at: datetime | None = None
+) -> CanonicalMarketEvent:
+    now = observed_at or datetime.now(UTC)
     return CanonicalMarketEvent(
         event_id=event_id,
         event_type="reconnect",
@@ -171,10 +174,22 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
             ).fetchone()[0]
         )
         accounts = int(connection.execute("SELECT count(*) FROM virtual_accounts").fetchone()[0])
+        lifecycle = connection.execute(
+            """
+            SELECT strategy_id, lifecycle_status, evaluation_cohort, enabled
+            FROM strategy_registry ORDER BY strategy_id
+            """
+        ).fetchall()
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert generations == 2
     assert events == 1
     assert strategies == 2
     assert accounts == 2
+    assert schema_version == 3
+    assert lifecycle == [
+        ("L5_FLOW_ALIGNMENT", "FROZEN_PAPER_SECONDARY", "LIVE_OOS", 1),
+        ("MICRO_FLOW_ALIGNMENT", "FROZEN_PAPER", "LIVE_OOS", 1),
+    ]
     assert market.discoveries == 2
     assert all(server.started and server.closed for server in servers)
     assert notifier.messages.count("READY=1") == 2
@@ -185,6 +200,50 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
     )
     assert UID in snapshot
     assert "market-data-token" not in snapshot
+
+
+def test_existing_strong_counterflow_is_preserved_but_forcibly_disabled(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
+    config = _config(tmp_path / "paper")
+    config.ensure_directories()
+    specification = frozen_counterflow_v1(
+        created_at=now - timedelta(minutes=1),
+        activated_at=now + timedelta(seconds=10),
+    )
+    with PaperStateStore(
+        config.data_root / "state" / "paper_state.sqlite3",
+        clock=lambda: now,
+    ) as state:
+        state.register_strategy(
+            specification.strategy_id,
+            specification.version,
+            config=dict(specification.parameters),
+            code_hash=specification.code_hash,
+            activated_at=specification.activated_at or now,
+            enabled=True,
+        )
+        runtime = PaperRuntime(
+            config,
+            environ={"PAPER_ONLY": "true"},
+            market_data=_FiniteMarketData((_event(),)),
+            clock=lambda: now,
+        )
+        installed = runtime._strategy_specifications(state)
+        by_id = {item.strategy_id: (item, enabled) for item, _, enabled in installed}
+        strong, strong_enabled = by_id["STRONG_COUNTERFLOW_ABSORPTION"]
+        assert strong.status.value == "REJECTED_OOS_AS_FORMALIZED"
+        assert strong_enabled is False
+        assert by_id["MICRO_FLOW_ALIGNMENT"][1] is True
+        assert by_id["L5_FLOW_ALIGNMENT"][1] is True
+        row = state.connection.execute(
+            """
+            SELECT enabled FROM strategy_registry
+            WHERE strategy_id = 'STRONG_COUNTERFLOW_ABSORPTION'
+            """
+        ).fetchone()
+        assert row is not None and int(row["enabled"]) == 0
 
 
 def test_disk_guard_pauses_signals_before_emergency(tmp_path: Path) -> None:
@@ -216,6 +275,7 @@ def test_live_closed_status_plus_grace_finalizes_writer_for_archive(
         health_server_factory=lambda *_args: _HealthServer(),
         notifier=_Notifier(),
         disk_guard=DiskGuard(config, usage=lambda _path: SimpleNamespace(free=1_000)),
+        clock=lambda: closed_at - timedelta(minutes=1),
     )
     asyncio.run(runtime.run())
 
@@ -243,13 +303,15 @@ def test_restart_after_preopen_finalizes_prior_durable_session(tmp_path: Path) -
     )
     state.close()
 
+    started_at = datetime(2026, 7, 15, 4, 0, tzinfo=UTC)
     runtime = PaperRuntime(
         config,
         environ={"PAPER_ONLY": "true"},
-        market_data=_FiniteMarketData((_event("post-downtime"),)),
+        market_data=_FiniteMarketData((_event("post-downtime", started_at),)),
         health_server_factory=lambda *_args: _HealthServer(),
         notifier=_Notifier(),
         disk_guard=DiskGuard(config, usage=lambda _path: SimpleNamespace(free=1_000)),
+        clock=lambda: started_at,
     )
     asyncio.run(runtime.run())
 

@@ -55,7 +55,15 @@ class PaperExecutionAdapter:
         created = as_utc(created_ts or intent.decision_ts, "created_ts")
         if created < intent.decision_ts:
             raise LookAheadError("paper order cannot be created before its intent")
-        eligible = max(intent.eligible_ts, created + self._decision_latency)
+        # Approved next-book strategies measure latency but always attempt the
+        # first strictly subsequent received book.  Other models retain the
+        # configurable simulated decision delay.
+        latency = (
+            timedelta(0)
+            if intent.metadata.get("max_entry_wait_seconds") is not None
+            else self._decision_latency
+        )
+        eligible = max(intent.eligible_ts, created + latency)
         order_id = deterministic_id(
             "order",
             intent.intent_id,

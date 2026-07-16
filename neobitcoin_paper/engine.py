@@ -21,6 +21,7 @@ from .domain import (
     ExitDecision,
     ExitPolicy,
     ExitReason,
+    FillStatus,
     MarketEvent,
     OrderBook,
     PaperIntent,
@@ -28,6 +29,7 @@ from .domain import (
     PaperPosition,
     PositionStatus,
     Side,
+    StrategyVersion,
     as_utc,
     decimal_value,
     deterministic_id,
@@ -225,6 +227,8 @@ class PaperTradingEngine:
                 self._replace_account(account, at, event.event_id)
         for order in self._restored_orders.values():
             self._state.remove_open_order(order.order_id)
+        for intent_id in tuple(self._pending):
+            self._state.remove_pending_intent(intent_id)
         self._pending.clear()
         self._restored_orders.clear()
         self._active_windows.intersection_update(self._position_signals.values())
@@ -308,7 +312,7 @@ class PaperTradingEngine:
             features=feature_snapshot,
             session=session,
             data_quality=quality,
-            own_state={},
+            own_state=self._strategy_runtime_state(),
         )
         decisions, errors = await self._supervisor.evaluate_all(context)
         error_ids = [self._record_strategy_error(error, session) for error in errors]
@@ -345,13 +349,34 @@ class PaperTradingEngine:
         if event.event_type == "reconnect":
             self._quality_gate.on_connect()
             self._features.reset_continuity()
+            self._reset_plugin_continuity()
         elif event.event_type == "disconnect":
             self._quality_gate.on_disconnect()
             self._features.reset_continuity()
+            self._reset_plugin_continuity()
         snapshot = self._quality_gate.observe(event)
         if event.gap_status != "OK":
             self._features.reset_continuity()
+            self._reset_plugin_continuity()
         return snapshot
+
+    def _reset_plugin_continuity(self) -> None:
+        for plugin in self._plugins:
+            reset = getattr(plugin, "reset_continuity", None)
+            if callable(reset):
+                reset()
+
+    def _strategy_runtime_state(self) -> Mapping[str, object]:
+        result: dict[str, object] = {}
+        for key in self._registry.versions:
+            result[key] = {
+                "pending": any(
+                    item.intent.strategy_id + "_" + item.intent.strategy_version == key
+                    for item in self._pending.values()
+                ),
+                "open": any(position.strategy_key == key for position in self._positions.values()),
+            }
+        return result
 
     @staticmethod
     def _domain_quality(snapshot: DataQualitySnapshot) -> DataQuality:
@@ -503,20 +528,39 @@ class PaperTradingEngine:
             self._append_raw(signal_id, buffered)
         if not accepted or decision.intent is None:
             return signal_id, False
-        if not self._state.remember_idempotency(
-            "paper-intent",
-            decision.intent.intent_id,
-            result={"signal_id": signal_id},
-        ):
-            return signal_id, False
-        self._pending[decision.intent.intent_id] = _PendingIntent(
+        pending = _PendingIntent(
             intent=decision.intent,
             signal_id=signal_id,
             evaluation_id=decision.evaluation_id,
             queued_event_id=context.event.event_id,
         )
+        plugin_state: Mapping[str, object] = {}
+        strategy_key = decision.strategy_id + "_" + decision.version
+        for plugin in self._plugins:
+            if plugin.specification.key != strategy_key:
+                continue
+            on_accepted = getattr(plugin, "on_intent_accepted", None)
+            if callable(on_accepted):
+                on_accepted(decision.intent)
+            snapshot = getattr(plugin, "snapshot_state", None)
+            if callable(snapshot):
+                plugin_state = cast(Mapping[str, object], snapshot())
+            break
+        claimed = self._state.claim_pending_intent(
+            decision.intent.intent_id,
+            strategy_id=decision.intent.strategy_id,
+            strategy_version=decision.intent.strategy_version,
+            state={
+                "intent": _intent_state(decision.intent),
+                "signal_id": signal_id,
+                "evaluation_id": decision.evaluation_id,
+                "queued_event_id": context.event.event_id,
+                "plugin_state": _jsonable(plugin_state),
+            },
+        )
+        self._pending[decision.intent.intent_id] = pending
         self._active_windows.add(signal_id)
-        return signal_id, True
+        return signal_id, claimed
 
     def _entry_rejection(
         self,
@@ -571,7 +615,7 @@ class PaperTradingEngine:
             tuple(self._pending.items()), key=lambda item: (item[1].intent.eligible_ts, item[0])
         ):
             intent = pending.intent
-            if book.receive_ts < intent.eligible_ts:
+            if book.receive_ts <= intent.decision_ts or book.receive_ts < intent.eligible_ts:
                 continue
             order = self._restored_orders.get(intent_id) or self._execution.create_order(intent)
             account = self._registry.account_for(intent.strategy_id, intent.strategy_version)
@@ -598,10 +642,54 @@ class PaperTradingEngine:
             if intent.execution_model is ExecutionModel.PASSIVE:
                 self._restored_orders[intent_id] = order
                 continue
-            execution = self._execution.execute_aggressive(order, book)
-            oracle = IndependentOracle.validate_aggressive(order, book, execution)
-            if not oracle.passed:
-                raise DomainValidationError("independent oracle rejected paper execution")
+            maximum_wait = int(intent.metadata.get("max_entry_wait_seconds", 0) or 0)
+            maximum_spread = int(intent.metadata.get("max_entry_spread_ticks", 0) or 0)
+            expected_generation = int(
+                intent.metadata.get("signal_reconnect_generation", book.reconnect_generation)
+            )
+            spread = (
+                book.best_ask - book.best_bid
+                if book.best_bid is not None and book.best_ask is not None
+                else None
+            )
+            spread_ratio = spread / self._tick_size if spread is not None else None
+            spread_ticks = (
+                int(spread_ratio)
+                if spread_ratio is not None
+                and spread_ratio == spread_ratio.to_integral_value()
+                else None
+            )
+            no_fill_reason = None
+            if book.reconnect_generation != expected_generation:
+                no_fill_reason = "STREAM_GENERATION_CHANGED"
+            elif maximum_wait and book.receive_ts > intent.decision_ts + timedelta(
+                seconds=maximum_wait
+            ):
+                no_fill_reason = "ENTRY_TIMEOUT"
+            elif maximum_spread and (spread_ticks is None or spread_ticks > maximum_spread):
+                no_fill_reason = "ENTRY_SPREAD_GATE"
+            execution = (
+                ExecutionResult(
+                    order_id=order.order_id,
+                    status=FillStatus.NO_FILL,
+                    reason=no_fill_reason,
+                    requested_quantity=order.quantity,
+                    filled_quantity=Decimal("0"),
+                    unfilled_quantity=order.quantity,
+                    vwap=None,
+                    fills=(),
+                    source_event_id=book.event_id,
+                    top_price=book.best_ask if intent.side is Side.BUY else book.best_bid,
+                )
+                if no_fill_reason is not None
+                else self._execution.execute_aggressive(order, book)
+            )
+            if no_fill_reason is None:
+                oracle = IndependentOracle.validate_aggressive(order, book, execution)
+                if not oracle.passed:
+                    raise DomainValidationError(
+                        "independent oracle rejected paper execution"
+                    )
             order_ids.append(order.order_id)
             fill_ids.extend(fill.fill_id for fill in execution.fills)
             self._record_execution(order, execution, pending, account, session, event)
@@ -625,6 +713,7 @@ class PaperTradingEngine:
             else:
                 self._active_windows.discard(pending.signal_id)
             self._state.remove_open_order(order.order_id)
+            self._state.remove_pending_intent(intent_id)
             self._pending.pop(intent_id, None)
             self._restored_orders.pop(intent_id, None)
         return order_ids, fill_ids, opened_ids
@@ -852,6 +941,31 @@ class PaperTradingEngine:
     ) -> None:
         assert position.exit_price is not None
         trade_id = deterministic_id("trade", position.position_id, execution.source_event_id)
+        specification = self._registry.version(
+            position.strategy_id, position.strategy_version
+        )
+        stress_ticks_each_side = Decimal(
+            str(specification.parameters.get("additional_slippage_ticks_each_side", 0))
+        )
+        stress_cost = (
+            Decimal("2")
+            * stress_ticks_each_side
+            * self._tick_size
+            * position.quantity
+        )
+        raw_pnl_ticks = position.realized_gross_pnl / (
+            self._tick_size * position.quantity
+        )
+        stress_entry_price = (
+            position.entry_price + self._tick_size * stress_ticks_each_side
+            if position.is_long
+            else position.entry_price - self._tick_size * stress_ticks_each_side
+        )
+        stress_exit_price = (
+            position.exit_price - self._tick_size * stress_ticks_each_side
+            if position.is_long
+            else position.exit_price + self._tick_size * stress_ticks_each_side
+        )
         self._datasets.append(
             "paper_trades",
             {
@@ -871,6 +985,13 @@ class PaperTradingEngine:
                 "gross_pnl": position.realized_gross_pnl,
                 "fees": position.realized_gross_pnl - position.realized_net_pnl,
                 "net_pnl": position.realized_net_pnl,
+                "raw_pnl_ticks": raw_pnl_ticks,
+                "stress_entry_price": stress_entry_price,
+                "stress_exit_price": stress_exit_price,
+                "stress_pnl": position.realized_gross_pnl - stress_cost,
+                "stress_net_pnl": position.realized_net_pnl - stress_cost,
+                "stress_pnl_ticks": raw_pnl_ticks - Decimal("2") * stress_ticks_each_side,
+                "stress_slippage_ticks_each_side": stress_ticks_each_side,
                 "entry_ts": position.opened_ts,
                 "exit_ts": position.closed_ts,
                 "entry_event_id": position.entry_event_id,
@@ -922,6 +1043,90 @@ class PaperTradingEngine:
                 ),
             },
         )
+        self._record_shadow_results(
+            position,
+            trade_id=trade_id,
+            event=event,
+            specification=specification,
+        )
+
+    def _record_shadow_results(
+        self,
+        position: PaperPosition,
+        *,
+        trade_id: str,
+        event: CanonicalMarketEvent,
+        specification: StrategyVersion,
+    ) -> None:
+        signal_id = self._position_signals.get(position.position_id)
+        if signal_id is None:
+            return
+        mae_ticks = position.mae / (self._tick_size * position.quantity)
+        mfe_ticks = position.mfe / (self._tick_size * position.quantity)
+        for raw_ticks in specification.parameters.get("shadow_stop_ticks", ()):
+            stop_ticks = int(raw_ticks)
+            triggered = mae_ticks >= stop_ticks
+            stop_level = (
+                position.entry_price - Decimal(stop_ticks) * self._tick_size
+                if position.is_long
+                else position.entry_price + Decimal(stop_ticks) * self._tick_size
+            )
+            self._datasets.append(
+                "shadow_stop_results",
+                {
+                    "result_id": deterministic_id("shadow-stop", trade_id, stop_ticks),
+                    "event_ts": event.processing_ts,
+                    "signal_id": signal_id,
+                    "order_id": None,
+                    "position_id": position.position_id,
+                    "strategy_id": position.strategy_id,
+                    "strategy_version": position.strategy_version,
+                    "stop_ticks": stop_ticks,
+                    "stop_level": stop_level,
+                    "triggered": triggered,
+                    "exit_price": stop_level if triggered else None,
+                    "pnl": (
+                        -Decimal(stop_ticks) * self._tick_size * position.quantity
+                        if triggered
+                        else None
+                    ),
+                    "source_event_id": (
+                        position.mae_event_id if triggered else position.exit_event_id
+                    ),
+                },
+            )
+        for raw_ticks in specification.parameters.get("shadow_take_ticks", ()):
+            take_ticks = int(raw_ticks)
+            triggered = mfe_ticks >= take_ticks
+            exit_price = (
+                position.entry_price + Decimal(take_ticks) * self._tick_size
+                if position.is_long
+                else position.entry_price - Decimal(take_ticks) * self._tick_size
+            )
+            self._datasets.append(
+                "shadow_exit_results",
+                {
+                    "result_id": deterministic_id("shadow-take", trade_id, take_ticks),
+                    "event_ts": event.processing_ts,
+                    "signal_id": signal_id,
+                    "order_id": None,
+                    "position_id": position.position_id,
+                    "strategy_id": position.strategy_id,
+                    "strategy_version": position.strategy_version,
+                    "exit_model": f"TAKE_{take_ticks}_TICKS",
+                    "triggered": triggered,
+                    "trigger_reason": "MFE_REACHED" if triggered else "NOT_REACHED",
+                    "exit_price": exit_price if triggered else None,
+                    "pnl": (
+                        Decimal(take_ticks) * self._tick_size * position.quantity
+                        if triggered
+                        else None
+                    ),
+                    "source_event_id": (
+                        position.mfe_event_id if triggered else position.exit_event_id
+                    ),
+                },
+            )
 
     def _persist_position(
         self,
@@ -1191,6 +1396,11 @@ class PaperTradingEngine:
                 ],
                 "active_windows": sorted(self._active_windows),
                 "last_book": _book_state(self._last_book) if self._last_book is not None else None,
+                "plugin_states": {
+                    plugin.specification.key: _jsonable(snapshot())
+                    for plugin in self._plugins
+                    if callable(snapshot := getattr(plugin, "snapshot_state", None))
+                },
             },
             event_id=event_id,
         )
@@ -1207,6 +1417,7 @@ class PaperTradingEngine:
 
     def _restore_and_register(self, recovery: RecoverySnapshot) -> None:
         account_rows = {row["account_id"]: row for row in recovery.virtual_accounts}
+        enabled_keys = {plugin.specification.key for plugin in self._plugins}
         for key, version in sorted(self._registry.versions.items()):
             if version.activated_at is None:
                 raise DomainValidationError(f"registered paper version {key} lacks activated_at")
@@ -1216,7 +1427,26 @@ class PaperTradingEngine:
                 config=cast(Mapping[str, Any], _jsonable(version.parameters)),
                 code_hash=version.code_hash or deterministic_id("code", key),
                 activated_at=version.activated_at,
-                enabled=True,
+                enabled=key in enabled_keys,
+                lifecycle_status=version.status.value,
+                evaluation_cohort=str(
+                    version.parameters.get("evaluation_cohort", "LIVE_OOS")
+                ),
+                lifecycle=_strategy_lifecycle(version),
+            )
+            self._state.set_strategy_enabled(
+                version.strategy_id,
+                version.version,
+                key in enabled_keys,
+            )
+            self._state.set_strategy_lifecycle(
+                version.strategy_id,
+                version.version,
+                lifecycle_status=version.status.value,
+                evaluation_cohort=str(
+                    version.parameters.get("evaluation_cohort", "LIVE_OOS")
+                ),
+                lifecycle=_strategy_lifecycle(version),
             )
             account = self._registry.accounts[key]
             row = account_rows.get(account.account_id)
@@ -1239,6 +1469,13 @@ class PaperTradingEngine:
             {},
         )
         if isinstance(checkpoint, Mapping):
+            plugin_states = checkpoint.get("plugin_states", {})
+            if isinstance(plugin_states, Mapping):
+                for plugin in self._plugins:
+                    restore = getattr(plugin, "restore_state", None)
+                    saved = plugin_states.get(plugin.specification.key)
+                    if callable(restore) and isinstance(saved, Mapping):
+                        restore(cast(Mapping[str, object], saved))
             book_data = checkpoint.get("last_book")
             if isinstance(book_data, Mapping):
                 self._last_book = _book_from_state(cast(Mapping[str, Any], book_data))
@@ -1259,6 +1496,33 @@ class PaperTradingEngine:
             windows = checkpoint.get("active_windows", [])
             if isinstance(windows, list):
                 self._active_windows.update(str(item) for item in windows)
+
+        for row in recovery.pending_intents:
+            state = row.get("state", {})
+            if not isinstance(state, Mapping) or not isinstance(
+                state.get("intent"), Mapping
+            ):
+                continue
+            intent = _intent_from_state(cast(Mapping[str, Any], state["intent"]))
+            self._pending[intent.intent_id] = _PendingIntent(
+                intent=intent,
+                signal_id=str(state.get("signal_id", intent.intent_id)),
+                evaluation_id=str(state.get("evaluation_id", "recovered-durable")),
+                queued_event_id=str(state.get("queued_event_id", "recovered-durable")),
+            )
+            self._active_windows.add(str(state.get("signal_id", intent.intent_id)))
+            saved_plugin = state.get("plugin_state")
+            if not isinstance(saved_plugin, Mapping):
+                continue
+            for plugin in self._plugins:
+                if plugin.specification.key != (
+                    intent.strategy_id + "_" + intent.strategy_version
+                ):
+                    continue
+                restore = getattr(plugin, "restore_state", None)
+                if callable(restore):
+                    restore(cast(Mapping[str, object], saved_plugin))
+                break
 
         for row in recovery.open_orders:
             state = row.get("state", {})
@@ -1302,6 +1566,28 @@ class PaperTradingEngine:
             entry_fill = trailing.get("entry_fill_id")
             if entry_fill:
                 self._entry_fills[position.position_id] = str(entry_fill)
+
+
+def _strategy_lifecycle(version: StrategyVersion) -> dict[str, object]:
+    lifecycle: dict[str, object] = {
+        "status": version.status.value,
+        "new_entries_enabled": version.is_active_at(version.activated_at)
+        if version.activated_at is not None
+        else False,
+        "activated_at": version.activated_at,
+        "deactivated_at": version.deactivated_at,
+    }
+    if version.strategy_id == "STRONG_COUNTERFLOW_ABSORPTION":
+        lifecycle.update(
+            {
+                "new_entries_enabled": False,
+                "rejected_on": "2026-07-15",
+                "oos_signals": 11,
+                "oos_mean_ticks": "-150.6364",
+                "oos_profit_factor": "0.2465",
+            }
+        )
+    return lifecycle
 
 
 def _levels(value: object, *, descending: bool) -> tuple[BookLevel, ...]:

@@ -11,7 +11,7 @@ import shutil
 import signal
 import socket
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -30,7 +30,7 @@ from .calendar import SessionCalendar
 from .config import PaperConfig
 from .datasets import DatasetStore
 from .delivery import ArtifactDescriptor, CodexSameThreadTransport
-from .domain import StrategyVersion
+from .domain import StrategyStatus, StrategyVersion
 from .engine import PaperTradingEngine
 from .execution import PaperExecutionAdapter
 from .ingest import (
@@ -46,9 +46,11 @@ from .safety import enforce_startup_boundary
 from .state import PaperStateStore
 from .strategies import (
     CounterflowFeatureEngine,
+    FlowAlignmentStrategy,
+    PaperStrategy,
     StrongCounterflowAbsorptionStrategy,
-    frozen_counterflow_v1,
     frozen_counterflow_version,
+    frozen_flow_alignment_v1,
 )
 
 LOGGER = logging.getLogger("neobitcoin_paper.runtime")
@@ -306,6 +308,9 @@ def build_daily_archive(
             "config_hash": str(row["config_hash"]),
             "activated_at": str(row["activated_at"]),
             "enabled": bool(row["enabled"]),
+            "lifecycle_status": str(row.get("lifecycle_status", "FROZEN_PAPER")),
+            "evaluation_cohort": str(row.get("evaluation_cohort", "LIVE_OOS")),
+            "lifecycle": row.get("lifecycle", {}),
             "parameters": row.get("config", {}),
         }
         for row in recovery.strategies
@@ -378,6 +383,7 @@ class PaperRuntime:
         health_server_factory: Callable[[HealthRegistry, str, int], Any] = HealthServer,
         notifier: Notifier | None = None,
         disk_guard: DiskGuard | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self._environ = dict(os.environ if environ is None else environ)
@@ -386,6 +392,7 @@ class PaperRuntime:
         self._health_server_factory = health_server_factory
         self._notifier = notifier or SystemdNotifier(self._environ.get("NOTIFY_SOCKET"))
         self._disk_guard = disk_guard or DiskGuard(config)
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._calendar = SessionCalendar()
         self._ready_notified = False
         self._engine: PaperTradingEngine | None = None
@@ -414,6 +421,7 @@ class PaperRuntime:
         state = PaperStateStore(
             self.config.data_root / "state" / "paper_state.sqlite3",
             restart_metadata={"paper_only": True},
+            clock=self._now,
         )
         self._state = state
         try:
@@ -428,7 +436,7 @@ class PaperRuntime:
             )
             self.health.heartbeat("instrument", healthy=True, ready=True)
             self._last_trading_status = _normalize_trading_status(instrument.trading_status)
-            started_at = datetime.now(UTC)
+            started_at = self._now()
             initial_session = self._calendar.resolve(
                 started_at, self._last_trading_status
             ).session_date_msk
@@ -531,7 +539,7 @@ class PaperRuntime:
             try:
                 state.quick_check()
                 state.checkpoint("PASSIVE")
-                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                stamp = self._now().strftime("%Y%m%dT%H%M%SZ")
                 state.backup(self.config.data_root / "state" / "backups" / f"paper-{stamp}.sqlite")
             finally:
                 state.close()
@@ -541,7 +549,7 @@ class PaperRuntime:
         self, state: PaperStateStore, session_date: date
     ) -> PaperTradingEngine:
         registry = StrategyRegistry()
-        plugins: list[StrongCounterflowAbsorptionStrategy] = []
+        plugins: list[PaperStrategy] = []
         for specification, registered_at, enabled in self._strategy_specifications(state):
             registry = registry.register(
                 specification,
@@ -549,11 +557,19 @@ class PaperRuntime:
                 initial_cash=Decimal(str(self.config.initial_balance)),
             )
             if enabled:
-                plugins.append(
-                    StrongCounterflowAbsorptionStrategy(
-                        specification, latency_ms=self.config.decision_latency_ms
+                if specification.strategy_id in {
+                    "MICRO_FLOW_ALIGNMENT",
+                    "L5_FLOW_ALIGNMENT",
+                }:
+                    plugins.append(FlowAlignmentStrategy(specification))
+                elif specification.strategy_id == "STRONG_COUNTERFLOW_ABSORPTION":
+                    plugins.append(
+                        StrongCounterflowAbsorptionStrategy(
+                            specification, latency_ms=self.config.decision_latency_ms
+                        )
                     )
-                )
+                else:
+                    raise RuntimeError("enabled strategy has no installed sandboxed plugin")
         self._datasets = DatasetStore(self.config.data_root, session_date)
         gate = DataQualityGate(
             warmup_events=self.config.warmup_events,
@@ -575,63 +591,112 @@ class PaperRuntime:
             tick_size=self._tick_size,
         )
 
-    @staticmethod
     def _strategy_specifications(
+        self,
         state: PaperStateStore,
     ) -> tuple[tuple[StrategyVersion, datetime, bool], ...]:
         recovery = state.recover()
         if not recovery.strategies:
-            created = datetime.now(UTC)
+            created = self._now()
             activated = created + timedelta(seconds=5)
             return (
                 (
-                    frozen_counterflow_v1(created_at=created, activated_at=activated),
+                    frozen_flow_alignment_v1(
+                        "MICRO_FLOW_ALIGNMENT",
+                        created_at=created,
+                        activated_at=activated,
+                    ),
                     created + timedelta(seconds=1),
                     True,
                 ),
                 (
-                    frozen_counterflow_version(
-                        version="v1-shadow-s6-t100",
+                    frozen_flow_alignment_v1(
+                        "L5_FLOW_ALIGNMENT",
                         created_at=created,
                         activated_at=activated,
-                        parameter_overrides={
-                            "fixed_stop_ticks": 6,
-                            "take_profit_ticks": 100,
-                        },
-                        discovery_source=(
-                            "task-specified pre-registered OOS shadow stop/target grid"
-                        ),
                     ),
                     created + timedelta(seconds=1),
                     True,
                 ),
             )
         versions: list[tuple[StrategyVersion, datetime, bool]] = []
+        installed: set[str] = set()
         for row in recovery.strategies:
             enabled = bool(row["enabled"])
-            if row["strategy_id"] != "STRONG_COUNTERFLOW_ABSORPTION":
-                if enabled:
-                    raise RuntimeError("enabled strategy has no installed sandboxed plugin")
-                continue
             activated = datetime.fromisoformat(
                 str(row["activated_at"]).replace("Z", "+00:00")
             )
             registered = datetime.fromisoformat(
                 str(row["registered_at"]).replace("Z", "+00:00")
             )
-            specification = frozen_counterflow_version(
-                version=str(row["strategy_version"]),
-                created_at=registered - timedelta(microseconds=1),
-                activated_at=activated,
-                parameter_overrides=row.get("config", {}),
-                discovery_source="immutable persisted paper-strategy registry",
-            )
+            strategy_id = str(row["strategy_id"])
+            version = str(row["strategy_version"])
+            if strategy_id == "STRONG_COUNTERFLOW_ABSORPTION":
+                specification = replace(
+                    frozen_counterflow_version(
+                        version=version,
+                        created_at=registered - timedelta(microseconds=1),
+                        activated_at=activated,
+                        parameter_overrides=row.get("config", {}),
+                        discovery_source="immutable persisted paper-strategy registry",
+                    ),
+                    status=StrategyStatus.REJECTED_OOS_AS_FORMALIZED,
+                )
+                enabled = False
+                state.set_strategy_enabled(strategy_id, version, False)
+            elif strategy_id in {"MICRO_FLOW_ALIGNMENT", "L5_FLOW_ALIGNMENT"}:
+                if version != "v1":
+                    raise RuntimeError("unsupported immutable flow-alignment version")
+                specification = frozen_flow_alignment_v1(
+                    strategy_id,
+                    created_at=registered - timedelta(microseconds=1),
+                    activated_at=activated,
+                )
+                persisted_status = StrategyStatus(
+                    str(row.get("lifecycle_status", specification.status.value))
+                )
+                specification = replace(specification, status=persisted_status)
+                if str(row.get("evaluation_cohort", "LIVE_OOS")) != "LIVE_OOS":
+                    raise RuntimeError("flow-alignment evaluation cohort is not LIVE_OOS")
+                enabled = enabled and persisted_status in {
+                    StrategyStatus.FROZEN_PAPER,
+                    StrategyStatus.FROZEN_PAPER_SECONDARY,
+                    StrategyStatus.OOS_ACCUMULATION,
+                    StrategyStatus.PAPER_VALIDATED,
+                }
+                if not enabled:
+                    state.set_strategy_enabled(strategy_id, version, False)
+            else:
+                if enabled:
+                    state.set_strategy_enabled(strategy_id, version, False)
+                continue
             if specification.code_hash != str(row["code_hash"]):
                 raise RuntimeError("persisted strategy code hash does not match installed plugin")
             versions.append((specification, registered, enabled))
-        if not versions:
-            raise RuntimeError("no installed paper strategy version is registered")
+            installed.add(strategy_id)
+        created = self._now()
+        activated = created + timedelta(seconds=5)
+        for strategy_id in ("MICRO_FLOW_ALIGNMENT", "L5_FLOW_ALIGNMENT"):
+            if strategy_id in installed:
+                continue
+            versions.append(
+                (
+                    frozen_flow_alignment_v1(
+                        strategy_id,
+                        created_at=created,
+                        activated_at=activated,
+                    ),
+                    created + timedelta(seconds=1),
+                    True,
+                )
+            )
         return tuple(versions)
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise RuntimeError("paper runtime clock must return a timezone-aware datetime")
+        return value.astimezone(UTC)
 
     @staticmethod
     def _session_is_finalized(state: PaperStateStore, session_date: date) -> bool:

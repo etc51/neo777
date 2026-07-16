@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -30,6 +30,7 @@ from neobitcoin_paper.strategies import (
     PaperStrategy,
     StrategyContext,
     StrategyDecision,
+    frozen_flow_alignment_v1,
 )
 
 UID = "4effa274-4e8f-422c-93ff-04aa34fe8e39"
@@ -56,6 +57,7 @@ class SignalStrategy:
     quantity: Decimal = Decimal("1")
     latency: timedelta = timedelta(milliseconds=100)
     limit_price: Decimal | None = None
+    metadata: Mapping[str, object] | None = None
 
     def evaluate(self, context: StrategyContext) -> StrategyDecision:
         signal = bool(context.event.values.get("signal"))
@@ -79,6 +81,7 @@ class SignalStrategy:
                     trailing_ticks=Decimal("3"),
                     time_exit_seconds=60,
                 ),
+                metadata=self.metadata,
             )
         evaluation_id = deterministic_id(
             "test-evaluation", self.specification.key, context.event.event_id
@@ -169,6 +172,8 @@ def orderbook(
     *,
     signal: bool = False,
     ask_quantity: int = 10,
+    ask_price: int = 101,
+    bid_price: int = 100,
     gap: str = "OK",
 ) -> CanonicalMarketEvent:
     return canonical(
@@ -176,8 +181,8 @@ def orderbook(
         "orderbook",
         at,
         payload={
-            "bids": [{"price": 100, "quantity": 10}],
-            "asks": [{"price": 101, "quantity": ask_quantity}],
+            "bids": [{"price": bid_price, "quantity": 10}],
+            "asks": [{"price": ask_price, "quantity": ask_quantity}],
             "signal": signal,
         },
         gap=gap,
@@ -331,6 +336,12 @@ def test_duplicate_and_pending_intent_then_open_position_survive_restart(tmp_pat
         asyncio.run(make_ready(engine))
         asyncio.run(engine.process_event(signal_event))
         assert len(engine.pending_intents) == 1
+        # Simulate a crash before the broad engine checkpoint.  The accepted
+        # intent has its own atomic durable journal and must still recover.
+        state.connection.execute(
+            "DELETE FROM checkpoints WHERE worker_id = ?",
+            ("paper-trading-engine",),
+        )
         datasets.abort()
 
     with PaperStateStore(database) as recovered_state:
@@ -401,3 +412,173 @@ def test_no_lookahead_and_recovered_last_book_session_finalization(tmp_path: Pat
             BASE + timedelta(hours=17, minutes=5), "CLOSED"
         ) == ()
         datasets.close()
+
+
+def test_next_book_entry_spread_boundary_and_timeout_are_one_shot(tmp_path: Path) -> None:
+    metadata = {
+        "max_entry_wait_seconds": 5,
+        "max_entry_spread_ticks": 20,
+        "signal_reconnect_generation": 1,
+    }
+
+    passing_spec = spec("NEXT_BOOK_PASS")
+    with PaperStateStore(tmp_path / "pass.sqlite") as state:
+        engine, datasets = build_engine(
+            tmp_path / "pass-data",
+            state,
+            registry_for(passing_spec),
+            [
+                SignalStrategy(
+                    passing_spec,
+                    latency=timedelta(0),
+                    metadata=metadata,
+                )
+            ],
+        )
+        asyncio.run(make_ready(engine))
+        signal_at = BASE + timedelta(seconds=20)
+        signal = asyncio.run(
+            engine.process_event(
+                orderbook("next-book-signal", signal_at, signal=True)
+            )
+        )
+        assert not signal.order_ids
+        assert len(engine.pending_intents) == 1
+        fill = asyncio.run(
+            engine.process_event(
+                orderbook("spread-20", signal_at + timedelta(seconds=1), ask_price=120)
+            )
+        )
+        assert len(fill.opened_position_ids) == 1
+        datasets.abort()
+
+    rejected_spec = spec("NEXT_BOOK_REJECT")
+    with PaperStateStore(tmp_path / "reject.sqlite") as state:
+        engine, datasets = build_engine(
+            tmp_path / "reject-data",
+            state,
+            registry_for(rejected_spec),
+            [
+                SignalStrategy(
+                    rejected_spec,
+                    latency=timedelta(0),
+                    metadata=metadata,
+                )
+            ],
+        )
+        asyncio.run(make_ready(engine))
+        signal_at = BASE + timedelta(seconds=20)
+        asyncio.run(
+            engine.process_event(orderbook("spread-signal", signal_at, signal=True))
+        )
+        spread_reject = asyncio.run(
+            engine.process_event(
+                orderbook("spread-21", signal_at + timedelta(seconds=1), ask_price=121)
+            )
+        )
+        assert len(spread_reject.order_ids) == 1
+        assert not spread_reject.opened_position_ids
+        assert not engine.pending_intents
+
+        false_after_reject = asyncio.run(
+            engine.process_event(
+                orderbook("no-retry", signal_at + timedelta(seconds=2), ask_price=101)
+            )
+        )
+        assert not false_after_reject.order_ids
+        datasets.abort()
+
+    timeout_spec = spec("NEXT_BOOK_TIMEOUT")
+    with PaperStateStore(tmp_path / "timeout.sqlite") as state:
+        engine, datasets = build_engine(
+            tmp_path / "timeout-data",
+            state,
+            registry_for(timeout_spec),
+            [
+                SignalStrategy(
+                    timeout_spec,
+                    latency=timedelta(0),
+                    metadata=metadata,
+                )
+            ],
+        )
+        asyncio.run(make_ready(engine))
+        signal_at = BASE + timedelta(seconds=20)
+        asyncio.run(
+            engine.process_event(orderbook("timeout-signal", signal_at, signal=True))
+        )
+        timed_out = asyncio.run(
+            engine.process_event(
+                orderbook("after-timeout", signal_at + timedelta(seconds=6))
+            )
+        )
+        assert len(timed_out.order_ids) == 1
+        assert not timed_out.opened_position_ids
+        assert not engine.pending_intents
+        datasets.abort()
+
+
+def test_flow_shadow_stop_take_and_stress_outputs_are_materialized(
+    tmp_path: Path,
+) -> None:
+    flow_spec = frozen_flow_alignment_v1(
+        "MICRO_FLOW_ALIGNMENT",
+        created_at=BASE,
+        activated_at=BASE + timedelta(seconds=2),
+    )
+    with PaperStateStore(tmp_path / "shadow.sqlite") as state:
+        engine, datasets = build_engine(
+            tmp_path / "shadow-data",
+            state,
+            registry_for(flow_spec),
+            [SignalStrategy(flow_spec, latency=timedelta(0))],
+        )
+        asyncio.run(make_ready(engine))
+        signal_at = BASE + timedelta(seconds=20)
+        asyncio.run(
+            engine.process_event(
+                canonical("shadow-signal", "trade", signal_at, payload={"signal": True})
+            )
+        )
+        asyncio.run(
+            engine.process_event(orderbook("shadow-entry", signal_at + timedelta(seconds=1)))
+        )
+        closed = asyncio.run(
+            engine.process_event(
+                orderbook(
+                    "shadow-exit",
+                    signal_at + timedelta(seconds=122),
+                    bid_price=301,
+                    ask_price=302,
+                )
+            )
+        )
+        assert len(closed.closed_position_ids) == 1
+        stops = [
+            json.loads(line)
+            for line in datasets.active_path("shadow_stop_results")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        takes = [
+            json.loads(line)
+            for line in datasets.active_path("shadow_exit_results")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        trades = [
+            json.loads(line)
+            for line in datasets.active_path("paper_trades")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert len(stops) == 6 and not any(row["triggered"] for row in stops)
+        assert len(takes) == 5
+        assert [row["exit_model"] for row in takes if row["triggered"]] == [
+            "TAKE_200_TICKS"
+        ]
+        assert Decimal(trades[0]["stress_slippage_ticks_each_side"]) == Decimal("1")
+        assert Decimal(trades[0]["stress_pnl_ticks"]) == (
+            Decimal(trades[0]["raw_pnl_ticks"]) - Decimal("2")
+        )
+        datasets.abort()

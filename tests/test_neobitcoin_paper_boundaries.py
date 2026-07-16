@@ -323,3 +323,97 @@ def test_strategy_sandbox_emits_only_intent_after_point_in_time_features() -> No
     forbidden = "post" + "order"
     with pytest.raises(AttributeError):
         getattr(strategy, forbidden)
+
+
+def test_flow_snapshot_matches_schema_v41_formulas_and_resets_continuity() -> None:
+    now = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
+    uid = "4effa274-4e8f-422c-93ff-04aa34fe8e39"
+    features = CounterflowFeatureEngine(tick_size=Decimal("0.1"))
+    book = OrderBook(
+        event_id="flow-book",
+        instrument_uid=uid,
+        exchange_ts=now + timedelta(seconds=2),
+        receive_ts=now + timedelta(seconds=2, milliseconds=10),
+        processing_ts=now + timedelta(seconds=2, milliseconds=20),
+        bids=(
+            BookLevel(Decimal("100"), Decimal("30")),
+            BookLevel(Decimal("99.9"), Decimal("20")),
+        ),
+        asks=(
+            BookLevel(Decimal("100.2"), Decimal("10")),
+            BookLevel(Decimal("100.3"), Decimal("40")),
+        ),
+        trading_status="NORMAL_TRADING",
+    )
+    for event_id, offset, direction, quantity in (
+        ("flow-left-boundary", -3, "BUY", 100),
+        ("flow-buy", 0, "BUY", 3),
+        ("flow-sell", 1, "SELL", 1),
+        ("flow-unknown", 1, "UNKNOWN", 2),
+        ("flow-future", 3, "BUY", 100),
+    ):
+        at = now + timedelta(seconds=offset)
+        features.update(
+            MarketEvent(
+                event_id,
+                uid,
+                "trade",
+                at,
+                at,
+                at,
+                values={"direction": direction, "quantity": quantity, "price": 100},
+            ),
+            None,
+        )
+    features.update(
+        MarketEvent(
+            "flow-late-received",
+            uid,
+            "trade",
+            now + timedelta(seconds=1),
+            now + timedelta(seconds=4),
+            now + timedelta(seconds=4),
+            values={"direction": "BUY", "quantity": 100, "price": 100},
+        ),
+        None,
+    )
+    book_event = MarketEvent(
+        "flow-book-event",
+        uid,
+        "orderbook",
+        book.exchange_ts,
+        book.receive_ts,
+        book.processing_ts,
+    )
+    snapshot = features.update(book_event, book)
+
+    assert snapshot.best_bid == Decimal("100")
+    assert snapshot.best_ask == Decimal("100.2")
+    assert snapshot.bid_qty_1 == Decimal("30")
+    assert snapshot.ask_qty_1 == Decimal("10")
+    assert snapshot.mid_price == Decimal("100.1")
+    assert snapshot.spread == Decimal("0.2")
+    assert snapshot.bid_depth_l5 == snapshot.ask_depth_l5 == Decimal("50")
+    assert snapshot.imbalance_l5 == Decimal("0")
+    assert snapshot.microprice == Decimal("100.15")
+    assert snapshot.microprice_offset == Decimal("0.5")
+    assert snapshot.spread_ticks == 2
+    assert snapshot.alignment_ready
+    assert not snapshot.l5_ready
+    flow_5s = snapshot.flow_window(5)
+    assert flow_5s is not None
+    assert flow_5s.trade_count == 3
+    assert flow_5s.known_trade_count == 2
+    assert flow_5s.unknown_side_trade_count == 1
+    assert flow_5s.buy_volume == Decimal("3")
+    assert flow_5s.sell_volume == Decimal("1")
+    assert flow_5s.unknown_side_volume == Decimal("2")
+    assert flow_5s.trade_flow == Decimal("2")
+    assert flow_5s.trade_flow_ratio == Decimal("0.5")
+    assert flow_5s.first_event_id == "flow-buy"
+    assert flow_5s.last_event_id == "flow-unknown"
+
+    features.reset_continuity()
+    reset_snapshot = features.update(book_event, book)
+    reset_flow = reset_snapshot.flow_window(5)
+    assert reset_flow is not None and reset_flow.trade_count == 0

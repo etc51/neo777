@@ -1,0 +1,69 @@
+{
+  "generated_from_data_through": "2026-07-15",
+  "activation_not_before": "2026-07-16T00:00:00Z",
+  "strategies": [
+    {
+      "strategy_id": "MICRO_FLOW_ALIGNMENT",
+      "version": 1,
+      "status": "FROZEN_PAPER",
+      "side_rules": {
+        "LONG": {
+          "microprice_offset_gte": 0.4,
+          "trade_flow_ratio_5s_gte": 0.4
+        },
+        "SHORT": {
+          "microprice_offset_lte": -0.4,
+          "trade_flow_ratio_5s_lte": -0.4
+        }
+      },
+      "minimum_known_trades_5s": 1,
+      "max_entry_spread_ticks": 20,
+      "signal_mode": "rising_edge",
+      "cooldown_seconds": 120,
+      "entry": "next_received_orderbook_aggressive",
+      "time_exit_seconds": 120,
+      "additional_slippage_ticks_each_side": 1,
+      "shadow_stop_ticks": [100, 200, 300, 500, 800, 1000],
+      "shadow_take_ticks": [200, 300, 500, 800, 1000],
+      "reject_on": ["gap", "stale_orderbook", "reconnect_warmup", "feature_not_ready", "unknown_trading_status"],
+      "notes": "Parameters frozen from discovery on 2026-07-13..14. First OOS day 2026-07-15. Do not mutate v1."
+    },
+    {
+      "strategy_id": "L5_FLOW_ALIGNMENT",
+      "version": 1,
+      "status": "FROZEN_PAPER_SECONDARY",
+      "side_rules": {
+        "LONG": {
+          "l5_imbalance_gte": 0.3,
+          "trade_flow_ratio_5s_gte": 0.4
+        },
+        "SHORT": {
+          "l5_imbalance_lte": -0.3,
+          "trade_flow_ratio_5s_lte": -0.4
+        }
+      },
+      "minimum_known_trades_5s": 1,
+      "max_entry_spread_ticks": 20,
+      "signal_mode": "rising_edge",
+      "cooldown_seconds": 120,
+      "entry": "next_received_orderbook_aggressive",
+      "time_exit_seconds": 120,
+      "additional_slippage_ticks_each_side": 1,
+      "shadow_stop_ticks": [100, 200, 300, 500, 800, 1000],
+      "shadow_take_ticks": [200, 300, 500, 800, 1000],
+      "reject_on": ["gap", "stale_orderbook", "reconnect_warmup", "feature_not_ready", "unknown_trading_status"],
+      "notes": "Secondary correlated candidate. Keep separate virtual account and statistics."
+    }
+  ],
+  "rejected": [
+    {
+      "strategy_id": "STRONG_COUNTERFLOW_ABSORPTION",
+      "version": 1,
+      "status": "REJECTED_OOS_AS_FORMALIZED",
+      "oos_date": "2026-07-15",
+      "oos_signals": 11,
+      "mean_ticks": -150.6364,
+      "profit_factor": 0.2465
+    }
+  ]
+}

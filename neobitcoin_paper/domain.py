@@ -65,8 +65,11 @@ class PositionStatus(StrEnum):
 class StrategyStatus(StrEnum):
     DISCOVERY = "DISCOVERY"
     FROZEN_PAPER = "FROZEN_PAPER"
+    FROZEN_PAPER_SECONDARY = "FROZEN_PAPER_SECONDARY"
     OOS_ACCUMULATION = "OOS_ACCUMULATION"
     PAPER_VALIDATED = "PAPER_VALIDATED"
+    CONTEXT_ONLY = "CONTEXT_ONLY"
+    REJECTED_OOS_AS_FORMALIZED = "REJECTED_OOS_AS_FORMALIZED"
     PAUSED = "PAUSED"
     REJECTED = "REJECTED"
     ARCHIVED = "ARCHIVED"
@@ -279,6 +282,7 @@ class StrategyVersion:
         timestamp = as_utc(timestamp)
         active_statuses = {
             StrategyStatus.FROZEN_PAPER,
+            StrategyStatus.FROZEN_PAPER_SECONDARY,
             StrategyStatus.OOS_ACCUMULATION,
             StrategyStatus.PAPER_VALIDATED,
         }

@@ -1,0 +1,28 @@
+{
+  "row_field_reconciliation": "PASS",
+  "matched_rows": 197,
+  "total_rows": 197,
+  "per_strategy": {
+    "MICRO_FLOW_ALIGNMENT_v1": 109,
+    "L5_FLOW_ALIGNMENT_v1": 88
+  },
+  "mismatches": [],
+  "signal_set_regeneration": "SOURCE_UNIVERSE_UNDERDETERMINED",
+  "best_published_rule_reconstruction": {
+    "MICRO_FLOW_ALIGNMENT_v1": {
+      "matched": 106,
+      "expected": 109,
+      "extra": 40
+    },
+    "L5_FLOW_ALIGNMENT_v1": {
+      "matched": 85,
+      "expected": 88,
+      "extra": 26
+    }
+  },
+  "proven_hidden_compatibility_transforms": [
+    "last received orderbook per UTC second",
+    "receive-time trade window (book.receive_ts-5s, book.receive_ts]"
+  ],
+  "production_window": "exchange-time (feature_exchange_ts-5s, feature_exchange_ts]"
+}

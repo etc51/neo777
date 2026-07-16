@@ -13,7 +13,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -21,7 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 3
 DELIVERY_STATUSES: Final = frozenset(
     {
         "CREATED",
@@ -86,6 +86,7 @@ class RecoverySnapshot:
     virtual_accounts: tuple[dict[str, Any], ...]
     checkpoints: tuple[dict[str, Any], ...]
     open_orders: tuple[dict[str, Any], ...]
+    pending_intents: tuple[dict[str, Any], ...]
     open_positions: tuple[dict[str, Any], ...]
     pending_archives: tuple[dict[str, Any], ...]
     pending_deliveries: tuple[dict[str, Any], ...]
@@ -284,6 +285,29 @@ _MIGRATION_1: Final = (
     """,
 )
 
+_MIGRATION_2: Final = (
+    "ALTER TABLE strategy_registry ADD COLUMN lifecycle_status "
+    "TEXT NOT NULL DEFAULT 'FROZEN_PAPER'",
+    "ALTER TABLE strategy_registry ADD COLUMN evaluation_cohort TEXT NOT NULL DEFAULT 'LIVE_OOS'",
+    "ALTER TABLE strategy_registry ADD COLUMN lifecycle_json TEXT NOT NULL DEFAULT '{}'",
+)
+
+_MIGRATION_3: Final = (
+    """
+    CREATE TABLE IF NOT EXISTS pending_intents (
+        intent_id TEXT PRIMARY KEY,
+        strategy_id TEXT NOT NULL,
+        strategy_version TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (strategy_id, strategy_version)
+            REFERENCES strategy_registry(strategy_id, strategy_version)
+            ON UPDATE RESTRICT ON DELETE RESTRICT
+    )
+    """,
+)
+
 
 class PaperStateStore:
     """SQLite state store with WAL, migrations and atomic recovery.
@@ -300,8 +324,10 @@ class PaperStateStore:
         *,
         busy_timeout_ms: int = 30_000,
         restart_metadata: Mapping[str, Any] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.path = Path(path).resolve()
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._closed = False
@@ -353,7 +379,21 @@ class PaperStateStore:
                     self._connection.execute(statement)
                 self._connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (1, _utc_now()),
+                    (1, self._utc_now()),
+                )
+            if 2 not in applied:
+                for statement in _MIGRATION_2:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (2, self._utc_now()),
+                )
+            if 3 not in applied:
+                for statement in _MIGRATION_3:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, self._utc_now()),
                 )
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -369,7 +409,7 @@ class PaperStateStore:
                 INSERT INTO restart_generation(generation, started_at, metadata_json)
                 VALUES (?, ?, ?)
                 """,
-                (generation, _utc_now(), _json_dumps(metadata)),
+                (generation, self._utc_now(), _json_dumps(metadata)),
             )
         return generation
 
@@ -409,6 +449,9 @@ class PaperStateStore:
         code_hash: str,
         activated_at: datetime | str,
         enabled: bool = True,
+        lifecycle_status: str = "FROZEN_PAPER",
+        evaluation_cohort: str = "LIVE_OOS",
+        lifecycle: Mapping[str, Any] | None = None,
     ) -> bool:
         """Register one immutable strategy version; return ``True`` if new."""
 
@@ -418,14 +461,18 @@ class PaperStateStore:
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
         code_hash = _required_text(code_hash, "code_hash")
         activated = _timestamp(activated_at)
-        now = _utc_now()
+        lifecycle_status = _required_text(lifecycle_status, "lifecycle_status")
+        evaluation_cohort = _required_text(evaluation_cohort, "evaluation_cohort")
+        lifecycle_json = _json_dumps(lifecycle or {})
+        now = self._utc_now()
         with self.transaction():
             cursor = self._connection.execute(
                 """
                 INSERT OR IGNORE INTO strategy_registry(
                     strategy_id, strategy_version, config_json, config_hash,
-                    code_hash, activated_at, registered_at, enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    code_hash, activated_at, registered_at, enabled,
+                    lifecycle_status, evaluation_cohort, lifecycle_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     strategy_id,
@@ -436,6 +483,9 @@ class PaperStateStore:
                     activated,
                     now,
                     int(enabled),
+                    lifecycle_status,
+                    evaluation_cohort,
+                    lifecycle_json,
                 ),
             )
             if cursor.rowcount == 1:
@@ -472,6 +522,96 @@ class PaperStateStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown strategy {strategy_id}/{strategy_version}")
 
+    def set_strategy_lifecycle(
+        self,
+        strategy_id: str,
+        strategy_version: str,
+        *,
+        lifecycle_status: str,
+        evaluation_cohort: str,
+        lifecycle: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self.transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE strategy_registry
+                SET lifecycle_status = ?, evaluation_cohort = ?, lifecycle_json = ?
+                WHERE strategy_id = ? AND strategy_version = ?
+                """,
+                (
+                    _required_text(lifecycle_status, "lifecycle_status"),
+                    _required_text(evaluation_cohort, "evaluation_cohort"),
+                    _json_dumps(lifecycle or {}),
+                    strategy_id,
+                    strategy_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown strategy {strategy_id}/{strategy_version}")
+
+    def claim_pending_intent(
+        self,
+        intent_id: str,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Atomically persist an accepted intent and its idempotency claim."""
+
+        intent_id = _required_text(intent_id, "intent_id")
+        strategy_id = _required_text(strategy_id, "strategy_id")
+        strategy_version = _required_text(strategy_version, "strategy_version")
+        state_json = _json_dumps(state)
+        now = self._utc_now()
+        with self.transaction():
+            existing = self._connection.execute(
+                "SELECT strategy_id, strategy_version, state_json FROM pending_intents "
+                "WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["strategy_id"] != strategy_id
+                    or existing["strategy_version"] != strategy_version
+                    or existing["state_json"] != state_json
+                ):
+                    raise StateConflictError(
+                        f"pending intent {intent_id} was reused with different state"
+                    )
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO pending_intents(
+                    intent_id, strategy_id, strategy_version,
+                    state_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    strategy_id,
+                    strategy_version,
+                    state_json,
+                    now,
+                    now,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO idempotency_keys(
+                    scope, idempotency_key, result_json, created_at, expires_at
+                ) VALUES ('paper-intent', ?, ?, ?, NULL)
+                """,
+                (intent_id, _json_dumps({"durable": True}), now),
+            )
+            return True
+
+    def remove_pending_intent(self, intent_id: str) -> None:
+        with self.transaction():
+            self._connection.execute(
+                "DELETE FROM pending_intents WHERE intent_id = ?", (intent_id,)
+            )
+
     def upsert_virtual_account(
         self,
         account_id: str,
@@ -489,7 +629,7 @@ class PaperStateStore:
         initial = _decimal_text(initial_balance)
         cash = _decimal_text(initial_balance if cash_balance is None else cash_balance)
         current_equity = _decimal_text(initial_balance if equity is None else equity)
-        now = _utc_now()
+        now = self._utc_now()
         with self.transaction():
             existing = self._connection.execute(
                 "SELECT strategy_id, strategy_version FROM virtual_accounts WHERE account_id = ?",
@@ -557,7 +697,7 @@ class PaperStateStore:
                     event_id,
                     _json_dumps(checkpoint),
                     self.restart_generation,
-                    _utc_now(),
+                    self._utc_now(),
                 ),
             )
 
@@ -582,7 +722,7 @@ class PaperStateStore:
     ) -> str:
         """Create/update an open order and collapse duplicate replay keys."""
 
-        now = _utc_now()
+        now = self._utc_now()
         order_id = _required_text(order_id, "order_id")
         key = _required_text(idempotency_key, "idempotency_key")
         with self.transaction():
@@ -660,7 +800,7 @@ class PaperStateStore:
     ) -> str:
         """Create/update an open position and collapse duplicate replay keys."""
 
-        now = _utc_now()
+        now = self._utc_now()
         position_id = _required_text(position_id, "position_id")
         key = _required_text(idempotency_key, "idempotency_key")
         with self.transaction():
@@ -732,7 +872,7 @@ class PaperStateStore:
         finalized_at: datetime | str | None = None,
     ) -> None:
         session = _session_date(session_date)
-        now = _utc_now()
+        now = self._utc_now()
         with self.transaction():
             if active:
                 self._connection.execute(
@@ -787,7 +927,7 @@ class PaperStateStore:
         archive_id = _required_text(archive_id, "archive_id")
         session = _session_date(session_date)
         digest = _sha256(sha256)
-        now = _utc_now()
+        now = self._utc_now()
         with self.transaction():
             existing = self._connection.execute(
                 "SELECT * FROM archives WHERE session_date = ? AND sha256 = ?",
@@ -843,7 +983,7 @@ class PaperStateStore:
             delivery_id = _delivery_id(
                 archive["session_date"], archive["sha256"], thread_id
             )
-            now = _utc_now()
+            now = self._utc_now()
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO delivery_outbox(
@@ -897,7 +1037,7 @@ class PaperStateStore:
                 return
             if status not in _DELIVERY_TRANSITIONS[current]:
                 raise DeliveryTransitionError(f"invalid delivery transition {current} -> {status}")
-            now = _utc_now()
+            now = self._utc_now()
             delivered_at = now if status == "DELIVERED" else None
             acknowledged_at = now if status == "ACKNOWLEDGED" else None
             self._connection.execute(
@@ -926,7 +1066,7 @@ class PaperStateStore:
     ) -> bool:
         """Atomically claim one due queued/retryable delivery for a worker."""
 
-        stamp = _timestamp(now) if now is not None else _utc_now()
+        stamp = _timestamp(now) if now is not None else self._utc_now()
         with self.transaction():
             cursor = self._connection.execute(
                 """
@@ -946,7 +1086,7 @@ class PaperStateStore:
     ) -> int:
         """Make crash-interrupted ``DELIVERING`` rows claimable again."""
 
-        now = _utc_now()
+        now = self._utc_now()
         retry = _timestamp(next_retry_at) if next_retry_at is not None else now
         with self.transaction():
             return self._connection.execute(
@@ -963,7 +1103,7 @@ class PaperStateStore:
     def pending_deliveries(
         self, *, due_at: datetime | str | None = None
     ) -> tuple[dict[str, Any], ...]:
-        stamp = _timestamp(due_at) if due_at is not None else _utc_now()
+        stamp = _timestamp(due_at) if due_at is not None else self._utc_now()
         placeholders = ",".join("?" for _ in PENDING_DELIVERY_STATUSES)
         rows = self._connection.execute(
             f"""
@@ -997,7 +1137,7 @@ class PaperStateStore:
                     _required_text(scope, "scope"),
                     _required_text(idempotency_key, "idempotency_key"),
                     _json_dumps(result or {}),
-                    _utc_now(),
+                    self._utc_now(),
                     _timestamp(expires_at) if expires_at is not None else None,
                 ),
             )
@@ -1026,6 +1166,9 @@ class PaperStateStore:
             accounts = self._rows("SELECT * FROM virtual_accounts ORDER BY account_id")
             checkpoints = self._rows("SELECT * FROM checkpoints ORDER BY worker_id")
             orders = self._rows("SELECT * FROM open_orders ORDER BY created_at, order_id")
+            intents = self._rows(
+                "SELECT * FROM pending_intents ORDER BY created_at, intent_id"
+            )
             positions = self._rows("SELECT * FROM open_positions ORDER BY opened_at, position_id")
             archives = self._rows(
                 """
@@ -1048,6 +1191,7 @@ class PaperStateStore:
                 virtual_accounts=accounts,
                 checkpoints=checkpoints,
                 open_orders=orders,
+                pending_intents=intents,
                 open_positions=positions,
                 pending_archives=archives,
                 pending_deliveries=deliveries,
@@ -1108,12 +1252,18 @@ class PaperStateStore:
                 with self.transaction():
                     self._connection.execute(
                         "UPDATE restart_generation SET closed_at = ? WHERE generation = ?",
-                        (_utc_now(), self.restart_generation),
+                        (self._utc_now(), self.restart_generation),
                     )
                 self.checkpoint("TRUNCATE")
             finally:
                 self._connection.close()
                 self._closed = True
+
+    def _utc_now(self) -> str:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise StateIntegrityError("state clock must return a timezone-aware datetime")
+        return _timestamp(value)
 
     def _rows(self, query: str, parameters: tuple[object, ...] = ()) -> tuple[dict[str, Any], ...]:
         return tuple(_row(row) for row in self._connection.execute(query, parameters).fetchall())
@@ -1162,10 +1312,6 @@ def _timestamp(value: datetime | str) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-def _utc_now() -> str:
-    return _timestamp(datetime.now(UTC))
 
 
 def _session_date(value: date | str) -> str:
