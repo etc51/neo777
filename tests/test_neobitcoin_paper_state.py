@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -246,3 +246,24 @@ def test_dataset_recovers_active_jsonl_after_restart(tmp_path: Path) -> None:
     table = pq.read_table(recovered.parquet_path("health_events"))
     assert table.num_rows == 1
     assert table.column("event_id")[0].as_py() == "health-1"
+
+
+def test_dataset_close_streams_multiple_parquet_row_groups(tmp_path: Path) -> None:
+    root = tmp_path / "paper-data"
+    store = DatasetStore(root, "2026-07-15", durable_writes=False)
+    started_at = datetime(2026, 7, 15, 7, 0, tzinfo=UTC)
+    for index in range(2_001):
+        store.append(
+            "health_events",
+            {
+                "event_id": f"health-{index:04d}",
+                "event_ts": started_at + timedelta(microseconds=index),
+                "component": "writer",
+                "status": "OK",
+            },
+        )
+
+    path = store.close()["health_events.parquet"]
+    parquet = pq.ParquetFile(path)
+    assert parquet.metadata.num_rows == 2_001
+    assert parquet.metadata.num_row_groups == 2

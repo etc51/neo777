@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +45,8 @@ REQUIRED_DATASETS: Final = (
 )
 DATASET_NAMES: Final = tuple(name.removesuffix(".parquet") for name in REQUIRED_DATASETS)
 UTC_TIMESTAMP: Final = pa.timestamp("us", tz="UTC")
+_JSONL_BATCH_MAX_ROWS: Final = 2_000
+_JSONL_BATCH_MAX_BYTES: Final = 16 * 1024 * 1024
 
 
 class DatasetStoreError(RuntimeError):
@@ -611,18 +613,13 @@ class DatasetStore:
                 result[dataset] = final
                 if final.exists() and not active.exists():
                     continue
-                rows = _read_jsonl(active) if active.exists() else []
-                table = _build_table(dataset, rows, self.session_date)
                 temporary = final.with_suffix(final.suffix + ".inprogress")
                 temporary.parent.mkdir(parents=True, exist_ok=True)
-                pq.write_table(
-                    table,
+                _materialize_parquet(
+                    dataset,
+                    active if active.exists() else None,
                     temporary,
-                    compression="zstd",
-                    use_dictionary=True,
-                    write_statistics=True,
-                    version="2.6",
-                    data_page_version="2.0",
+                    self.session_date,
                 )
                 written_schema = pq.read_schema(temporary)
                 if not written_schema.equals(DATASET_SCHEMAS[dataset], check_metadata=True):
@@ -667,11 +664,17 @@ class DatasetStore:
             raise DatasetClosedError("dataset store is closed")
 
 
-def _build_table(dataset: str, rows: Sequence[Mapping[str, Any]], session: date) -> pa.Table:
+def _build_table(
+    dataset: str,
+    rows: Sequence[Mapping[str, Any]],
+    session: date,
+    *,
+    seen_primary_keys: set[str] | None = None,
+) -> pa.Table:
     schema = DATASET_SCHEMAS[dataset]
     primary_key = (schema.metadata or {})[b"primary_key"].decode("utf-8")
     normalized = [_normalize_row(row, schema, primary_key, session) for row in rows]
-    seen: set[str] = set()
+    seen = seen_primary_keys if seen_primary_keys is not None else set()
     for row in normalized:
         identifier = str(row[primary_key])
         if identifier in seen:
@@ -687,6 +690,60 @@ def _build_table(dataset: str, rows: Sequence[Mapping[str, Any]], session: date)
         return pa.Table.from_pylist(normalized, schema=schema)
     except (ArrowError, TypeError, ValueError) as exc:
         raise DatasetMaterializationError(f"{dataset}: {exc}") from exc
+
+
+def _materialize_parquet(
+    dataset: str,
+    active: Path | None,
+    temporary: Path,
+    session: date,
+) -> None:
+    """Write bounded row groups instead of loading a whole trading day in RAM."""
+
+    schema = DATASET_SCHEMAS[dataset]
+    seen_primary_keys: set[str] = set()
+    previous_event_ts: datetime | None = None
+    writer: pq.ParquetWriter | None = None
+    try:
+        batches = _iter_jsonl_batches(active) if active is not None else ()
+        for rows in batches:
+            table = _build_table(
+                dataset,
+                rows,
+                session,
+                seen_primary_keys=seen_primary_keys,
+            )
+            timestamps = table["event_ts"].to_pylist()
+            if timestamps and previous_event_ts is not None and timestamps[0] < previous_event_ts:
+                raise DatasetMaterializationError(
+                    f"{dataset}: event_ts order crosses a streaming row-group boundary"
+                )
+            if timestamps:
+                previous_event_ts = timestamps[-1]
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temporary,
+                    schema,
+                    compression="zstd",
+                    use_dictionary=True,
+                    write_statistics=True,
+                    version="2.6",
+                    data_page_version="2.0",
+                )
+            writer.write_table(table)
+        if writer is None:
+            pq.write_table(
+                _build_table(dataset, (), session),
+                temporary,
+                compression="zstd",
+                use_dictionary=True,
+                write_statistics=True,
+                version="2.6",
+                data_page_version="2.0",
+            )
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def _normalize_row(
@@ -776,8 +833,9 @@ def _coerce(value: Any, data_type: pa.DataType) -> Any:
     return value
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _iter_jsonl_batches(path: Path) -> Iterator[list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
+    batch_bytes = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
@@ -793,7 +851,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                     f"{path.name}:{line_number}: row must be an object"
                 )
             rows.append(value)
-    return rows
+            batch_bytes += len(line.encode("utf-8"))
+            if len(rows) >= _JSONL_BATCH_MAX_ROWS or batch_bytes >= _JSONL_BATCH_MAX_BYTES:
+                yield rows
+                rows = []
+                batch_bytes = 0
+    if rows:
+        yield rows
 
 
 def _dataset_file(dataset: str) -> str:

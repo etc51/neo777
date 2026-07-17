@@ -46,6 +46,14 @@ _SECRET_ASSIGNMENT: Final = re.compile(
 )
 _SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _MOSCOW: Final = ZoneInfo("Europe/Moscow")
+_STREAMED_VALIDATION_DATASETS: Final = frozenset(
+    {
+        "raw_orderbook_event_windows.parquet",
+        "raw_trades_event_windows.parquet",
+        "raw_last_price_event_windows.parquet",
+        "raw_candles_event_windows.parquet",
+    }
+)
 
 
 class ArchiveError(RuntimeError):
@@ -366,17 +374,20 @@ class ArchiveValidator:
                     duckdb_ok = False
                     continue
                 try:
-                    table = pq.read_table(path)
+                    parquet = pq.ParquetFile(path)
+                    for batch in parquet.iter_batches(batch_size=2_048):
+                        batch.validate(full=True)
                 except Exception as exc:
                     pyarrow_ok = False
                     duckdb_ok = False
                     errors.append(f"PyArrow cannot read {name}: {type(exc).__name__}")
                     continue
                 expected = DATASET_SCHEMAS[name]
-                if not table.schema.equals(expected, check_metadata=True):
+                if not parquet.schema_arrow.equals(expected, check_metadata=True):
                     errors.append(f"schema mismatch {name}")
-                tables[name] = table
-                _validate_primary_key(name, table, errors)
+                if name not in _STREAMED_VALIDATION_DATASETS:
+                    tables[name] = pq.read_table(path)
+                _validate_primary_key_path(name, path, parquet, connection, errors)
                 _validate_parquet_compression(name, path, errors)
                 try:
                     result = connection.execute(
@@ -387,22 +398,23 @@ class ArchiveValidator:
                     count = int(
                         result[0]
                     )
-                    if count != table.num_rows:
+                    if count != parquet.metadata.num_rows:
                         errors.append(f"DuckDB/PyArrow row mismatch {name}")
                     row_counts[name] = count
                 except Exception as exc:
                     duckdb_ok = False
                     errors.append(f"DuckDB cannot read {name}: {type(exc).__name__}")
+
+            _validate_foreign_key_paths(root, connection, errors)
+            _validate_source_lineage_paths(root, connection, tables, errors)
+            _validate_event_window_coverage_paths(root, connection, tables, errors)
         finally:
             connection.close()
 
-        _validate_foreign_keys(tables, errors)
         reconciliation_errors: list[str] = []
         _validate_financial_reconciliation(tables, reconciliation_errors)
         _validate_temporal_and_position_reconciliation(tables, reconciliation_errors)
-        _validate_source_lineage(tables, reconciliation_errors)
         errors.extend(reconciliation_errors)
-        _validate_event_window_coverage(tables, errors)
         _validate_strategy_registry(root, errors)
         _validate_manifest(root, row_counts, errors)
         if _contains_secret(root):
@@ -414,8 +426,8 @@ class ArchiveValidator:
             errors=tuple(errors),
             warnings=tuple(warnings),
             row_counts=row_counts,
-            duckdb_verified=duckdb_ok and len(tables) == len(REQUIRED_DATASETS),
-            pyarrow_verified=pyarrow_ok and len(tables) == len(REQUIRED_DATASETS),
+            duckdb_verified=duckdb_ok and len(row_counts) == len(REQUIRED_DATASETS),
+            pyarrow_verified=pyarrow_ok and len(row_counts) == len(REQUIRED_DATASETS),
             independent_reconciliation_verified=not reconciliation_errors,
             unexplained_discrepancies=len(reconciliation_errors),
         )
@@ -534,6 +546,161 @@ def _validate_primary_key(name: str, table: pa.Table, errors: list[str]) -> None
         timestamps = table["event_ts"].to_pylist()
         if timestamps != sorted(timestamps):
             errors.append(f"timestamp sort failure {name}")
+
+
+def _validate_primary_key_path(
+    name: str,
+    path: Path,
+    parquet: pq.ParquetFile,
+    connection: duckdb.DuckDBPyConnection,
+    errors: list[str],
+) -> None:
+    metadata = parquet.schema_arrow.metadata or {}
+    primary = metadata.get(b"primary_key", b"").decode()
+    if not primary or primary not in parquet.schema_arrow.names:
+        errors.append(f"missing primary key metadata {name}")
+        return
+    relation = _duckdb_parquet(path)
+    key = _duckdb_identifier(primary)
+    try:
+        row = connection.execute(
+            f"SELECT count(*), count({key}), count(DISTINCT {key}) FROM {relation}"
+        ).fetchone()
+        if row is None:
+            raise ArchiveError("DuckDB returned no primary-key row")
+        total, nonnull, distinct = (int(value) for value in row)
+        if nonnull != total:
+            errors.append(f"null primary key {name}")
+        if distinct != total:
+            errors.append(f"duplicate primary key {name}")
+    except Exception as exc:
+        errors.append(f"primary key validation failed {name}: {type(exc).__name__}")
+
+    if "event_ts" not in parquet.schema_arrow.names or parquet.metadata.num_rows <= 1:
+        return
+    previous: datetime | None = None
+    try:
+        for batch in parquet.iter_batches(batch_size=65_536, columns=["event_ts"]):
+            for value in batch.column(0).to_pylist():
+                if previous is not None and value < previous:
+                    errors.append(f"timestamp sort failure {name}")
+                    return
+                previous = value
+    except Exception as exc:
+        errors.append(f"timestamp validation failed {name}: {type(exc).__name__}")
+
+
+def _validate_foreign_key_paths(
+    root: Path,
+    connection: duckdb.DuckDBPyConnection,
+    errors: list[str],
+) -> None:
+    for name, schema in DATASET_SCHEMAS.items():
+        source_path = root / "data" / name
+        if not source_path.is_file():
+            continue
+        metadata = schema.metadata or {}
+        raw_foreign_keys = metadata.get(b"foreign_keys", b"{}").decode()
+        for field, target in json.loads(raw_foreign_keys).items():
+            target_table, target_field = str(target).split(".", 1)
+            target_name = f"{target_table}.parquet"
+            target_path = root / "data" / target_name
+            if target_name not in DATASET_SCHEMAS or not target_path.is_file():
+                continue
+            source_column = _duckdb_identifier(str(field))
+            target_column = _duckdb_identifier(target_field)
+            try:
+                row = connection.execute(
+                    "SELECT count(*) FROM "
+                    f"{_duckdb_parquet(source_path)} AS source "
+                    f"WHERE source.{source_column} IS NOT NULL "
+                    f"AND CAST(source.{source_column} AS VARCHAR) <> '' "
+                    "AND NOT EXISTS (SELECT 1 FROM "
+                    f"{_duckdb_parquet(target_path)} AS target "
+                    f"WHERE target.{target_column} = source.{source_column})"
+                ).fetchone()
+                if row is None or int(row[0]) != 0:
+                    errors.append(f"foreign key failure {name}.{field}")
+            except Exception as exc:
+                errors.append(
+                    f"foreign key validation failed {name}.{field}: {type(exc).__name__}"
+                )
+
+
+def _raw_union(root: Path, column: str) -> str:
+    identifier = _duckdb_identifier(column)
+    selects = [
+        f"SELECT {identifier} AS value FROM {_duckdb_parquet(root / 'data' / name)} "
+        f"WHERE {identifier} IS NOT NULL AND CAST({identifier} AS VARCHAR) <> ''"
+        for name in sorted(_STREAMED_VALIDATION_DATASETS)
+        if (root / "data" / name).is_file()
+    ]
+    return " UNION ".join(selects) if selects else "SELECT NULL AS value WHERE false"
+
+
+def _validate_source_lineage_paths(
+    root: Path,
+    connection: duckdb.DuckDBPyConnection,
+    tables: dict[str, pa.Table],
+    errors: list[str],
+) -> None:
+    signals = tables.get("candidate_signals.parquet")
+    if signals is None or signals.num_rows == 0:
+        return
+    raw_sources = (
+        f"{_raw_union(root, 'raw_event_id')} UNION "
+        f"{_raw_union(root, 'source_event_id')}"
+    )
+    for dataset, source_fields in (
+        ("paper_fills.parquet", ("source_event_id",)),
+        ("mfe_mae.parquet", ("mfe_source_event_id", "mae_source_event_id")),
+        ("shadow_stop_results.parquet", ("source_event_id",)),
+        ("shadow_exit_results.parquet", ("source_event_id",)),
+    ):
+        path = root / "data" / dataset
+        if not path.is_file():
+            continue
+        for field in source_fields:
+            column = _duckdb_identifier(field)
+            row = connection.execute(
+                f"WITH raw_sources AS ({raw_sources}) "
+                f"SELECT count(*) FROM {_duckdb_parquet(path)} AS item "
+                f"WHERE item.{column} IS NOT NULL AND CAST(item.{column} AS VARCHAR) <> '' "
+                "AND NOT EXISTS (SELECT 1 FROM raw_sources "
+                f"WHERE raw_sources.value = item.{column})"
+            ).fetchone()
+            if row is None or int(row[0]) != 0:
+                errors.append(f"source lineage failure {dataset}:{field}")
+
+
+def _validate_event_window_coverage_paths(
+    root: Path,
+    connection: duckdb.DuckDBPyConnection,
+    tables: dict[str, pa.Table],
+    errors: list[str],
+) -> None:
+    signals = tables.get("candidate_signals.parquet")
+    if signals is None or signals.num_rows == 0:
+        return
+    signal_path = root / "data" / "candidate_signals.parquet"
+    covered = _raw_union(root, "signal_id")
+    row = connection.execute(
+        f"WITH covered AS ({covered}) "
+        f"SELECT count(*) FROM {_duckdb_parquet(signal_path)} AS signal "
+        "WHERE signal.signal_id IS NOT NULL AND CAST(signal.signal_id AS VARCHAR) <> '' "
+        "AND NOT EXISTS (SELECT 1 FROM covered WHERE covered.value = signal.signal_id)"
+    ).fetchone()
+    if row is None or int(row[0]) != 0:
+        errors.append("event-window coverage failure")
+
+
+def _duckdb_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _duckdb_parquet(path: Path) -> str:
+    escaped = str(path).replace("'", "''")
+    return f"read_parquet('{escaped}')"
 
 
 def _validate_foreign_keys(tables: dict[str, pa.Table], errors: list[str]) -> None:
