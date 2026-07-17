@@ -82,6 +82,25 @@ def _closed_status_event(event_id: str, observed_at: datetime) -> CanonicalMarke
     )
 
 
+def _break_status_event(event_id: str, observed_at: datetime) -> CanonicalMarketEvent:
+    return CanonicalMarketEvent(
+        event_id=event_id,
+        event_type="trading_status",
+        instrument_uid=UID,
+        exchange_ts=observed_at,
+        receive_ts=observed_at,
+        processing_ts=observed_at,
+        revision=0,
+        sequence=0,
+        source="test-market-data",
+        latency_ms=0.0,
+        gap_status="OK",
+        reconnect_generation=1,
+        collector_instance_id="test-runtime",
+        payload={"trading_status": "SECURITY_TRADING_STATUS_BREAK_IN_TRADING"},
+    )
+
+
 class _FiniteMarketData:
     def __init__(self, events: tuple[CanonicalMarketEvent, ...]) -> None:
         self.events = events
@@ -288,6 +307,33 @@ def test_live_closed_status_plus_grace_finalizes_writer_for_archive(
     assert row[0] == "FINALIZED" and row[1] == 0
     assert row[2] == "NOT_AVAILABLE_FOR_TRADING"
     assert list((config.data_root / "active" / "2026-07-15").glob("*.inprogress"))
+
+
+def test_scheduled_close_plus_grace_finalizes_break_status_for_archive(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path / "paper")
+    finalizer_at = datetime(2026, 7, 15, 21, 5, tzinfo=UTC)
+    market = _FiniteMarketData(
+        (_break_status_event("scheduled-close-heartbeat", finalizer_at),)
+    )
+    runtime = PaperRuntime(
+        config,
+        environ={"PAPER_ONLY": "true"},
+        market_data=market,
+        health_server_factory=lambda *_args: _HealthServer(),
+        notifier=_Notifier(),
+        disk_guard=DiskGuard(config, usage=lambda _path: SimpleNamespace(free=1_000)),
+        clock=lambda: finalizer_at - timedelta(minutes=1),
+    )
+    asyncio.run(runtime.run())
+
+    with sqlite3.connect(config.data_root / "state" / "paper_state.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT status, active, trading_status FROM session_state "
+            "WHERE session_date = '2026-07-15'"
+        ).fetchone()
+    assert row == ("FINALIZED", 0, "BREAK_IN_TRADING")
 
 
 def test_restart_after_preopen_finalizes_prior_durable_session(tmp_path: Path) -> None:

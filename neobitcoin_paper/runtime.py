@@ -30,7 +30,7 @@ from .calendar import SessionCalendar
 from .config import PaperConfig
 from .datasets import DatasetStore
 from .delivery import ArtifactDescriptor, CodexSameThreadTransport
-from .domain import StrategyStatus, StrategyVersion
+from .domain import StrategyStatus, StrategyVersion, trading_status_is_open
 from .engine import PaperTradingEngine
 from .execution import PaperExecutionAdapter
 from .ingest import (
@@ -728,9 +728,26 @@ class PaperRuntime:
             self._closed_since = None
 
     def _maybe_finalize_active(self, observed_at: datetime) -> None:
-        if self._closed_since is None or self._session_finalized:
+        if self._session_finalized:
             return
         grace = timedelta(seconds=self.config.archive_grace_seconds)
+        if self._active_session_date is not None:
+            window = self._calendar.window_for(self._active_session_date)
+            if (
+                observed_at >= window.expected_close + grace
+                and not trading_status_is_open(self._last_trading_status)
+            ):
+                # The exchange may remain in BREAK_IN_TRADING after the
+                # scheduled close instead of publishing one of the narrow
+                # terminal statuses.  Finalize at the session boundary so the
+                # daily archive cannot depend on a particular enum transition.
+                self._finalize_active(
+                    window.expected_close - timedelta(microseconds=1),
+                    self._last_trading_status,
+                )
+                return
+        if self._closed_since is None:
+            return
         if observed_at >= self._closed_since + grace:
             self._finalize_active(observed_at, self._last_trading_status)
 
