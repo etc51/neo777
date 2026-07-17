@@ -748,11 +748,18 @@ def _materialize_parquet(
                     # file-wide Arrow dictionary grows linearly for those
                     # columns and can exhaust an otherwise bounded worker.
                     use_dictionary=dataset not in _RAW_EVENT_WINDOW_DATASETS,
-                    write_statistics=True,
+                    # Min/max statistics for unique multi-kilobyte JSON values
+                    # have the same problem and provide no query benefit.
+                    write_statistics=dataset not in _RAW_EVENT_WINDOW_DATASETS,
                     version="2.6",
                     data_page_version="2.0",
                 )
             writer.write_table(table)
+            if dataset in _RAW_EVENT_WINDOW_DATASETS:
+                # PyArrow's pool otherwise keeps freed row-group buffers in
+                # the long-lived archive process until final close.
+                del table
+                pa.default_memory_pool().release_unused()
         if writer is None:
             pq.write_table(
                 _build_table(dataset, (), session),
