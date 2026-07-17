@@ -709,7 +709,13 @@ def _materialize_parquet(
     """Write bounded row groups instead of loading a whole trading day in RAM."""
 
     schema = DATASET_SCHEMAS[dataset]
-    seen_primary_keys: set[str] = set()
+    # Raw windows can contain millions of stable IDs.  Keeping every ID in a
+    # Python set would make finalization memory-linear; the archive validator
+    # performs the global DISTINCT check with DuckDB after Parquet is written.
+    # A fresh per-batch set still rejects immediate duplicates while writing.
+    seen_primary_keys: set[str] | None = (
+        None if dataset in _RAW_EVENT_WINDOW_DATASETS else set()
+    )
     previous_event_ts: datetime | None = None
     writer: pq.ParquetWriter | None = None
     try:
