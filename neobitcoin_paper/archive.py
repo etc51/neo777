@@ -576,7 +576,11 @@ def _validate_primary_key_path(
     except Exception as exc:
         errors.append(f"primary key validation failed {name}: {type(exc).__name__}")
 
-    if "event_ts" not in parquet.schema_arrow.names or parquet.metadata.num_rows <= 1:
+    if (
+        name in _STREAMED_VALIDATION_DATASETS
+        or "event_ts" not in parquet.schema_arrow.names
+        or parquet.metadata.num_rows <= 1
+    ):
         return
     previous: datetime | None = None
     try:

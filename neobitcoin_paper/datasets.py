@@ -47,6 +47,14 @@ DATASET_NAMES: Final = tuple(name.removesuffix(".parquet") for name in REQUIRED_
 UTC_TIMESTAMP: Final = pa.timestamp("us", tz="UTC")
 _JSONL_BATCH_MAX_ROWS: Final = 2_000
 _JSONL_BATCH_MAX_BYTES: Final = 16 * 1024 * 1024
+_RAW_EVENT_WINDOW_DATASETS: Final = frozenset(
+    {
+        "raw_orderbook_event_windows.parquet",
+        "raw_trades_event_windows.parquet",
+        "raw_last_price_event_windows.parquet",
+        "raw_candles_event_windows.parquet",
+    }
+)
 
 
 class DatasetStoreError(RuntimeError):
@@ -714,7 +722,12 @@ def _materialize_parquet(
                 seen_primary_keys=seen_primary_keys,
             )
             timestamps = table["event_ts"].to_pylist()
-            if timestamps and previous_event_ts is not None and timestamps[0] < previous_event_ts:
+            if (
+                dataset not in _RAW_EVENT_WINDOW_DATASETS
+                and timestamps
+                and previous_event_ts is not None
+                and timestamps[0] < previous_event_ts
+            ):
                 raise DatasetMaterializationError(
                     f"{dataset}: event_ts order crosses a streaming row-group boundary"
                 )

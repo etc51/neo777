@@ -267,3 +267,29 @@ def test_dataset_close_streams_multiple_parquet_row_groups(tmp_path: Path) -> No
     parquet = pq.ParquetFile(path)
     assert parquet.metadata.num_rows == 2_001
     assert parquet.metadata.num_row_groups == 2
+
+
+def test_raw_event_windows_allow_receive_order_across_streaming_groups(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "paper-data"
+    store = DatasetStore(root, "2026-07-15", durable_writes=False)
+    started_at = datetime(2026, 7, 15, 7, 0, tzinfo=UTC)
+    for index in range(2_001):
+        store.append(
+            "raw_last_price_event_windows",
+            {
+                "raw_event_id": f"raw-{index:04d}",
+                "source_event_id": f"source-{index:04d}",
+                "event_ts": started_at + timedelta(microseconds=2_001 - index),
+                "receive_ts": started_at + timedelta(microseconds=index),
+                "instrument_uid": "4effa274-4e8f-422c-93ff-04aa34fe8e39",
+                "price": 100_000 + index,
+                "payload_json": {"sequence": index},
+            },
+        )
+
+    path = store.close()["raw_last_price_event_windows.parquet"]
+    parquet = pq.ParquetFile(path)
+    assert parquet.metadata.num_rows == 2_001
+    assert parquet.metadata.num_row_groups == 2
