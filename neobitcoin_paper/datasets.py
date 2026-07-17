@@ -744,7 +744,10 @@ def _materialize_parquet(
                     temporary,
                     schema,
                     compression="zstd",
-                    use_dictionary=True,
+                    # Raw JSON/book payloads are effectively unique.  A
+                    # file-wide Arrow dictionary grows linearly for those
+                    # columns and can exhaust an otherwise bounded worker.
+                    use_dictionary=dataset not in _RAW_EVENT_WINDOW_DATASETS,
                     write_statistics=True,
                     version="2.6",
                     data_page_version="2.0",

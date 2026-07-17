@@ -293,3 +293,5 @@ def test_raw_event_windows_allow_receive_order_across_streaming_groups(
     parquet = pq.ParquetFile(path)
     assert parquet.metadata.num_rows == 2_001
     assert parquet.metadata.num_row_groups == 2
+    for column in range(parquet.metadata.row_group(0).num_columns):
+        assert "RLE_DICTIONARY" not in parquet.metadata.row_group(0).column(column).encodings
