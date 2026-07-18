@@ -391,7 +391,11 @@ class PaperRuntime:
         self._environ = dict(os.environ if environ is None else environ)
         self._market = market_data or ReadOnlyMarketDataAdapter(
             config.token_file,
-            stream_silence_seconds=max(5.0, config.stale_after_seconds * 1.5),
+            # The SDK emits subscription-check/ping traffic on a roughly
+            # 60-second cadence while the market is closed.  Keep the hard
+            # stream silence watchdog above that cadence; component freshness
+            # remains separately fail-closed for trading.
+            stream_silence_seconds=max(75.0, config.stale_after_seconds * 1.5),
         )
         self.health = health or HealthRegistry()
         self._health_server_factory = health_server_factory
@@ -610,6 +614,7 @@ class PaperRuntime:
             warmup_events=self.config.warmup_events,
             stale_after_seconds=self.config.stale_after_seconds,
             max_latency_ms=self.config.excessive_latency_ms,
+            initial_trading_status=self._last_trading_status,
         )
         self._quality_gate = gate
         return PaperTradingEngine(
@@ -842,7 +847,10 @@ class PaperRuntime:
         fresh = all(not self.health.stale_component(name, 30.0) for name in critical)
         if not snapshot.healthy or not fresh:
             return
-        if snapshot.ready and not self._ready_notified:
+        # systemd READY means the supervised process completed initialization;
+        # functional market readiness remains independently represented by
+        # /readyz and never permits entries while subscriptions/features lag.
+        if not self._ready_notified:
             self._notifier.notify("READY=1")
             self._ready_notified = True
         self._notifier.notify("WATCHDOG=1")

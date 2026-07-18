@@ -216,9 +216,8 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
     ]
     assert market.discoveries == 2
     assert all(server.started and server.closed for server in servers)
-    # A live process without current-generation subscription ACKs must not
-    # announce functional readiness.
-    assert notifier.messages.count("READY=1") == 0
+    # systemd startup readiness is distinct from functional /readyz state.
+    assert notifier.messages.count("READY=1") == 2
     assert notifier.messages.count("WATCHDOG=1") == 4
     assert notifier.messages.count("STOPPING=1") == 2
     snapshot = (config.data_root / "state" / "instrument_snapshot.json").read_text(

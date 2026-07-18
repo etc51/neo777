@@ -154,6 +154,7 @@ class DataQualityGate:
         warmup_events: int,
         stale_after_seconds: float,
         max_latency_ms: float,
+        initial_trading_status: str = "UNKNOWN",
     ) -> None:
         self._warmup_target = warmup_events
         self._stale_after_seconds = stale_after_seconds
@@ -163,7 +164,7 @@ class DataQualityGate:
         self._warmup_remaining = warmup_events
         self._gap_active = True
         self._book_valid = False
-        self._trading_status = "UNKNOWN"
+        self._trading_status = normalize_security_trading_status(initial_trading_status)
         self._last_event_monotonic: float | None = None
         self._last_latency_ms = float("inf")
         self._generation = 0
