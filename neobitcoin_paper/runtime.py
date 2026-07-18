@@ -474,6 +474,7 @@ class PaperRuntime:
                 self._engine = self._build_engine(state, initial_session)
             else:
                 self._engine = None
+                self._quality_gate = self._new_quality_gate()
             if _is_explicitly_closed(self._last_trading_status):
                 # A closed/not-tradable status is an entry gate, not a session
                 # boundary.  In particular the weekend status observed at
@@ -518,29 +519,38 @@ class PaperRuntime:
                     if self._engine is None:
                         raise RuntimeError("active paper session has no execution engine")
                     result = await self._engine.process_event(event)
-                    if self._quality_gate is not None:
-                        quality = self._quality_gate.snapshot()
-                        self._last_trading_status = _normalize_trading_status(
-                            quality.trading_status
-                        )
-                        self._stream_connected = quality.operational_ready
-                        self.health.heartbeat(
-                            "subscriptions",
-                            healthy=quality.subscription_state not in {"FATAL"},
-                            ready=quality.operational_ready,
-                            detail=f"{quality.subscription_state}:{quality.reason}",
-                        )
-                        self.health.heartbeat(
-                            "feature_pipeline",
-                            healthy=True,
-                            ready=(
-                                quality.feature_ready
-                                or quality.subscription_state == "CLOSED_MARKET"
-                            ),
-                            detail=quality.reason,
-                        )
                     self._update_closed_boundary(event.processing_ts)
                     self._maybe_finalize_active(event.processing_ts)
+                elif self._quality_gate is not None and disk.signals_allowed:
+                    # Between finalized session close and the next pre-open,
+                    # continue supervising the 24/7 stream without writing
+                    # historical events into a completed session.
+                    if event.event_type == "reconnect":
+                        self._quality_gate.on_connect(event.reconnect_generation)
+                    elif event.event_type == "disconnect":
+                        self._quality_gate.on_disconnect()
+                    self._quality_gate.observe(event)
+                if self._quality_gate is not None:
+                    quality = self._quality_gate.snapshot()
+                    self._last_trading_status = _normalize_trading_status(
+                        quality.trading_status
+                    )
+                    self._stream_connected = quality.operational_ready
+                    self.health.heartbeat(
+                        "subscriptions",
+                        healthy=quality.subscription_state not in {"FATAL"},
+                        ready=quality.operational_ready,
+                        detail=f"{quality.subscription_state}:{quality.reason}",
+                    )
+                    self.health.heartbeat(
+                        "feature_pipeline",
+                        healthy=True,
+                        ready=(
+                            quality.feature_ready
+                            or quality.subscription_state == "CLOSED_MARKET"
+                        ),
+                        detail=quality.reason,
+                    )
                 self.health.heartbeat(
                     "market_stream",
                     healthy=True,
@@ -610,12 +620,7 @@ class PaperRuntime:
                 else:
                     raise RuntimeError("enabled strategy has no installed sandboxed plugin")
         self._datasets = DatasetStore(self.config.data_root, session_date)
-        gate = DataQualityGate(
-            warmup_events=self.config.warmup_events,
-            stale_after_seconds=self.config.stale_after_seconds,
-            max_latency_ms=self.config.excessive_latency_ms,
-            initial_trading_status=self._last_trading_status,
-        )
+        gate = self._new_quality_gate()
         self._quality_gate = gate
         return PaperTradingEngine(
             state_store=state,
@@ -629,6 +634,14 @@ class PaperRuntime:
                 timedelta(milliseconds=self.config.decision_latency_ms)
             ),
             tick_size=self._tick_size,
+        )
+
+    def _new_quality_gate(self) -> DataQualityGate:
+        return DataQualityGate(
+            warmup_events=self.config.warmup_events,
+            stale_after_seconds=self.config.stale_after_seconds,
+            max_latency_ms=self.config.excessive_latency_ms,
+            initial_trading_status=self._last_trading_status,
         )
 
     def _strategy_specifications(
