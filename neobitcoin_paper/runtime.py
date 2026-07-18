@@ -857,7 +857,10 @@ class PaperRuntime:
     def _notify_healthy(self) -> None:
         snapshot = self.health.snapshot()
         critical = ("event_loop", "state_store", "writer", "market_stream")
-        fresh = all(not self.health.stale_component(name, 30.0) for name in critical)
+        # Closed-market SDK ping cadence is about 60 seconds.  This freshness
+        # bound remains below systemd WatchdogSec=180 and above the 75-second
+        # internal stream-silence reconnect threshold.
+        fresh = all(not self.health.stale_component(name, 120.0) for name in critical)
         if not snapshot.healthy or not fresh:
             return
         # systemd READY means the supervised process completed initialization;

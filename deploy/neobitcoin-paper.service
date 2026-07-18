@@ -10,7 +10,7 @@ StartLimitBurst=10
 [Service]
 Type=notify
 NotifyAccess=main
-WatchdogSec=60s
+WatchdogSec=180s
 WatchdogSignal=SIGTERM
 User=neopaper
 Group=neopaper

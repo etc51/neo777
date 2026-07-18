@@ -54,7 +54,7 @@ def test_main_unit_is_paper_only_loopback_and_restart_unlimited() -> None:
     assert _one(unit, "Service", "Restart") == "always"
     assert _one(unit, "Service", "Type") == "notify"
     assert _one(unit, "Service", "NotifyAccess") == "main"
-    assert _one(unit, "Service", "WatchdogSec") == "60s"
+    assert _one(unit, "Service", "WatchdogSec") == "180s"
     assert _one(unit, "Service", "WatchdogSignal") == "SIGTERM"
     assert _one(unit, "Service", "EnvironmentFile") == (
         "/etc/neobitcoin-paper/paper.env"
