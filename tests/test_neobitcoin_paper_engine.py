@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 from neobitcoin_paper.calendar import SessionCalendar
 from neobitcoin_paper.datasets import DatasetStore
 from neobitcoin_paper.domain import (
@@ -268,7 +270,8 @@ def test_gap_signal_is_rejected_and_strategy_failure_is_isolated(tmp_path: Path)
         assert len(result.strategy_error_ids) == 1
         assert not engine.pending_intents
         assert not engine.open_positions
-        datasets.abort()
+        paths = datasets.close()
+        assert pq.ParquetFile(paths["raw_orderbook_event_windows.parquet"]).metadata.num_rows == 1
 
 
 def test_signal_first_later_book_full_partial_no_fill_and_account_isolation(
@@ -330,9 +333,7 @@ def test_duplicate_and_pending_intent_then_open_position_survive_restart(tmp_pat
         payload={"signal": True},
     )
     with PaperStateStore(database) as state:
-        engine, datasets = build_engine(
-            data_root, state, registry, [SignalStrategy(strategy_spec)]
-        )
+        engine, datasets = build_engine(data_root, state, registry, [SignalStrategy(strategy_spec)])
         asyncio.run(make_ready(engine))
         asyncio.run(engine.process_event(signal_event))
         assert len(engine.pending_intents) == 1
@@ -408,9 +409,7 @@ def test_no_lookahead_and_recovered_last_book_session_finalization(tmp_path: Pat
         closed = recovered.finalize_session(BASE + timedelta(hours=17, minutes=5), "CLOSED")
         assert len(closed) == 1
         assert not recovered.open_positions
-        assert recovered.finalize_session(
-            BASE + timedelta(hours=17, minutes=5), "CLOSED"
-        ) == ()
+        assert recovered.finalize_session(BASE + timedelta(hours=17, minutes=5), "CLOSED") == ()
         datasets.close()
 
 
@@ -438,9 +437,7 @@ def test_next_book_entry_spread_boundary_and_timeout_are_one_shot(tmp_path: Path
         asyncio.run(make_ready(engine))
         signal_at = BASE + timedelta(seconds=20)
         signal = asyncio.run(
-            engine.process_event(
-                orderbook("next-book-signal", signal_at, signal=True)
-            )
+            engine.process_event(orderbook("next-book-signal", signal_at, signal=True))
         )
         assert not signal.order_ids
         assert len(engine.pending_intents) == 1
@@ -468,9 +465,7 @@ def test_next_book_entry_spread_boundary_and_timeout_are_one_shot(tmp_path: Path
         )
         asyncio.run(make_ready(engine))
         signal_at = BASE + timedelta(seconds=20)
-        asyncio.run(
-            engine.process_event(orderbook("spread-signal", signal_at, signal=True))
-        )
+        asyncio.run(engine.process_event(orderbook("spread-signal", signal_at, signal=True)))
         spread_reject = asyncio.run(
             engine.process_event(
                 orderbook("spread-21", signal_at + timedelta(seconds=1), ask_price=121)
@@ -504,13 +499,9 @@ def test_next_book_entry_spread_boundary_and_timeout_are_one_shot(tmp_path: Path
         )
         asyncio.run(make_ready(engine))
         signal_at = BASE + timedelta(seconds=20)
-        asyncio.run(
-            engine.process_event(orderbook("timeout-signal", signal_at, signal=True))
-        )
+        asyncio.run(engine.process_event(orderbook("timeout-signal", signal_at, signal=True)))
         timed_out = asyncio.run(
-            engine.process_event(
-                orderbook("after-timeout", signal_at + timedelta(seconds=6))
-            )
+            engine.process_event(orderbook("after-timeout", signal_at + timedelta(seconds=6)))
         )
         assert len(timed_out.order_ids) == 1
         assert not timed_out.opened_position_ids
@@ -574,9 +565,7 @@ def test_flow_shadow_stop_take_and_stress_outputs_are_materialized(
         ]
         assert len(stops) == 6 and not any(row["triggered"] for row in stops)
         assert len(takes) == 5
-        assert [row["exit_model"] for row in takes if row["triggered"]] == [
-            "TAKE_200_TICKS"
-        ]
+        assert [row["exit_model"] for row in takes if row["triggered"]] == ["TAKE_200_TICKS"]
         assert Decimal(trades[0]["stress_slippage_ticks_each_side"]) == Decimal("1")
         assert Decimal(trades[0]["stress_pnl_ticks"]) == (
             Decimal(trades[0]["raw_pnl_ticks"]) - Decimal("2")

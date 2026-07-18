@@ -126,7 +126,7 @@ class PaperTradingEngine:
         self._position_signals: dict[str, str] = {}
         self._entry_fills: dict[str, str] = {}
         self._active_windows: set[str] = set()
-        self._raw_written: set[tuple[str, str]] = set()
+        self._raw_written: dict[str, set[str]] = {}
         self._raw_buffer: deque[CanonicalMarketEvent] = deque()
         self._last_book: OrderBook | None = None
         self._validate_plugins()
@@ -213,7 +213,7 @@ class PaperTradingEngine:
                     self._state.remove_open_position(position_id)
                     self._record_position(updated, account, event, "SESSION_END")
                     self._record_trade(updated, execution, account, event)
-                    self._active_windows.discard(self._position_signals.get(position_id, ""))
+                    self._discard_raw_window(self._position_signals.get(position_id, ""))
                     closed_ids.append(position_id)
                 else:
                     self._positions[position_id] = updated
@@ -231,7 +231,9 @@ class PaperTradingEngine:
             self._state.remove_pending_intent(intent_id)
         self._pending.clear()
         self._restored_orders.clear()
-        self._active_windows.intersection_update(self._position_signals.values())
+        retained_windows = set(self._position_signals.values())
+        for signal_id in self._active_windows - retained_windows:
+            self._discard_raw_window(signal_id)
         self._state.set_session_state(
             session.session_date_msk,
             status="FINALIZED" if not self._positions else "FINALIZATION_INCOMPLETE",
@@ -480,9 +482,7 @@ class PaperTradingEngine:
             },
         )
         is_candidate = (
-            decision.signal
-            or decision.intent is not None
-            or decision.side_considered is not None
+            decision.signal or decision.intent is not None or decision.side_considered is not None
         )
         if not is_candidate:
             return None
@@ -524,8 +524,16 @@ class PaperTradingEngine:
                 "reason": rejection or "READY",
             },
         )
-        for buffered in tuple(self._raw_buffer):
-            self._append_raw(signal_id, buffered)
+        if accepted:
+            for buffered in tuple(self._raw_buffer):
+                self._append_raw(signal_id, buffered)
+        else:
+            # Coverage requires one causal raw row for every candidate, but a
+            # rejected candidate does not need a duplicated two-minute window.
+            for buffered in reversed(self._raw_buffer):
+                if self._append_raw(signal_id, buffered):
+                    break
+            self._raw_written.pop(signal_id, None)
         if not accepted or decision.intent is None:
             return signal_id, False
         pending = _PendingIntent(
@@ -655,8 +663,7 @@ class PaperTradingEngine:
             spread_ratio = spread / self._tick_size if spread is not None else None
             spread_ticks = (
                 int(spread_ratio)
-                if spread_ratio is not None
-                and spread_ratio == spread_ratio.to_integral_value()
+                if spread_ratio is not None and spread_ratio == spread_ratio.to_integral_value()
                 else None
             )
             no_fill_reason = None
@@ -687,9 +694,7 @@ class PaperTradingEngine:
             if no_fill_reason is None:
                 oracle = IndependentOracle.validate_aggressive(order, book, execution)
                 if not oracle.passed:
-                    raise DomainValidationError(
-                        "independent oracle rejected paper execution"
-                    )
+                    raise DomainValidationError("independent oracle rejected paper execution")
             order_ids.append(order.order_id)
             fill_ids.extend(fill.fill_id for fill in execution.fills)
             self._record_execution(order, execution, pending, account, session, event)
@@ -711,7 +716,7 @@ class PaperTradingEngine:
                 self._record_position(position, account, event, "OPEN")
                 opened_ids.append(position.position_id)
             else:
-                self._active_windows.discard(pending.signal_id)
+                self._discard_raw_window(pending.signal_id)
             self._state.remove_open_order(order.order_id)
             self._state.remove_pending_intent(intent_id)
             self._pending.pop(intent_id, None)
@@ -823,7 +828,7 @@ class PaperTradingEngine:
                 self._state.remove_open_position(position_id)
                 self._record_position(updated, account, event, "CLOSED")
                 self._record_trade(updated, execution, account, event)
-                self._active_windows.discard(self._position_signals.get(position_id, ""))
+                self._discard_raw_window(self._position_signals.get(position_id, ""))
                 closed_ids.append(position_id)
             else:
                 self._positions[position_id] = updated
@@ -941,21 +946,12 @@ class PaperTradingEngine:
     ) -> None:
         assert position.exit_price is not None
         trade_id = deterministic_id("trade", position.position_id, execution.source_event_id)
-        specification = self._registry.version(
-            position.strategy_id, position.strategy_version
-        )
+        specification = self._registry.version(position.strategy_id, position.strategy_version)
         stress_ticks_each_side = Decimal(
             str(specification.parameters.get("additional_slippage_ticks_each_side", 0))
         )
-        stress_cost = (
-            Decimal("2")
-            * stress_ticks_each_side
-            * self._tick_size
-            * position.quantity
-        )
-        raw_pnl_ticks = position.realized_gross_pnl / (
-            self._tick_size * position.quantity
-        )
+        stress_cost = Decimal("2") * stress_ticks_each_side * self._tick_size * position.quantity
+        raw_pnl_ticks = position.realized_gross_pnl / (self._tick_size * position.quantity)
         stress_entry_price = (
             position.entry_price + self._tick_size * stress_ticks_each_side
             if position.is_long
@@ -1235,9 +1231,7 @@ class PaperTradingEngine:
             },
         )
 
-    def _record_market_status(
-        self, event: CanonicalMarketEvent, session: SessionContext
-    ) -> None:
+    def _record_market_status(self, event: CanonicalMarketEvent, session: SessionContext) -> None:
         if event.event_type != "trading_status":
             return
         self._datasets.append(
@@ -1325,10 +1319,16 @@ class PaperTradingEngine:
         while self._raw_buffer and as_utc(self._raw_buffer[0].receive_ts) < cutoff:
             self._raw_buffer.popleft()
 
-    def _append_raw(self, signal_id: str, event: CanonicalMarketEvent) -> None:
-        key = (signal_id, event.event_id)
-        if key in self._raw_written:
+    def _discard_raw_window(self, signal_id: str) -> None:
+        if not signal_id:
             return
+        self._active_windows.discard(signal_id)
+        self._raw_written.pop(signal_id, None)
+
+    def _append_raw(self, signal_id: str, event: CanonicalMarketEvent) -> bool:
+        written = self._raw_written.setdefault(signal_id, set())
+        if event.event_id in written:
+            return False
         dataset = {
             "orderbook": "raw_orderbook_event_windows",
             "trade": "raw_trades_event_windows",
@@ -1337,7 +1337,7 @@ class PaperTradingEngine:
             "backfill_candle": "raw_candles_event_windows",
         }.get(event.event_type)
         if dataset is None:
-            return
+            return False
         payload: Mapping[str, object] = event.payload
         nested = event.payload.get(event.event_type) or event.payload.get("orderbook")
         if isinstance(nested, Mapping):
@@ -1350,7 +1350,7 @@ class PaperTradingEngine:
             "window_id": signal_id,
             "signal_id": signal_id,
             "instrument_uid": event.instrument_uid,
-            "payload_json": event.payload,
+            "payload_json": _compact_raw_payload(event.event_type, event.payload, payload),
         }
         if event.event_type == "orderbook":
             bids = _levels(payload.get("bids"), descending=True)
@@ -1379,7 +1379,8 @@ class PaperTradingEngine:
             row["interval"] = payload.get("interval")
             row["is_complete"] = payload.get("is_complete", True)
         self._datasets.append(dataset, row)
-        self._raw_written.add(key)
+        written.add(event.event_id)
+        return True
 
     def _checkpoint(self, event_id: str) -> None:
         self._state.save_checkpoint(
@@ -1429,9 +1430,7 @@ class PaperTradingEngine:
                 activated_at=version.activated_at,
                 enabled=key in enabled_keys,
                 lifecycle_status=version.status.value,
-                evaluation_cohort=str(
-                    version.parameters.get("evaluation_cohort", "LIVE_OOS")
-                ),
+                evaluation_cohort=str(version.parameters.get("evaluation_cohort", "LIVE_OOS")),
                 lifecycle=_strategy_lifecycle(version),
             )
             self._state.set_strategy_enabled(
@@ -1443,9 +1442,7 @@ class PaperTradingEngine:
                 version.strategy_id,
                 version.version,
                 lifecycle_status=version.status.value,
-                evaluation_cohort=str(
-                    version.parameters.get("evaluation_cohort", "LIVE_OOS")
-                ),
+                evaluation_cohort=str(version.parameters.get("evaluation_cohort", "LIVE_OOS")),
                 lifecycle=_strategy_lifecycle(version),
             )
             account = self._registry.accounts[key]
@@ -1499,9 +1496,7 @@ class PaperTradingEngine:
 
         for row in recovery.pending_intents:
             state = row.get("state", {})
-            if not isinstance(state, Mapping) or not isinstance(
-                state.get("intent"), Mapping
-            ):
+            if not isinstance(state, Mapping) or not isinstance(state.get("intent"), Mapping):
                 continue
             intent = _intent_from_state(cast(Mapping[str, Any], state["intent"]))
             self._pending[intent.intent_id] = _PendingIntent(
@@ -1515,9 +1510,7 @@ class PaperTradingEngine:
             if not isinstance(saved_plugin, Mapping):
                 continue
             for plugin in self._plugins:
-                if plugin.specification.key != (
-                    intent.strategy_id + "_" + intent.strategy_version
-                ):
+                if plugin.specification.key != (intent.strategy_id + "_" + intent.strategy_version):
                     continue
                 restore = getattr(plugin, "restore_state", None)
                 if callable(restore):
@@ -1588,6 +1581,25 @@ def _strategy_lifecycle(version: StrategyVersion) -> dict[str, object]:
             }
         )
     return lifecycle
+
+
+def _compact_raw_payload(
+    event_type: str,
+    envelope: Mapping[str, object],
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Remove null stream fields and book levels duplicated in typed columns."""
+
+    nested = {
+        str(key): value
+        for key, value in payload.items()
+        if value is not None and not (event_type == "orderbook" and key in {"bids", "asks"})
+    }
+    compact: dict[str, object] = {event_type: nested}
+    subscription_kind = envelope.get("subscription_kind")
+    if subscription_kind is not None:
+        compact["subscription_kind"] = subscription_kind
+    return compact
 
 
 def _levels(value: object, *, descending: bool) -> tuple[BookLevel, ...]:
@@ -1756,9 +1768,7 @@ def _position_from_state(value: Mapping[str, Any]) -> PaperPosition:
         realized_gross_pnl=decimal_value(
             value.get("realized_gross_pnl", "0"), "realized_gross_pnl"
         ),
-        realized_net_pnl=decimal_value(
-            value.get("realized_net_pnl", "0"), "realized_net_pnl"
-        ),
+        realized_net_pnl=decimal_value(value.get("realized_net_pnl", "0"), "realized_net_pnl"),
     )
 
 

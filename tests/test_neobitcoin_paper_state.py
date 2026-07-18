@@ -159,13 +159,10 @@ def test_state_backups_are_verified_and_rotated(tmp_path: Path) -> None:
     backup_dir = tmp_path / "state" / "backups"
     with PaperStateStore(database) as store:
         for index in range(6):
-            backup = store.backup(
-                backup_dir / f"paper-20260718T00000{index}Z.sqlite"
-            )
+            backup = store.backup(backup_dir / f"paper-20260718T00000{index}Z.sqlite")
             os.utime(backup, ns=(index + 1, index + 1))
         orphan = backup_dir / (
-            ".paper-20260718T000006Z.sqlite."
-            "0123456789abcdef0123456789abcdef.inprogress-journal"
+            ".paper-20260718T000006Z.sqlite.0123456789abcdef0123456789abcdef.inprogress-journal"
         )
         orphan.write_bytes(b"orphan")
 
@@ -273,6 +270,37 @@ def test_dataset_recovers_active_jsonl_after_restart(tmp_path: Path) -> None:
     table = pq.read_table(recovered.parquet_path("health_events"))
     assert table.num_rows == 1
     assert table.column("event_id")[0].as_py() == "health-1"
+
+
+def test_raw_active_jsonl_is_zstd_compressed_and_restart_recoverable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "paper-data"
+    first = DatasetStore(root, "2026-07-15", durable_writes=False)
+    for index in range(100):
+        first.append(
+            "raw_last_price_event_windows",
+            {
+                "raw_event_id": f"raw-{index}",
+                "source_event_id": f"source-{index}",
+                "event_ts": datetime(2026, 7, 15, 7, 0, tzinfo=UTC) + timedelta(microseconds=index),
+                "receive_ts": datetime(2026, 7, 15, 7, 0, tzinfo=UTC)
+                + timedelta(microseconds=index),
+                "instrument_uid": "4effa274-4e8f-422c-93ff-04aa34fe8e39",
+                "price": 100_000 + index,
+                "payload_json": {"repeated": "x" * 4_000},
+            },
+        )
+    active = first.active_path("raw_last_price_event_windows")
+    first.abort()
+
+    assert active.name.endswith(".jsonl.zst.inprogress")
+    assert active.stat().st_size < 100_000
+
+    recovered = DatasetStore(root, "2026-07-15", durable_writes=False)
+    path = recovered.close()["raw_last_price_event_windows.parquet"]
+    assert pq.ParquetFile(path).metadata.num_rows == 100
+    assert not tuple(root.rglob("*.inprogress"))
 
 
 def test_dataset_close_streams_multiple_parquet_row_groups(tmp_path: Path) -> None:

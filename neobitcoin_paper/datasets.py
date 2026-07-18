@@ -9,6 +9,7 @@ small operational SQLite database.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -16,10 +17,11 @@ from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Final, TextIO
+from typing import Any, BinaryIO, Final, TextIO
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import zstandard as zstd  # type: ignore[import-untyped]
 
 REQUIRED_DATASETS: Final = (
     "market_status_events.parquet",
@@ -510,13 +512,21 @@ if tuple(DATASET_SCHEMAS) != REQUIRED_DATASETS:
 
 
 class JsonlDatasetWriter:
-    """One flush-on-append crash-recoverable JSONL writer."""
+    """One flush-on-append crash-recoverable JSONL or ZSTD-JSONL writer."""
 
-    def __init__(self, path: Path, *, durable_writes: bool) -> None:
+    def __init__(self, path: Path, *, durable_writes: bool, compressed: bool = False) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._durable_writes = durable_writes
-        self._handle: TextIO = self.path.open("a", encoding="utf-8", newline="\n")
+        self._compressed = compressed
+        self._text_handle: TextIO | None = None
+        self._binary_handle: BinaryIO | None = None
+        self._compressor: zstd.ZstdCompressor | None = None
+        if compressed:
+            self._binary_handle = self.path.open("ab")
+            self._compressor = zstd.ZstdCompressor(level=3)
+        else:
+            self._text_handle = self.path.open("a", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
         self._closed = False
 
@@ -531,19 +541,33 @@ class JsonlDatasetWriter:
             default=_json_default,
         )
         with self._lock:
-            self._handle.write(payload + "\n")
-            self._handle.flush()
+            if self._compressed:
+                assert self._binary_handle is not None and self._compressor is not None
+                # Each row is a complete frame. Concatenated frames remain appendable
+                # after a crash and avoid multi-gigabyte plain JSONL order-book files.
+                self._binary_handle.write(
+                    self._compressor.compress((payload + "\n").encode("utf-8"))
+                )
+                self._binary_handle.flush()
+                descriptor = self._binary_handle.fileno()
+            else:
+                assert self._text_handle is not None
+                self._text_handle.write(payload + "\n")
+                self._text_handle.flush()
+                descriptor = self._text_handle.fileno()
             if self._durable_writes:
-                os.fsync(self._handle.fileno())
+                os.fsync(descriptor)
 
     def close(self) -> None:
         if self._closed:
             return
         with self._lock:
-            self._handle.flush()
+            handle = self._binary_handle if self._compressed else self._text_handle
+            assert handle is not None
+            handle.flush()
             if self._durable_writes:
-                os.fsync(self._handle.fileno())
-            self._handle.close()
+                os.fsync(handle.fileno())
+            handle.close()
             self._closed = True
 
 
@@ -580,7 +604,15 @@ class DatasetStore:
     def active_path(self, dataset: str) -> Path:
         canonical = _dataset_file(dataset)
         stem = canonical.removesuffix(".parquet")
-        return self.active_dir / f"{stem}.jsonl.inprogress"
+        legacy = self.active_dir / f"{stem}.jsonl.inprogress"
+        compressed = self.active_dir / f"{stem}.jsonl.zst.inprogress"
+        if legacy.exists() and compressed.exists():
+            raise DatasetMaterializationError(f"multiple active formats exist for {canonical}")
+        if compressed.exists():
+            return compressed
+        if legacy.exists():
+            return legacy
+        return compressed if canonical in _RAW_EVENT_WINDOW_DATASETS else legacy
 
     def parquet_path(self, dataset: str) -> Path:
         return self.parquet_dir / _dataset_file(dataset)
@@ -593,8 +625,11 @@ class DatasetStore:
                 raise DatasetClosedError(f"dataset is already finalized: {canonical}")
             writer = self._writers.get(canonical)
             if writer is None:
+                active = self.active_path(canonical)
                 writer = JsonlDatasetWriter(
-                    self.active_path(canonical), durable_writes=self._durable_writes
+                    active,
+                    durable_writes=self._durable_writes,
+                    compressed=active.name.endswith(".jsonl.zst.inprogress"),
                 )
                 self._writers[canonical] = writer
             return writer
@@ -713,9 +748,7 @@ def _materialize_parquet(
     # Python set would make finalization memory-linear; the archive validator
     # performs the global DISTINCT check with DuckDB after Parquet is written.
     # A fresh per-batch set still rejects immediate duplicates while writing.
-    seen_primary_keys: set[str] | None = (
-        None if dataset in _RAW_EVENT_WINDOW_DATASETS else set()
-    )
+    seen_primary_keys: set[str] | None = None if dataset in _RAW_EVENT_WINDOW_DATASETS else set()
     previous_event_ts: datetime | None = None
     writer: pq.ParquetWriter | None = None
     try:
@@ -865,7 +898,13 @@ def _coerce(value: Any, data_type: pa.DataType) -> Any:
 def _iter_jsonl_batches(path: Path) -> Iterator[list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     batch_bytes = 0
-    with path.open("r", encoding="utf-8") as handle:
+    if path.name.endswith(".jsonl.zst.inprogress"):
+        raw = path.open("rb")
+        reader = zstd.ZstdDecompressor().stream_reader(raw, read_across_frames=True)
+        source: TextIO = io.TextIOWrapper(reader, encoding="utf-8")
+    else:
+        source = path.open("r", encoding="utf-8")
+    with source as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
                 continue

@@ -53,6 +53,7 @@ def test_command_surface_and_underscore_aliases_are_complete() -> None:
         "verify-archive",
         "replay-strategy",
         "acknowledge-delivery",
+        "cleanup-session-data",
     }
     assert all(command in help_text for command in required)
 
@@ -131,29 +132,33 @@ def test_strategy_registration_lifecycle_summary_and_replay_are_json_only(
     )
     assert code == 0 and registered["registered"] is True
 
-    code, strategy, _ = _run(
-        root, "get_paper_strategy", "STRONG_COUNTERFLOW_ABSORPTION", "v2"
-    )
+    code, strategy, _ = _run(root, "get_paper_strategy", "STRONG_COUNTERFLOW_ABSORPTION", "v2")
     assert code == 0
     assert strategy["strategy"]["enabled"] == 0
     assert len(strategy["virtual_accounts"]) == 1
 
-    assert _run(
-        root,
-        "enable_paper_strategy",
-        "STRONG_COUNTERFLOW_ABSORPTION",
-        "v2",
-        "--confirm",
-        "PAPER_ONLY",
-    )[1]["enabled"] is True
-    assert _run(
-        root,
-        "pause_paper_strategy",
-        "STRONG_COUNTERFLOW_ABSORPTION",
-        "v2",
-        "--confirm",
-        "PAPER_ONLY",
-    )[1]["enabled"] is False
+    assert (
+        _run(
+            root,
+            "enable_paper_strategy",
+            "STRONG_COUNTERFLOW_ABSORPTION",
+            "v2",
+            "--confirm",
+            "PAPER_ONLY",
+        )[1]["enabled"]
+        is True
+    )
+    assert (
+        _run(
+            root,
+            "pause_paper_strategy",
+            "STRONG_COUNTERFLOW_ABSORPTION",
+            "v2",
+            "--confirm",
+            "PAPER_ONLY",
+        )[1]["enabled"]
+        is False
+    )
 
     fixture = tmp_path / "fixture.json"
     fixture.write_text('{"events":[]}', encoding="utf-8")
@@ -184,9 +189,7 @@ def test_strategy_registration_lifecycle_summary_and_replay_are_json_only(
         ),
         encoding="utf-8",
     )
-    code, _, text = _run(
-        root, "register-strategy", str(unsafe), "--confirm", "PAPER_ONLY"
-    )
+    code, _, text = _run(root, "register-strategy", str(unsafe), "--confirm", "PAPER_ONLY")
     assert code == 2
     assert "sensitive-value-that-must-not-print" not in text
 
@@ -227,6 +230,64 @@ def test_archive_manifest_verification_and_test_exclusion(tmp_path: Path) -> Non
     )
     assert code == 2
     assert payload["message"] == "TEST archives are excluded from delivery"
+
+
+def test_cleanup_session_data_removes_only_prevalidated_finalized_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "paper"
+    _run(root, "migrate", "--confirm", "PAPER_ONLY")
+    session = "2026-07-15"
+    archive_id = "DAILY-2026-07-15-111111111111"
+    archive = root / "daily_archives" / "session.tar.zst"
+    archive.write_bytes(b"validated")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    Path(str(archive) + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    state = PaperStateStore(root / "state" / "paper_state.sqlite3")
+    state.record_archive(
+        archive_id,
+        session_date=session,
+        path=archive,
+        sha256=digest,
+        status="VALIDATED",
+        validation={"test_archive": False},
+        validated_at=datetime.now(UTC),
+    )
+    state.close()
+    active = root / "active" / session
+    parquet = root / "parquet" / session
+    active.mkdir(parents=True)
+    parquet.mkdir(parents=True)
+    for name in cli.REQUIRED_DATASETS:
+        (parquet / name).write_bytes(name.encode())
+
+    class PassingValidator:
+        def validate_archive(self, *_args: object, **_kwargs: object) -> object:
+            return type("Validation", (), {"passed": True})()
+
+    monkeypatch.setattr(cli, "ArchiveValidator", PassingValidator)
+    monkeypatch.setattr(
+        cli,
+        "_read_archive_manifest",
+        lambda _path: {
+            "archive_id": archive_id,
+            "session_date": session,
+            "archive_type": "OOS_DAILY",
+        },
+    )
+    code, payload, _ = _run(
+        root,
+        "cleanup-session-data",
+        session,
+        archive_id,
+        digest,
+        "--confirm",
+        "PAPER_ONLY",
+    )
+
+    assert code == 0 and payload["session_data_removed"] is True
+    assert not active.exists() and not parquet.exists()
+    assert archive.is_file() and Path(str(archive) + ".sha256").is_file()
 
 
 def test_delivery_and_acknowledgement_use_durable_outbox_without_network(

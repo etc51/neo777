@@ -59,6 +59,7 @@ _WRITE_COMMANDS: Final = frozenset(
         "enable-strategy",
         "pause-strategy",
         "acknowledge-delivery",
+        "cleanup-session-data",
     }
 )
 
@@ -81,12 +82,19 @@ def build_parser() -> argparse.ArgumentParser:
     deliver = _write_parser(commands, "deliver", help_text="deliver a validated archive")
     deliver.add_argument("--archive-id")
 
+    cleanup = _write_parser(
+        commands,
+        "cleanup-session-data",
+        help_text="remove finalized server data after verified local delivery",
+    )
+    cleanup.add_argument("session_date", type=_session_date)
+    cleanup.add_argument("archive_id", type=_validated_identifier)
+    cleanup.add_argument("sha256", type=_validated_sha256)
+
     commands.add_parser("status", aliases=["paper_bot_status"])
     commands.add_parser("list-strategies", aliases=["list_paper_strategies"])
 
-    get_strategy = commands.add_parser(
-        "get-strategy", aliases=["get_paper_strategy"]
-    )
+    get_strategy = commands.add_parser("get-strategy", aliases=["get_paper_strategy"])
     _strategy_selector(get_strategy)
 
     register = _write_parser(
@@ -113,29 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _strategy_selector(pause)
 
-    summary = commands.add_parser(
-        "daily-summary", aliases=["get_paper_daily_summary"]
-    )
+    summary = commands.add_parser("daily-summary", aliases=["get_paper_daily_summary"])
     summary.add_argument("session_date", nargs="?", type=_session_date)
 
-    archives = commands.add_parser(
-        "list-archives", aliases=["list_paper_archives"]
-    )
+    archives = commands.add_parser("list-archives", aliases=["list_paper_archives"])
     archives.add_argument("--session-date", type=_session_date)
 
-    manifest = commands.add_parser(
-        "archive-manifest", aliases=["get_paper_archive_manifest"]
-    )
+    manifest = commands.add_parser("archive-manifest", aliases=["get_paper_archive_manifest"])
     manifest.add_argument("archive_id")
 
-    verify = commands.add_parser(
-        "verify-archive", aliases=["verify_paper_archive"]
-    )
+    verify = commands.add_parser("verify-archive", aliases=["verify_paper_archive"])
     verify.add_argument("path_or_id")
 
-    replay = commands.add_parser(
-        "replay-strategy", aliases=["replay_paper_strategy"]
-    )
+    replay = commands.add_parser("replay-strategy", aliases=["replay_paper_strategy"])
     _strategy_selector(replay)
     replay.add_argument("fixture", type=Path)
 
@@ -234,13 +232,13 @@ def _dispatch(
     if command == "verify-archive":
         return _verify_archive(config, args.path_or_id)
     if command == "replay-strategy":
-        return _replay_strategy(
-            config, args.strategy_id, args.strategy_version, args.fixture
-        )
+        return _replay_strategy(config, args.strategy_id, args.strategy_version, args.fixture)
     if command == "archive":
         return _archive(config, args.session_date, args.test_archive)
     if command == "deliver":
         return _deliver(config, args.archive_id)
+    if command == "cleanup-session-data":
+        return _cleanup_session_data(config, args.session_date, args.archive_id, args.sha256)
     if command == "acknowledge-delivery":
         return _acknowledge_delivery(config, args.delivery_id)
     raise CLIError("unknown command")
@@ -504,6 +502,95 @@ def _verify_archive(config: PaperConfig, path_or_id: str) -> dict[str, object]:
     return {"validation": asdict(validation)}
 
 
+def _cleanup_session_data(
+    config: PaperConfig,
+    session_date: date,
+    archive_id: str,
+    expected_sha256: str,
+) -> dict[str, object]:
+    """Delete only one finalized session while its OOS archive is verifiable."""
+
+    if session_date >= datetime.now(UTC).astimezone(_MOSCOW).date():
+        raise CLIError("only completed prior sessions may be cleaned")
+    with _read_state(config) as connection:
+        row = connection.execute(
+            "SELECT * FROM archives WHERE archive_id = ? AND status = 'VALIDATED'",
+            (archive_id,),
+        ).fetchone()
+    if row is None:
+        raise CLIError("validated archive was not found")
+    if str(row["session_date"]) != session_date.isoformat():
+        raise CLIError("archive session date does not match")
+    if str(row["sha256"]).lower() != expected_sha256:
+        raise CLIError("archive SHA-256 does not match")
+
+    archive = allowlisted_archive_path(config, str(row["path"]))
+    manifest = _read_archive_manifest(archive)
+    if (
+        manifest.get("archive_id") != archive_id
+        or manifest.get("session_date") != session_date.isoformat()
+        or manifest.get("archive_type") != "OOS_DAILY"
+    ):
+        raise CLIError("archive manifest does not authorize session cleanup")
+    validation = ArchiveValidator().validate_archive(archive, expected_sha256=expected_sha256)
+    if not validation.passed:
+        raise CLIError("archive validation failed before session cleanup")
+    sidecar = Path(str(archive) + ".sha256")
+    if not sidecar.is_file() or sidecar.is_symlink() or sidecar.resolve().parent != archive.parent:
+        raise CLIError("archive sidecar is invalid")
+    if sidecar.read_text(encoding="utf-8").strip().split() != [
+        expected_sha256,
+        archive.name,
+    ]:
+        raise CLIError("archive sidecar does not match")
+
+    active_root = (config.data_root / "active").resolve(strict=True)
+    parquet_root = (config.data_root / "parquet").resolve(strict=True)
+    active_dir = active_root / session_date.isoformat()
+    parquet_dir = parquet_root / session_date.isoformat()
+    for directory, expected_parent in (
+        (active_dir, active_root),
+        (parquet_dir, parquet_root),
+    ):
+        if directory.exists() and (
+            directory.is_symlink()
+            or not directory.is_dir()
+            or directory.resolve(strict=True).parent != expected_parent
+        ):
+            raise CLIError("session cleanup path is unsafe")
+
+    active_entries = tuple(active_dir.iterdir()) if active_dir.exists() else ()
+    if active_entries:
+        raise CLIError("finalized active session directory is not empty")
+    parquet_entries = tuple(parquet_dir.iterdir()) if parquet_dir.exists() else ()
+    if parquet_entries:
+        if {path.name for path in parquet_entries} != set(REQUIRED_DATASETS):
+            raise CLIError("finalized parquet session contains unexpected files")
+        resolved_parquet = parquet_dir.resolve(strict=True)
+        for path in parquet_entries:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.resolve(strict=True).parent != resolved_parquet
+            ):
+                raise CLIError("finalized parquet file is unsafe")
+
+    removed_bytes = sum(path.stat().st_size for path in parquet_entries)
+    for path in sorted(parquet_entries, key=lambda item: item.name):
+        path.unlink()
+    if parquet_dir.exists():
+        parquet_dir.rmdir()
+    if active_dir.exists():
+        active_dir.rmdir()
+    return {
+        "archive_id": archive_id,
+        "session_date": session_date,
+        "sha256": expected_sha256,
+        "removed_bytes": removed_bytes,
+        "session_data_removed": True,
+    }
+
+
 def _replay_strategy(
     config: PaperConfig, strategy_id: str, strategy_version: str, fixture: Path
 ) -> dict[str, object]:
@@ -521,9 +608,7 @@ def _replay_strategy(
     }
 
 
-def _archive(
-    config: PaperConfig, session: date | None, test_archive: bool
-) -> dict[str, object]:
+def _archive(config: PaperConfig, session: date | None, test_archive: bool) -> dict[str, object]:
     selected = session or datetime.now(UTC).astimezone(_MOSCOW).date() - timedelta(days=1)
     config.ensure_directories()
     with _write_state(config) as state:
@@ -561,9 +646,7 @@ def _deliver(config: PaperConfig, archive_id: str | None) -> dict[str, object]:
         if validation.get("test_archive"):
             raise CLIError("TEST archives are excluded from delivery")
         allowlisted_archive_path(config, str(row["path"]))
-        worker = DeliveryWorker(
-            state, maximum_retry_seconds=config.delivery_max_retry_seconds
-        )
+        worker = DeliveryWorker(state, maximum_retry_seconds=config.delivery_max_retry_seconds)
         delivery_id = worker.enqueue(selected, thread_id)
         results = worker.run_due()
     return {
@@ -588,9 +671,7 @@ def _acknowledge_delivery(config: PaperConfig, delivery_id: str) -> dict[str, ob
     return {"delivery_id": delivery_id, "status": "ACKNOWLEDGED"}
 
 
-def _latest_deliverable_archive_id(
-    state: PaperStateStore, thread_id: str
-) -> str | None:
+def _latest_deliverable_archive_id(state: PaperStateStore, thread_id: str) -> str | None:
     rows = state.connection.execute(
         """
         SELECT a.archive_id, a.validation_json
@@ -642,6 +723,13 @@ def _validated_identifier(value: object) -> str:
     return text
 
 
+def _validated_sha256(value: object) -> str:
+    text = str(value).strip().lower()
+    if _SHA256.fullmatch(text) is None:
+        raise CLIError("invalid SHA-256")
+    return text
+
+
 def _required_identifier(payload: Mapping[str, object], key: str) -> str:
     return _validated_identifier(payload.get(key, ""))
 
@@ -683,8 +771,7 @@ def _safe_error_message(exc: BaseException) -> str:
 
 def _emit(output: TextIO, payload: Mapping[str, object]) -> None:
     output.write(
-        json.dumps(payload, default=_json_default, sort_keys=True, separators=(",", ":"))
-        + "\n"
+        json.dumps(payload, default=_json_default, sort_keys=True, separators=(",", ":")) + "\n"
     )
 
 

@@ -311,8 +311,18 @@ browser, store cookies, or use private web endpoints.
 Default free-space thresholds are 5 GiB warning, 2 GiB critical, and 1 GiB
 emergency. At critical pressure, checkpoint state, close writers, suppress new
 signals, preserve undelivered artifacts, and remove only allow-listed temporary
-or already acknowledged retained data. Delivered archives are retained at least
-30 days by default; manifests, hashes, and delivery logs may be retained longer.
+or already acknowledged retained data. Raw event windows are written as
+ZSTD-JSONL frames so an interrupted day remains bounded before Parquet
+finalization.
+
+After an OOS_DAILY archive has been copied locally and its server, sidecar, and
+local SHA plus PyArrow/DuckDB/zstd/reconciliation checks all pass, run
+`cleanup-session-data SESSION_DATE ARCHIVE_ID SHA256 --confirm PAPER_ONLY`.
+The command revalidates the server archive and removes only the empty finalized
+`active/SESSION_DATE` directory and the exact 20 typed Parquet files under
+`parquet/SESSION_DATE`. It refuses current-day, TEST, symlink, unexpected-file,
+incomplete, or hash-mismatched cleanup. The archive and sidecar are handled by
+the separate content-addressed delivery cleanup.
 
 Useful read-only checks:
 

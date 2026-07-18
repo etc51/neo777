@@ -184,11 +184,14 @@ One consistent recovery snapshot includes:
 - pending archives;
 - the durable delivery outbox.
 
-Session history is appended to crash-recoverable JSONL files ending in
-`.inprogress`. Finalization closes writers and materializes exactly one typed,
-ZSTD-compressed Parquet file per dataset, including a typed empty file for a
-zero-event dataset. A successful materialization removes active markers. An
-archive is never built while any `.inprogress` file remains.
+Session history is appended to crash-recoverable files ending in `.inprogress`.
+Raw event windows use concatenated, independently complete ZSTD-JSONL frames;
+smaller derived datasets use plain JSONL. Rejected candidates retain one causal
+raw row, while accepted intents retain their full causal window. Finalization
+closes writers and materializes exactly one typed, ZSTD-compressed Parquet file
+per dataset, including a typed empty file for a zero-event dataset. A successful
+materialization removes active markers. An archive is never built while any
+`.inprogress` file remains.
 
 The independent storage roots are:
 
