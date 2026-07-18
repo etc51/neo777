@@ -532,6 +532,11 @@ def _cleanup_session_data(
         or manifest.get("archive_type") != "OOS_DAILY"
     ):
         raise CLIError("archive manifest does not authorize session cleanup")
+    if (
+        manifest.get("session_classification") == "INVALID_DATA_COVERAGE"
+        or manifest.get("investigation_required") is True
+    ):
+        raise CLIError("invalid coverage session is retained for investigation")
     validation = ArchiveValidator().validate_archive(archive, expected_sha256=expected_sha256)
     if not validation.passed:
         raise CLIError("archive validation failed before session cleanup")
@@ -645,6 +650,8 @@ def _deliver(config: PaperConfig, archive_id: str | None) -> dict[str, object]:
         validation = json.loads(str(row["validation_json"]))
         if validation.get("test_archive"):
             raise CLIError("TEST archives are excluded from delivery")
+        if validation.get("investigation_required") is True:
+            raise CLIError("invalid coverage archive is retained for investigation")
         allowlisted_archive_path(config, str(row["path"]))
         worker = DeliveryWorker(state, maximum_retry_seconds=config.delivery_max_retry_seconds)
         delivery_id = worker.enqueue(selected, thread_id)
@@ -686,7 +693,10 @@ def _latest_deliverable_archive_id(state: PaperStateStore, thread_id: str) -> st
     ).fetchall()
     for row in rows:
         validation = json.loads(str(row["validation_json"]))
-        if not validation.get("test_archive"):
+        if (
+            not validation.get("test_archive")
+            and validation.get("investigation_required") is not True
+        ):
             return str(row["archive_id"])
     return None
 

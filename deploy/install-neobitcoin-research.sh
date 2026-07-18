@@ -73,7 +73,6 @@ for unit in \
 done
 
 systemctl daemon-reload
-systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
 previous_target=""
 if [[ -L "${TARGET_DIR}" ]]; then
   previous_target="$(readlink -f "${TARGET_DIR}")"
@@ -85,10 +84,11 @@ ln -s "${release}" "${TARGET_DIR}.new"
 mv -Tf "${TARGET_DIR}.new" "${TARGET_DIR}"
 
 deployment_ok=true
-systemctl enable --now "${SCHEDULE_TIMER}" "${ARCHIVE_TIMER}" || deployment_ok=false
+systemctl enable --now "${SERVICE}" "${SCHEDULE_TIMER}" "${ARCHIVE_TIMER}" || deployment_ok=false
 systemctl start "${SCHEDULE_SERVICE}" || deployment_ok=false
 systemctl is-active --quiet "${SCHEDULE_TIMER}" || deployment_ok=false
 systemctl is-active --quiet "${ARCHIVE_TIMER}" || deployment_ok=false
+systemctl is-active --quiet "${SERVICE}" || deployment_ok=false
 test -f "${DATA_DIR}/server_control/status.json" || deployment_ok=false
 
 if [[ "${deployment_ok}" != true ]]; then

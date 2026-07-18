@@ -170,6 +170,29 @@ def test_data_quality_numeric_normal_trading_status_is_open_fail_closed() -> Non
     assert gate.snapshot().entry_allowed is False
 
 
+def test_closed_market_is_not_mislabeled_as_orderbook_gap() -> None:
+    gate = DataQualityGate(warmup_events=1, stale_after_seconds=5, max_latency_ms=3_000)
+    gate.on_connect()
+    for kind in ("orderbook", "trade", "last_price", "trading_status", "candle"):
+        gate.observe(
+            _canonical_event(
+                "subscription_ack",
+                payload={"subscription_kind": kind},
+                status="SUBSCRIPTION_STATUS_SUCCESS",
+            )
+        )
+    closed = gate.observe(
+        _canonical_event(
+            "trading_status",
+            payload={"tradingStatus": "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING"},
+        )
+    )
+    assert closed.subscription_state == "CLOSED_MARKET"
+    assert closed.reason == "CLOSED_MARKET"
+    assert closed.gap_active is False
+    assert closed.entry_allowed is False
+
+
 class _FakeChannel:
     last: _FakeChannel | None = None
 

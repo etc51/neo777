@@ -365,7 +365,9 @@ def build_daily_archive(
         validation={
             **asdict(built.validation),
             "test_archive": test_archive,
-            "oos_included": not test_archive,
+            "session_classification": built.manifest.get("session_classification"),
+            "investigation_required": built.manifest.get("investigation_required", True),
+            "oos_included": bool(built.manifest.get("oos_included", False)),
         },
         validated_at=datetime.now(UTC),
     )
@@ -387,7 +389,10 @@ class PaperRuntime:
     ) -> None:
         self.config = config
         self._environ = dict(os.environ if environ is None else environ)
-        self._market = market_data or ReadOnlyMarketDataAdapter(config.token_file)
+        self._market = market_data or ReadOnlyMarketDataAdapter(
+            config.token_file,
+            stream_silence_seconds=max(5.0, config.stale_after_seconds * 1.5),
+        )
         self.health = health or HealthRegistry()
         self._health_server_factory = health_server_factory
         self._notifier = notifier or SystemdNotifier(self._environ.get("NOTIFY_SOCKET"))
@@ -466,15 +471,20 @@ class PaperRuntime:
             else:
                 self._engine = None
             if _is_explicitly_closed(self._last_trading_status):
-                expected_close = self._calendar.window_for(initial_session).expected_close
-                self._closed_since = min(started_at, expected_close)
+                # A closed/not-tradable status is an entry gate, not a session
+                # boundary.  In particular the weekend status observed at
+                # process start must not finalize the writer after the normal
+                # five-minute archive grace period.
+                self._closed_since = started_at
             self.health.heartbeat("writer", healthy=True, ready=True)
             self.health.heartbeat("event_loop", healthy=True, ready=True)
             async for event in self._market.stream(stop):
                 if stop.is_set():
                     break
                 if event.event_type == "reconnect":
-                    self._stream_connected = True
+                    # Opening a gRPC iterator is not readiness.  Fresh ACKs,
+                    # status and a valid book must converge for this generation.
+                    self._stream_connected = False
                 elif event.event_type == "disconnect":
                     self._stream_connected = False
                 self._observe_live_status(event)
@@ -505,8 +515,25 @@ class PaperRuntime:
                         raise RuntimeError("active paper session has no execution engine")
                     result = await self._engine.process_event(event)
                     if self._quality_gate is not None:
+                        quality = self._quality_gate.snapshot()
                         self._last_trading_status = _normalize_trading_status(
-                            self._quality_gate.snapshot().trading_status
+                            quality.trading_status
+                        )
+                        self._stream_connected = quality.operational_ready
+                        self.health.heartbeat(
+                            "subscriptions",
+                            healthy=quality.subscription_state not in {"FATAL"},
+                            ready=quality.operational_ready,
+                            detail=f"{quality.subscription_state}:{quality.reason}",
+                        )
+                        self.health.heartbeat(
+                            "feature_pipeline",
+                            healthy=True,
+                            ready=(
+                                quality.feature_ready
+                                or quality.subscription_state == "CLOSED_MARKET"
+                            ),
+                            detail=quality.reason,
                         )
                     self._update_closed_boundary(event.processing_ts)
                     self._maybe_finalize_active(event.processing_ts)
@@ -751,10 +778,10 @@ class PaperRuntime:
                     self._last_trading_status,
                 )
                 return
-        if self._closed_since is None:
-            return
-        if observed_at >= self._closed_since + grace:
-            self._finalize_active(observed_at, self._last_trading_status)
+        # Never finalize merely because an explicit closed status persisted.
+        # The status can legitimately cover pre-open, breaks, weekends, or an
+        # unavailable instrument.  Keep recording status/ping evidence for the
+        # full expected session and finalize only at the scheduled boundary.
 
     def _finalize_active(self, observed_at: datetime, trading_status: str) -> None:
         if self._engine is None or self._session_finalized:

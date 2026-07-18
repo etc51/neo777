@@ -10,8 +10,9 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, cast
 
@@ -38,6 +39,34 @@ OPEN_TRADING_STATUSES: Final = frozenset(
 
 class InstrumentIdentityError(RuntimeError):
     """The broker metadata no longer matches the frozen instrument identity."""
+
+
+class SubscriptionState(StrEnum):
+    DISCONNECTED = "DISCONNECTED"
+    CONNECTING = "CONNECTING"
+    STREAM_OPEN = "STREAM_OPEN"
+    SUBSCRIBING = "SUBSCRIBING"
+    WAITING_ACKS = "WAITING_ACKS"
+    READY = "READY"
+    DEGRADED = "DEGRADED"
+    STALE = "STALE"
+    RECONNECTING = "RECONNECTING"
+    CLOSED_MARKET = "CLOSED_MARKET"
+    FATAL = "FATAL"
+
+
+@dataclass(slots=True)
+class SubscriptionEvidence:
+    requested_at: datetime | None = None
+    acknowledged_at: datetime | None = None
+    instrument_uid: str | None = None
+    requested_depth_or_interval: str | None = None
+    response_status: str | None = None
+    last_event_at: datetime | None = None
+    last_receive_at: datetime | None = None
+    generation_id: int = 0
+    retry_count: int = 0
+    last_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +136,9 @@ class DataQualitySnapshot:
     excessive_latency: bool
     warmup_remaining: int
     reason: str
+    subscription_state: str
+    operational_ready: bool
+    component_ages_seconds: dict[str, float | None] = field(default_factory=dict)
 
 
 class DataQualityGate:
@@ -134,28 +166,70 @@ class DataQualityGate:
         self._trading_status = "UNKNOWN"
         self._last_event_monotonic: float | None = None
         self._last_latency_ms = float("inf")
+        self._generation = 0
+        self._state = SubscriptionState.DISCONNECTED
+        self._evidence = {
+            kind: SubscriptionEvidence() for kind in (*sorted(self._REQUIRED_ACKS), "ping")
+        }
+        self._last_by_kind: dict[str, float] = {}
 
-    def on_connect(self) -> None:
+    def on_connect(self, generation: int | None = None) -> None:
+        self._generation = self._generation + 1 if generation is None else generation
         self._connected = True
+        self._state = SubscriptionState.WAITING_ACKS
         self._acks.clear()
         self._warmup_remaining = self._warmup_target
         self._gap_active = True
         self._book_valid = False
+        now = datetime.now(UTC)
+        for evidence in self._evidence.values():
+            evidence.requested_at = now
+            evidence.acknowledged_at = None
+            evidence.response_status = None
+            evidence.generation_id = self._generation
 
     def on_disconnect(self) -> None:
         self._connected = False
+        self._state = SubscriptionState.DISCONNECTED
         self._gap_active = True
         self._book_valid = False
         self._warmup_remaining = self._warmup_target
 
     def observe(self, event: CanonicalMarketEvent) -> DataQualitySnapshot:
+        if event.reconnect_generation and event.reconnect_generation != self._generation:
+            # The runtime may observe the first lifecycle event before it has
+            # explicitly advanced the gate.  Newer generations reset all ACK
+            # and warm-up evidence; older-generation events are ignored.
+            if event.reconnect_generation < self._generation:
+                return self.snapshot()
+            self.on_connect(event.reconnect_generation)
         self._last_event_monotonic = time.monotonic()
         self._last_latency_ms = event.latency_ms
+        kind = event.event_type
+        if kind in self._evidence:
+            self._last_by_kind[kind] = time.monotonic()
+            evidence = self._evidence[kind]
+            evidence.last_event_at = event.exchange_ts
+            evidence.last_receive_at = event.receive_ts
+            evidence.instrument_uid = event.instrument_uid
         if event.event_type == "subscription_ack":
-            kind = str(event.payload.get("subscription_kind", ""))
+            ack_kind = str(event.payload.get("subscription_kind", ""))
             status = event.subscription_status or ""
-            if status in {"SUBSCRIPTION_STATUS_SUCCESS", "1"} and kind:
-                self._acks.add(kind)
+            ack_evidence = self._evidence.get(ack_kind)
+            if ack_evidence is not None:
+                ack_evidence.response_status = status
+                ack_evidence.instrument_uid = event.instrument_uid
+            if (
+                status in {"SUBSCRIPTION_STATUS_SUCCESS", "1"}
+                and ack_kind in self._evidence
+            ):
+                self._acks.add(ack_kind)
+                self._evidence[ack_kind].acknowledged_at = event.receive_ts
+            elif ack_kind in self._evidence:
+                self._state = SubscriptionState.DEGRADED
+                self._evidence[ack_kind].last_error = (
+                    f"subscription status {status or 'missing'}"
+                )
         elif event.event_type == "trading_status":
             self._trading_status = _extract_trading_status(event.payload)
         elif event.event_type == "orderbook":
@@ -176,6 +250,11 @@ class DataQualityGate:
         excessive = self._last_latency_ms > self._max_latency_ms
         acknowledgements_ready = self._REQUIRED_ACKS.issubset(self._acks)
         status_open = self._trading_status in OPEN_TRADING_STATUSES
+        explicitly_closed = self._trading_status in {
+            "NOT_AVAILABLE_FOR_TRADING",
+            "DEALER_NOT_AVAILABLE_FOR_TRADING",
+            "CLOSED",
+        }
         feature_ready = (
             self._connected
             and acknowledgements_ready
@@ -188,25 +267,47 @@ class DataQualityGate:
         gates = (
             (self._connected, "DISCONNECTED"),
             (acknowledgements_ready, "SUBSCRIPTIONS_NOT_READY"),
-            (not stale, "STALE_DATA"),
+            (not stale, "STALE_STREAM"),
             (not excessive, "EXCESSIVE_LATENCY"),
-            (not self._gap_active, "ORDERBOOK_GAP"),
+            (not self._gap_active, "WAITING_VALID_ORDERBOOK"),
             (self._book_valid, "INVALID_BOOK"),
             (self._warmup_remaining == 0, "WARMUP"),
-            (status_open, "TRADING_STATUS_CLOSED_OR_UNKNOWN"),
+            (status_open, "MARKET_NOT_TRADABLE"),
         )
         reason = next((reason for passed, reason in gates if not passed), "READY")
+        if explicitly_closed and self._connected and acknowledgements_ready:
+            self._state = SubscriptionState.CLOSED_MARKET
+            reason = "CLOSED_MARKET"
+        elif feature_ready and status_open:
+            self._state = SubscriptionState.READY
+        elif stale and self._connected:
+            self._state = SubscriptionState.STALE
+        elif self._connected and self._state not in {SubscriptionState.DEGRADED}:
+            self._state = SubscriptionState.WAITING_ACKS
+        now = time.monotonic()
+        ages = {
+            kind: (None if stamp is None else max(0.0, now - stamp))
+            for kind in self._evidence
+            for stamp in (self._last_by_kind.get(kind),)
+        }
+        operational_ready = self._connected and acknowledgements_ready and (
+            explicitly_closed or (not stale and self._book_valid)
+        )
+        effective_gap = self._gap_active and not explicitly_closed
         return DataQualitySnapshot(
             stream_connected=self._connected,
             feature_ready=feature_ready,
             entry_allowed=feature_ready and status_open,
             trading_status=self._trading_status,
             book_valid=self._book_valid,
-            gap_active=self._gap_active,
+            gap_active=effective_gap,
             stale=stale,
             excessive_latency=excessive,
             warmup_remaining=self._warmup_remaining,
             reason=reason,
+            subscription_state=self._state.value,
+            operational_ready=operational_ready,
+            component_ages_seconds=ages,
         )
 
 
@@ -229,6 +330,7 @@ class ReadOnlyMarketDataAdapter:
         instance_id: str | None = None,
         minimum_backoff_seconds: float = 1.0,
         maximum_backoff_seconds: float = 60.0,
+        stream_silence_seconds: float = 30.0,
     ) -> None:
         self.__token_file = token_file
         self.__expected_uid = expected_uid
@@ -236,6 +338,7 @@ class ReadOnlyMarketDataAdapter:
         self.instance_id = instance_id or str(uuid.uuid4())
         self.minimum_backoff_seconds = minimum_backoff_seconds
         self.maximum_backoff_seconds = maximum_backoff_seconds
+        self.stream_silence_seconds = stream_silence_seconds
         self.reconnect_generation = 0
 
     def discover(self) -> InstrumentSnapshot:
@@ -267,7 +370,11 @@ class ReadOnlyMarketDataAdapter:
                     ):
                         yield event
                 backoff = self.minimum_backoff_seconds
-                async for record in client.stream_market_data(metadata):
+                iterator = client.stream_market_data(metadata).__aiter__()
+                while not stop.is_set():
+                    record = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=self.stream_silence_seconds
+                    )
                     if stop.is_set():
                         return
                     yield canonicalize_record(
@@ -506,7 +613,7 @@ def _book_is_valid(payload: Mapping[str, object]) -> bool:
         return False
     best_bid = _level_price(bids[0])
     best_ask = _level_price(asks[0])
-    return best_bid is not None and best_ask is not None and best_bid > 0 and best_ask >= best_bid
+    return best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > best_bid
 
 
 def _level_price(level: object) -> float | None:

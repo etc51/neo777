@@ -4,7 +4,8 @@ Documentation=file:/opt/neobitcoin-paper/docs/paper_bot_operations.md
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/var/lib/neobitcoin-paper
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300s
+StartLimitBurst=10
 
 [Service]
 Type=notify

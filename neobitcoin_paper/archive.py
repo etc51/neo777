@@ -24,6 +24,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import zstandard
 
+from neobitcoin_paper.coverage import classify_session, verify_coverage_report
 from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS, DatasetStore
 
 REQUIRED_DOCUMENTS: Final = (
@@ -159,6 +160,13 @@ class DailyArchiveBuilder:
                 for name in REQUIRED_DATASETS
             }
             summary = _daily_summary(data_dir, request.strategy_registry, row_counts)
+            coverage = classify_session(
+                data_dir,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                test_archive=request.test_archive,
+            )
+            _write_json(stage / "SESSION_COVERAGE.json", coverage)
             _write_json(stage / "SESSION_CALENDAR.json", request.session_calendar)
             _write_json(stage / "STRATEGY_REGISTRY.json", request.strategy_registry)
             safe_config = dict(request.config_snapshot)
@@ -186,6 +194,11 @@ class DailyArchiveBuilder:
                 "strategies": len(request.strategy_registry),
                 "datasets": [f"data/{name}" for name in REQUIRED_DATASETS],
                 "validation_policy": "zero unexplained discrepancies",
+                "coverage_schema_version": 1,
+                "session_classification": coverage["classification"],
+                "oos_included": coverage["oos_included"],
+                "investigation_required": coverage["investigation_required"],
+                "coverage_report_sha256": coverage["report_sha256"],
             }
             _write_json(stage / "MANIFEST.json", manifest)
             (stage / "MANIFEST.md").write_text(
@@ -480,6 +493,10 @@ def _expected_bundle_files(*, verify_sums: bool) -> set[str]:
     if not verify_sums:
         documents.discard("VALIDATION_REPORT.md")
         documents.discard("SHA256SUMS")
+    # SESSION_COVERAGE is mandatory for newly built archives (declared by the
+    # manifest) but is allow-listed here so older schema-v1 archives remain
+    # independently verifiable.
+    documents.add("SESSION_COVERAGE.json")
     return documents | {f"data/{name}" for name in REQUIRED_DATASETS}
 
 
@@ -503,6 +520,23 @@ def _validate_manifest(
         errors.append("manifest PAPER_ONLY assertion is missing")
     if manifest.get("archive_type") not in {"TEST", "OOS_DAILY"}:
         errors.append("manifest archive_type is invalid")
+    if manifest.get("coverage_schema_version") is not None:
+        coverage_path = root / "SESSION_COVERAGE.json"
+        try:
+            coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            errors.append("SESSION_COVERAGE.json is unreadable")
+        else:
+            if not isinstance(coverage, dict) or not verify_coverage_report(coverage):
+                errors.append("session coverage report hash mismatch")
+            elif (
+                manifest.get("coverage_report_sha256") != coverage.get("report_sha256")
+                or manifest.get("session_classification") != coverage.get("classification")
+                or manifest.get("oos_included") != coverage.get("oos_included")
+                or manifest.get("investigation_required")
+                != coverage.get("investigation_required")
+            ):
+                errors.append("manifest session coverage mismatch")
     expected_datasets = [f"data/{name}" for name in REQUIRED_DATASETS]
     if manifest.get("datasets") != expected_datasets:
         errors.append("manifest dataset list mismatch")

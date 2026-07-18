@@ -19,6 +19,14 @@ from scripts.neobitcoin_server_schedule import (
 )
 
 
+def test_scheduler_policy_keeps_collector_continuously_enabled() -> None:
+    source = (Path(__file__).parents[1] / "scripts" / "neobitcoin_server_schedule.py").read_text(
+        encoding="utf-8"
+    )
+    assert "should_run = True" in source
+    assert '"market_session_expected": market_session_expected' in source
+
+
 def test_fallback_schedule_matches_spb_future_hours() -> None:
     weekday = fallback_session(date(2026, 7, 15))
     weekend = fallback_session(date(2026, 7, 18))

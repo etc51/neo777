@@ -216,7 +216,9 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
     ]
     assert market.discoveries == 2
     assert all(server.started and server.closed for server in servers)
-    assert notifier.messages.count("READY=1") == 2
+    # A live process without current-generation subscription ACKs must not
+    # announce functional readiness.
+    assert notifier.messages.count("READY=1") == 0
     assert notifier.messages.count("WATCHDOG=1") == 4
     assert notifier.messages.count("STOPPING=1") == 2
     snapshot = (config.data_root / "state" / "instrument_snapshot.json").read_text(
@@ -281,11 +283,11 @@ def test_disk_guard_pauses_signals_before_emergency(tmp_path: Path) -> None:
     assert emergency.level is DiskLevel.EMERGENCY and not emergency.signals_allowed
 
 
-def test_live_closed_status_plus_grace_finalizes_writer_for_archive(
+def test_live_closed_status_plus_grace_does_not_finalize_before_scheduled_close(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path / "paper")
-    closed_at = datetime(2026, 7, 15, 21, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 18, 6, 50, tzinfo=UTC)
     market = _FiniteMarketData(
         (
             _closed_status_event("closed-start", closed_at),
@@ -306,12 +308,12 @@ def test_live_closed_status_plus_grace_finalizes_writer_for_archive(
     with sqlite3.connect(config.data_root / "state" / "paper_state.sqlite3") as connection:
         row = connection.execute(
             "SELECT status, active, trading_status FROM session_state "
-            "WHERE session_date = '2026-07-15'"
+            "WHERE session_date = '2026-07-18'"
         ).fetchone()
     assert row is not None
-    assert row[0] == "FINALIZED" and row[1] == 0
+    assert row[0] == "RUNNING" and row[1] == 1
     assert row[2] == "NOT_AVAILABLE_FOR_TRADING"
-    assert list((config.data_root / "active" / "2026-07-15").glob("*.inprogress"))
+    assert list((config.data_root / "active" / "2026-07-18").glob("*.inprogress"))
 
 
 def test_scheduled_close_plus_grace_finalizes_break_status_for_archive(

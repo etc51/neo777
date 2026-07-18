@@ -263,7 +263,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     cached = load_cached_sessions(args.cache)
     previous = cached.get((now.date() - timedelta(days=1)).isoformat())
-    should_run = should_collect(now, session, previous)
+    market_session_expected = should_collect(now, session, previous)
+    # Collection is intentionally continuous.  The market-session flag is
+    # retained as monitoring metadata, but it must never stop the independent
+    # raw collector: status/ping and reconnect evidence are required 24/7.
+    should_run = True
     action = "dry_run"
     if not args.dry_run:
         action = apply_service_state(args.service, should_run)
@@ -271,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         "checked_at": now.isoformat(),
         "service": args.service,
         "should_run": should_run,
+        "market_session_expected": market_session_expected,
         "action": action,
         "session": session.as_dict(),
         "previous_session": previous.as_dict() if previous is not None else None,

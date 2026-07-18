@@ -94,6 +94,7 @@ def test_zero_event_test_archive_has_exact_typed_bundle_and_hashes(
     expected_files = set(REQUIRED_DOCUMENTS) | {
         f"data/{name}" for name in REQUIRED_DATASETS
     }
+    expected_files.add("SESSION_COVERAGE.json")
     actual_files = {
         path.relative_to(extracted).as_posix()
         for path in extracted.rglob("*")

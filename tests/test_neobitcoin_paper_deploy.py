@@ -46,7 +46,8 @@ def _parse_env() -> dict[str, str]:
 def test_main_unit_is_paper_only_loopback_and_restart_unlimited() -> None:
     unit = _parse_unit("neobitcoin-paper.service")
     service = unit["Service"]
-    assert _one(unit, "Unit", "StartLimitIntervalSec") == "0"
+    assert _one(unit, "Unit", "StartLimitIntervalSec") == "300s"
+    assert _one(unit, "Unit", "StartLimitBurst") == "10"
     assert _one(unit, "Service", "User") == "neopaper"
     assert _one(unit, "Service", "Group") == "neopaper"
     assert _one(unit, "Service", "WorkingDirectory") == "/opt/neobitcoin-paper"
