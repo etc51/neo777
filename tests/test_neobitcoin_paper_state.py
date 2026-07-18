@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -151,6 +152,32 @@ def test_sqlite_recovery_generation_and_duplicate_guards(tmp_path: Path) -> None
         assert snapshot.pending_deliveries[0]["status"] == "DELIVERING"
         assert recovered_store.reset_interrupted_deliveries() == 1
         assert recovered_store.pending_deliveries()[0]["status"] == "FAILED_RETRYABLE"
+
+
+def test_state_backups_are_verified_and_rotated(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "paper.sqlite"
+    backup_dir = tmp_path / "state" / "backups"
+    with PaperStateStore(database) as store:
+        for index in range(6):
+            backup = store.backup(
+                backup_dir / f"paper-20260718T00000{index}Z.sqlite"
+            )
+            os.utime(backup, ns=(index + 1, index + 1))
+        orphan = backup_dir / (
+            ".paper-20260718T000006Z.sqlite."
+            "0123456789abcdef0123456789abcdef.inprogress-journal"
+        )
+        orphan.write_bytes(b"orphan")
+
+        retained = store.prune_backups(backup_dir, keep=2)
+
+    assert [path.name for path in retained] == [
+        "paper-20260718T000005Z.sqlite",
+        "paper-20260718T000004Z.sqlite",
+    ]
+    assert sorted(path.name for path in backup_dir.iterdir()) == sorted(
+        path.name for path in retained
+    )
 
 
 def test_strategy_version_is_immutable(tmp_path: Path) -> None:

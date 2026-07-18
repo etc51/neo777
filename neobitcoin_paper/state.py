@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -43,6 +44,11 @@ PENDING_DELIVERY_STATUSES: Final = (
     "FAILED_RETRYABLE",
 )
 _DELIVERY_STATUS_SQL: Final = ",".join(repr(status) for status in sorted(DELIVERY_STATUSES))
+_STATE_BACKUP_RE: Final = re.compile(r"^paper-\d{8}T\d{6}Z\.sqlite$")
+_STATE_BACKUP_TEMP_RE: Final = re.compile(
+    r"^\.paper-\d{8}T\d{6}Z\.sqlite\.[0-9a-f]{32}\.inprogress"
+    r"(?:-(?:journal|shm|wal))?$"
+)
 
 _DELIVERY_TRANSITIONS: Final = {
     "CREATED": frozenset({"VALIDATED", "QUARANTINED"}),
@@ -1228,15 +1234,61 @@ class PaperStateStore:
             with self._lock, closing(sqlite3.connect(temporary)) as target:
                 self._connection.backup(target)
             with closing(
-                sqlite3.connect(f"file:{temporary.as_posix()}?mode=ro", uri=True)
+                sqlite3.connect(
+                    f"file:{temporary.as_posix()}?mode=ro&immutable=1", uri=True
+                )
             ) as check:
                 results = tuple(str(row[0]) for row in check.execute("PRAGMA quick_check"))
                 if results != ("ok",):
                     raise StateIntegrityError("backup quick_check failed: " + "; ".join(results))
             os.replace(temporary, destination)
         finally:
-            temporary.unlink(missing_ok=True)
+            for suffix in ("", "-journal", "-shm", "-wal"):
+                temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
         return destination
+
+    @staticmethod
+    def prune_backups(directory: str | Path, *, keep: int) -> tuple[Path, ...]:
+        """Keep only verified recent runtime backups and remove orphan sidecars."""
+
+        if keep <= 0:
+            raise ValueError("backup keep count must be positive")
+        root = Path(directory).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        backups: list[Path] = []
+        temporary: list[Path] = []
+        for candidate in root.iterdir():
+            if candidate.is_symlink():
+                raise StateIntegrityError(f"backup path must not be a symlink: {candidate}")
+            if _STATE_BACKUP_RE.fullmatch(candidate.name):
+                if not candidate.is_file() or candidate.resolve().parent != root:
+                    raise StateIntegrityError(f"invalid backup path: {candidate}")
+                backups.append(candidate)
+            elif _STATE_BACKUP_TEMP_RE.fullmatch(candidate.name):
+                if not candidate.is_file() or candidate.resolve().parent != root:
+                    raise StateIntegrityError(f"invalid temporary backup path: {candidate}")
+                temporary.append(candidate)
+
+        backups.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+        retained = backups[:keep]
+        for backup in retained:
+            with closing(
+                sqlite3.connect(
+                    f"file:{backup.as_posix()}?mode=ro&immutable=1", uri=True
+                )
+            ) as check:
+                results = tuple(str(row[0]) for row in check.execute("PRAGMA quick_check"))
+            if results != ("ok",):
+                raise StateIntegrityError(
+                    f"retained backup quick_check failed for {backup.name}: "
+                    + "; ".join(results)
+                )
+
+        for expired in (*backups[keep:], *temporary):
+            if expired.is_symlink() or expired.resolve().parent != root:
+                raise StateIntegrityError(f"refusing unsafe backup cleanup: {expired}")
+            expired.unlink()
+        return tuple(retained)
 
     def table_names(self) -> tuple[str, ...]:
         rows = self._connection.execute(

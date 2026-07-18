@@ -540,7 +540,12 @@ class PaperRuntime:
                 state.quick_check()
                 state.checkpoint("PASSIVE")
                 stamp = self._now().strftime("%Y%m%dT%H%M%SZ")
-                state.backup(self.config.data_root / "state" / "backups" / f"paper-{stamp}.sqlite")
+                backup_dir = self.config.data_root / "state" / "backups"
+                state.prune_backups(
+                    backup_dir, keep=max(1, self.config.state_backup_keep - 1)
+                )
+                state.backup(backup_dir / f"paper-{stamp}.sqlite")
+                state.prune_backups(backup_dir, keep=self.config.state_backup_keep)
             finally:
                 state.close()
                 health_server.close()

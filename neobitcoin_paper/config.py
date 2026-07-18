@@ -57,6 +57,7 @@ class PaperConfig:
     health_port: int = 8787
     initial_balance: float = 1_000_000.0
     delivered_retention_days: int = 30
+    state_backup_keep: int = 5
     disk_warning_free_bytes: int = 5 * 1024**3
     disk_critical_free_bytes: int = 2 * 1024**3
     disk_emergency_free_bytes: int = 1024**3
@@ -140,6 +141,11 @@ class PaperConfig:
                 30,
                 "retention days",
             ),
+            state_backup_keep=_positive_int(
+                values.get("NEOBITCOIN_PAPER_STATE_BACKUP_KEEP"),
+                5,
+                "state backup keep",
+            ),
             disk_warning_free_bytes=warning,
             disk_critical_free_bytes=critical,
             disk_emergency_free_bytes=emergency,
@@ -185,6 +191,7 @@ class PaperConfig:
             "archive_grace_seconds": self.archive_grace_seconds,
             "timezone": "Europe/Moscow",
             "delivered_retention_days": self.delivered_retention_days,
+            "state_backup_keep": self.state_backup_keep,
         }
 
 
