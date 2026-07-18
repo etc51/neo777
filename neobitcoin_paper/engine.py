@@ -1431,7 +1431,7 @@ class PaperTradingEngine:
                 enabled=key in enabled_keys,
                 lifecycle_status=version.status.value,
                 evaluation_cohort=str(version.parameters.get("evaluation_cohort", "LIVE_OOS")),
-                lifecycle=_strategy_lifecycle(version),
+                lifecycle=strategy_lifecycle(version),
             )
             self._state.set_strategy_enabled(
                 version.strategy_id,
@@ -1443,7 +1443,7 @@ class PaperTradingEngine:
                 version.version,
                 lifecycle_status=version.status.value,
                 evaluation_cohort=str(version.parameters.get("evaluation_cohort", "LIVE_OOS")),
-                lifecycle=_strategy_lifecycle(version),
+                lifecycle=strategy_lifecycle(version),
             )
             account = self._registry.accounts[key]
             row = account_rows.get(account.account_id)
@@ -1561,7 +1561,7 @@ class PaperTradingEngine:
                 self._entry_fills[position.position_id] = str(entry_fill)
 
 
-def _strategy_lifecycle(version: StrategyVersion) -> dict[str, object]:
+def strategy_lifecycle(version: StrategyVersion) -> dict[str, object]:
     lifecycle: dict[str, object] = {
         "status": version.status.value,
         "new_entries_enabled": version.is_active_at(version.activated_at)

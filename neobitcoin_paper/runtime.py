@@ -31,7 +31,7 @@ from .config import PaperConfig
 from .datasets import DatasetStore
 from .delivery import ArtifactDescriptor, CodexSameThreadTransport
 from .domain import StrategyStatus, StrategyVersion, trading_status_is_open
-from .engine import PaperTradingEngine
+from .engine import PaperTradingEngine, strategy_lifecycle
 from .execution import PaperExecutionAdapter
 from .ingest import (
     CanonicalMarketEvent,
@@ -427,6 +427,9 @@ class PaperRuntime:
         try:
             state.quick_check()
             state.reset_interrupted_deliveries()
+            # Lifecycle policy must migrate even after the current session has
+            # already finalized and no execution engine is built.
+            self._strategy_specifications(state)
             self.health.heartbeat("state_store", healthy=True, ready=True)
             instrument = await asyncio.to_thread(self._market.discover)
             self._verify_instrument(instrument)
@@ -661,6 +664,13 @@ class PaperRuntime:
                     raise RuntimeError("flow-alignment evaluation cohort is not LIVE_OOS")
                 enabled = strategy_id == "MICRO_FLOW_ALIGNMENT"
                 state.set_strategy_enabled(strategy_id, version, enabled)
+                state.set_strategy_lifecycle(
+                    strategy_id,
+                    version,
+                    lifecycle_status=specification.status.value,
+                    evaluation_cohort="LIVE_OOS",
+                    lifecycle=strategy_lifecycle(specification),
+                )
             else:
                 if enabled:
                     state.set_strategy_enabled(strategy_id, version, False)
