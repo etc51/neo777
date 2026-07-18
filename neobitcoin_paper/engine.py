@@ -1580,6 +1580,40 @@ def _strategy_lifecycle(version: StrategyVersion) -> dict[str, object]:
                 "oos_profit_factor": "0.2465",
             }
         )
+    elif version.strategy_id == "MICRO_FLOW_ALIGNMENT":
+        lifecycle.update(
+            {
+                "new_entries_enabled": True,
+                "oos_day": {
+                    "session_date": "2026-07-17",
+                    "valid_trades": 21,
+                    "total_pnl_ticks": -1721,
+                    "mean_pnl_ticks": -81.95,
+                    "median_pnl_ticks": -202,
+                    "win_rate": 0.380952,
+                    "profit_factor": 0.62,
+                },
+                "cumulative_oos": {
+                    "period": "2026-07-15..2026-07-17",
+                    "trades": 192,
+                    "total_pnl_ticks": 16500,
+                    "mean_pnl_ticks": 85.94,
+                    "median_pnl_ticks": 100,
+                    "win_rate": 0.568,
+                    "profit_factor": 1.50,
+                    "mean_without_best_5": 41.2,
+                    "mean_without_best_10": 11.6,
+                },
+            }
+        )
+    elif version.strategy_id == "L5_FLOW_ALIGNMENT":
+        lifecycle.update(
+            {
+                "new_entries_enabled": False,
+                "paused_on": "2026-07-17",
+                "reason": "OOS_FAILURE",
+            }
+        )
     return lifecycle
 
 

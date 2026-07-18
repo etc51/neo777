@@ -106,8 +106,11 @@ def _strategy(strategy_id: str) -> FlowAlignmentStrategy:
 def test_approved_versions_and_exact_threshold_boundaries() -> None:
     micro = _strategy("MICRO_FLOW_ALIGNMENT")
     l5 = _strategy("L5_FLOW_ALIGNMENT")
-    assert micro.specification.status is StrategyStatus.FROZEN_PAPER
-    assert l5.specification.status is StrategyStatus.FROZEN_PAPER_SECONDARY
+    assert (
+        micro.specification.status
+        is StrategyStatus.FROZEN_PAPER_DEGRADED_CONTINUE_OOS
+    )
+    assert l5.specification.status is StrategyStatus.PAUSE_NEW_ENTRIES_OOS_FAILURE
     assert micro.specification.parameters["max_entry_spread_ticks"] == 20
     assert l5.specification.parameters["alignment_long_threshold"] == 0.30
 

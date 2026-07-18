@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
@@ -18,11 +19,27 @@ from neobitcoin_paper.archive import (
     ArchiveValidator,
     BuiltArchive,
     DailyArchiveBuilder,
+    _contains_secret,
     _extract_tar_zst,
 )
 from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS, DatasetStore
 
 SESSION_DATE = date(2026, 7, 15)
+
+
+def test_secret_scan_reads_logical_parquet_strings(tmp_path: Path) -> None:
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    pq.write_table(pa.table({"payload": ["ordinary market data"]}), clean / "data.parquet")
+    assert not _contains_secret(clean)
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    pq.write_table(
+        pa.table({"payload": ["token=1234567890abcdef"]}),
+        unsafe / "data.parquet",
+    )
+    assert _contains_secret(unsafe)
 
 
 def _request(root: Path, *, config: dict[str, object] | None = None) -> ArchiveBuildRequest:

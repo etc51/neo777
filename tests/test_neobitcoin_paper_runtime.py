@@ -202,12 +202,17 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert generations == 2
     assert events == 1
-    assert strategies == 2
+    assert strategies == 1
     assert accounts == 2
     assert schema_version == 3
     assert lifecycle == [
-        ("L5_FLOW_ALIGNMENT", "FROZEN_PAPER_SECONDARY", "LIVE_OOS", 1),
-        ("MICRO_FLOW_ALIGNMENT", "FROZEN_PAPER", "LIVE_OOS", 1),
+        ("L5_FLOW_ALIGNMENT", "PAUSE_NEW_ENTRIES_OOS_FAILURE", "LIVE_OOS", 0),
+        (
+            "MICRO_FLOW_ALIGNMENT",
+            "FROZEN_PAPER_DEGRADED_CONTINUE_OOS",
+            "LIVE_OOS",
+            1,
+        ),
     ]
     assert market.discoveries == 2
     assert all(server.started and server.closed for server in servers)
@@ -255,7 +260,7 @@ def test_existing_strong_counterflow_is_preserved_but_forcibly_disabled(
         assert strong.status.value == "REJECTED_OOS_AS_FORMALIZED"
         assert strong_enabled is False
         assert by_id["MICRO_FLOW_ALIGNMENT"][1] is True
-        assert by_id["L5_FLOW_ALIGNMENT"][1] is True
+        assert by_id["L5_FLOW_ALIGNMENT"][1] is False
         row = state.connection.execute(
             """
             SELECT enabled FROM strategy_registry

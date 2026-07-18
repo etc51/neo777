@@ -621,7 +621,7 @@ class PaperRuntime:
                         activated_at=activated,
                     ),
                     created + timedelta(seconds=1),
-                    True,
+                    False,
                 ),
             )
         versions: list[tuple[StrategyVersion, datetime, bool]] = []
@@ -657,20 +657,10 @@ class PaperRuntime:
                     created_at=registered - timedelta(microseconds=1),
                     activated_at=activated,
                 )
-                persisted_status = StrategyStatus(
-                    str(row.get("lifecycle_status", specification.status.value))
-                )
-                specification = replace(specification, status=persisted_status)
                 if str(row.get("evaluation_cohort", "LIVE_OOS")) != "LIVE_OOS":
                     raise RuntimeError("flow-alignment evaluation cohort is not LIVE_OOS")
-                enabled = enabled and persisted_status in {
-                    StrategyStatus.FROZEN_PAPER,
-                    StrategyStatus.FROZEN_PAPER_SECONDARY,
-                    StrategyStatus.OOS_ACCUMULATION,
-                    StrategyStatus.PAPER_VALIDATED,
-                }
-                if not enabled:
-                    state.set_strategy_enabled(strategy_id, version, False)
+                enabled = strategy_id == "MICRO_FLOW_ALIGNMENT"
+                state.set_strategy_enabled(strategy_id, version, enabled)
             else:
                 if enabled:
                     state.set_strategy_enabled(strategy_id, version, False)
@@ -692,7 +682,7 @@ class PaperRuntime:
                         activated_at=activated,
                     ),
                     created + timedelta(seconds=1),
-                    True,
+                    strategy_id == "MICRO_FLOW_ALIGNMENT",
                 )
             )
         return tuple(versions)

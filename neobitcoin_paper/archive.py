@@ -995,10 +995,39 @@ def _contains_secret(root: Path) -> bool:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
+        if path.suffix.casefold() == ".parquet":
+            if _parquet_contains_secret(path):
+                return True
+            continue
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 if _TOKEN_PATTERN.search(chunk) or _SECRET_ASSIGNMENT.search(chunk):
                     return True
+    return False
+
+
+def _parquet_contains_secret(path: Path) -> bool:
+    """Scan logical Parquet strings, never compressed binary container bytes."""
+
+    try:
+        parquet = pq.ParquetFile(path)
+        columns = [
+            field.name
+            for field in parquet.schema_arrow
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+        ]
+        if not columns:
+            return False
+        for batch in parquet.iter_batches(batch_size=2048, columns=columns):
+            for column in batch.columns:
+                for value in column.to_pylist():
+                    if value is None:
+                        continue
+                    payload = str(value).encode("utf-8", errors="replace")
+                    if _TOKEN_PATTERN.search(payload) or _SECRET_ASSIGNMENT.search(payload):
+                        return True
+    except (OSError, pa.ArrowException):
+        return True
     return False
 
 

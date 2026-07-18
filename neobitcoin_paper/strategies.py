@@ -704,9 +704,9 @@ def frozen_flow_alignment_v1(
         strategy_id=strategy_id,
         version="v1",
         status=(
-            StrategyStatus.FROZEN_PAPER
+            StrategyStatus.FROZEN_PAPER_DEGRADED_CONTINUE_OOS
             if is_micro
-            else StrategyStatus.FROZEN_PAPER_SECONDARY
+            else StrategyStatus.PAUSE_NEW_ENTRIES_OOS_FAILURE
         ),
         created_at=created_at.astimezone(UTC),
         activated_at=activated_at.astimezone(UTC),
