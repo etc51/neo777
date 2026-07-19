@@ -99,6 +99,8 @@ def test_archive_and_delivery_are_isolated_oneshots() -> None:
     assert _one(archive, "Service", "Type") == "oneshot"
     assert _one(archive, "Service", "Restart") == "on-failure"
     assert _one(archive, "Service", "RestartSec") == "60s"
+    assert _one(archive, "Unit", "StartLimitIntervalSec") == "15min"
+    assert _one(archive, "Unit", "StartLimitBurst") == "3"
     assert _one(delivery, "Service", "Type") == "oneshot"
     assert _one(archive, "Service", "ExecStart").endswith(
         "-m neobitcoin_paper.cli archive --confirm PAPER_ONLY"

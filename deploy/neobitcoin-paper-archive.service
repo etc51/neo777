@@ -2,7 +2,8 @@
 Description=Build and validate the completed Neobitcoin paper session archive
 After=local-fs.target
 RequiresMountsFor=/var/lib/neobitcoin-paper
-StartLimitIntervalSec=0
+StartLimitIntervalSec=15min
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
