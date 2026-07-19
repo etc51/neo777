@@ -21,7 +21,9 @@ from typing import Any, BinaryIO, Final, TextIO
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
-import zstandard as zstd  # type: ignore[import-untyped]
+import zstandard as zstd
+
+from .domain import equity_point_id
 
 REQUIRED_DATASETS: Final = (
     "market_status_events.parquet",
@@ -847,6 +849,16 @@ def _normalize_row(
         if not field.nullable and value is None:
             raise DatasetMaterializationError(f"missing required field {field.name}")
         normalized[field.name] = _coerce(value, field.type)
+    if schema.metadata and schema.metadata.get(b"dataset") == b"equity_curve.parquet":
+        normalized[primary_key] = equity_point_id(
+            str(normalized["account_id"]),
+            normalized["event_ts"],
+            cash=normalized["cash"],
+            equity=normalized["equity"],
+            realized_pnl=normalized["realized_pnl"],
+            unrealized_pnl=normalized["unrealized_pnl"],
+            drawdown=normalized["drawdown"],
+        )
     return normalized
 
 

@@ -192,6 +192,36 @@ def deterministic_id(namespace: str, *parts: Any) -> str:
     return f"{namespace}_{hashlib.sha256(payload).hexdigest()[:32]}"
 
 
+def equity_point_id(
+    account_id: str,
+    event_ts: datetime,
+    *,
+    cash: Any,
+    equity: Any,
+    realized_pnl: Any,
+    unrealized_pnl: Any,
+    drawdown: Any,
+) -> str:
+    """Identify one complete equity state, including same-event close transitions."""
+
+    values = tuple(
+        format(decimal_value(value, name).normalize(), "f")
+        for name, value in (
+            ("cash", cash),
+            ("equity", equity),
+            ("realized_pnl", realized_pnl),
+            ("unrealized_pnl", unrealized_pnl),
+            ("drawdown", drawdown),
+        )
+    )
+    return deterministic_id(
+        "equity",
+        account_id,
+        as_utc(event_ts, "event_ts").isoformat(timespec="microseconds"),
+        *values,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExitPolicy:
     fixed_stop_ticks: Decimal | None = None

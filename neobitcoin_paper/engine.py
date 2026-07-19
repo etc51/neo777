@@ -33,6 +33,7 @@ from .domain import (
     as_utc,
     decimal_value,
     deterministic_id,
+    equity_point_id,
 )
 from .execution import PaperExecutionAdapter
 from .ingest import CanonicalMarketEvent, DataQualityGate, DataQualitySnapshot
@@ -1209,7 +1210,15 @@ class PaperTradingEngine:
         self._datasets.append(
             "equity_curve",
             {
-                "equity_id": deterministic_id("equity", account.account_id, source_event_id),
+                "equity_id": equity_point_id(
+                    account.account_id,
+                    event_ts,
+                    cash=account.cash,
+                    equity=account.equity,
+                    realized_pnl=account.realized_pnl,
+                    unrealized_pnl=account.unrealized_pnl,
+                    drawdown=account.max_drawdown,
+                ),
                 "event_ts": event_ts,
                 "account_id": account.account_id,
                 "strategy_id": account.strategy_id,
