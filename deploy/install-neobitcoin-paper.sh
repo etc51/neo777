@@ -268,6 +268,7 @@ if [[ ${deployment_ok} == true ]]; then
   fi
 fi
 if [[ ${deployment_ok} == true ]]; then
+  systemctl reset-failed "${SERVICE}" || true
   if ! systemctl restart "${SERVICE}" "${ARCHIVE_TIMER}" "${DELIVERY_TIMER}"; then
     deployment_ok=false
   fi

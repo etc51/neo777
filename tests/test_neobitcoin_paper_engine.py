@@ -24,6 +24,7 @@ from neobitcoin_paper.domain import (
     deterministic_id,
 )
 from neobitcoin_paper.engine import PaperTradingEngine
+from neobitcoin_paper.execution import PaperExecutionAdapter
 from neobitcoin_paper.ingest import CanonicalMarketEvent, DataQualityGate
 from neobitcoin_paper.registry import StrategyRegistry
 from neobitcoin_paper.state import PaperStateStore
@@ -225,6 +226,8 @@ def build_engine(
     state: PaperStateStore,
     registry: StrategyRegistry,
     plugins: Sequence[PaperStrategy],
+    *,
+    decision_latency: timedelta = timedelta(0),
 ) -> tuple[PaperTradingEngine, DatasetStore]:
     datasets = DatasetStore(root, "2026-07-15", durable_writes=False)
     engine = PaperTradingEngine(
@@ -237,11 +240,63 @@ def build_engine(
             warmup_events=1,
             stale_after_seconds=60,
             max_latency_ms=3000,
+            initial_trading_status="NORMAL_TRADING",
         ),
         feature_engine=StaticFeatures(),
+        execution_adapter=PaperExecutionAdapter(decision_latency),
         tick_size=Decimal("1"),
     )
     return engine, datasets
+
+
+def test_time_exit_waits_for_next_causal_book_and_survives_restart(tmp_path: Path) -> None:
+    strategy_spec = spec("CAUSAL_EXIT")
+    registry = registry_for(strategy_spec)
+    database = tmp_path / "state.sqlite"
+    data_root = tmp_path / "data"
+    with PaperStateStore(database) as state:
+        engine, datasets = build_engine(
+            data_root,
+            state,
+            registry,
+            [SignalStrategy(strategy_spec)],
+            decision_latency=timedelta(milliseconds=100),
+        )
+        asyncio.run(make_ready(engine))
+        signal_at = BASE + timedelta(seconds=20)
+        asyncio.run(
+            engine.process_event(
+                canonical("exit-signal", "trade", signal_at, payload={"signal": True})
+            )
+        )
+        opened = asyncio.run(
+            engine.process_event(orderbook("exit-entry", signal_at + timedelta(seconds=1)))
+        )
+        assert len(opened.opened_position_ids) == 1
+        trigger_at = signal_at + timedelta(seconds=82)
+        triggered = asyncio.run(
+            engine.process_event(orderbook("exit-trigger", trigger_at))
+        )
+        assert not triggered.closed_position_ids
+        assert len(engine.open_positions) == 1
+        datasets.abort()
+
+    with PaperStateStore(database) as recovered_state:
+        recovered, datasets = build_engine(
+            data_root,
+            recovered_state,
+            registry,
+            [SignalStrategy(strategy_spec)],
+            decision_latency=timedelta(milliseconds=100),
+        )
+        closed = asyncio.run(
+            recovered.process_event(
+                orderbook("exit-eligible", trigger_at + timedelta(milliseconds=200))
+            )
+        )
+        assert len(closed.closed_position_ids) == 1
+        assert not recovered.open_positions
+        datasets.abort()
 
 
 def test_gap_signal_is_rejected_and_strategy_failure_is_isolated(tmp_path: Path) -> None:

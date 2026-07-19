@@ -123,6 +123,7 @@ class PaperTradingEngine:
         self._restored_orders: dict[str, PaperOrder] = {}
         self._positions: dict[str, PaperPosition] = {}
         self._position_policies: dict[str, ExitPolicy] = {}
+        self._pending_exits: dict[str, ExitDecision] = {}
         self._position_signals: dict[str, str] = {}
         self._entry_fills: dict[str, str] = {}
         self._active_windows: set[str] = set()
@@ -193,6 +194,11 @@ class PaperTradingEngine:
                 account = self._registry.account_for(
                     position.strategy_id, position.strategy_version
                 )
+                # The last observed book predates a newly created exit order's
+                # simulated decision latency.  Never manufacture a causal fill
+                # at finalization; retain the position for explicit recovery.
+                if book.receive_ts < decision.trigger_ts + self._execution.decision_latency:
+                    continue
                 updated, execution = self._execution.close_position(position, decision, book)
                 self._record_exit_order(position, execution, account, event)
                 for fill in execution.fills:
@@ -799,14 +805,25 @@ class PaperTradingEngine:
                 <= session.expected_close - event.processing_ts
                 <= self._session_close_buffer
             )
-            decision = self._execution.evaluate_exit(
-                marked,
-                book,
-                tick_size=self._tick_size,
-                policy=self._position_policies[position_id],
-                session_closing=session_closing,
-            )
+            decision = self._pending_exits.get(position_id)
             if decision is None:
+                decision = self._execution.evaluate_exit(
+                    marked,
+                    book,
+                    tick_size=self._tick_size,
+                    policy=self._position_policies[position_id],
+                    session_closing=session_closing,
+                )
+                if decision is not None:
+                    self._pending_exits[position_id] = decision
+                    # An exit decision cannot consume the same book that
+                    # triggered it when simulated latency is non-zero.  A
+                    # zero-latency test/model remains eligible immediately.
+                    if self._execution.decision_latency > timedelta(0):
+                        continue
+            if decision is None:
+                continue
+            if book.receive_ts < decision.trigger_ts + self._execution.decision_latency:
                 continue
             updated, execution = self._execution.close_position(marked, decision, book)
             self._record_exit_order(marked, execution, account, event)
@@ -825,6 +842,7 @@ class PaperTradingEngine:
             if updated.status is PositionStatus.CLOSED:
                 account = account.without_open_position(position_id)
                 self._positions.pop(position_id, None)
+                self._pending_exits.pop(position_id, None)
                 self._state.remove_open_position(position_id)
                 self._record_position(updated, account, event, "CLOSED")
                 self._record_trade(updated, execution, account, event)
@@ -1396,6 +1414,10 @@ class PaperTradingEngine:
                     for _, item in sorted(self._pending.items())
                 ],
                 "active_windows": sorted(self._active_windows),
+                "pending_exits": {
+                    position_id: _exit_decision_state(decision)
+                    for position_id, decision in sorted(self._pending_exits.items())
+                },
                 "last_book": _book_state(self._last_book) if self._last_book is not None else None,
                 "plugin_states": {
                     plugin.specification.key: _jsonable(snapshot())
@@ -1493,6 +1515,13 @@ class PaperTradingEngine:
             windows = checkpoint.get("active_windows", [])
             if isinstance(windows, list):
                 self._active_windows.update(str(item) for item in windows)
+            pending_exits = checkpoint.get("pending_exits", {})
+            if isinstance(pending_exits, Mapping):
+                for position_id, value in pending_exits.items():
+                    if isinstance(value, Mapping):
+                        self._pending_exits[str(position_id)] = _exit_decision_from_state(
+                            cast(Mapping[str, Any], value)
+                        )
 
         for row in recovery.pending_intents:
             state = row.get("state", {})
@@ -1701,6 +1730,19 @@ def _policy_from_state(value: Mapping[str, Any]) -> ExitPolicy:
             int(value["time_exit_seconds"]) if value.get("time_exit_seconds") is not None else None
         ),
         close_at_session_end=bool(value.get("close_at_session_end", True)),
+    )
+
+
+def _exit_decision_state(decision: ExitDecision) -> dict[str, object]:
+    return cast(dict[str, object], _jsonable(decision))
+
+
+def _exit_decision_from_state(value: Mapping[str, Any]) -> ExitDecision:
+    return ExitDecision(
+        reason=ExitReason(str(value["reason"])),
+        trigger_ts=datetime.fromisoformat(str(value["trigger_ts"])),
+        trigger_event_id=str(value["trigger_event_id"]),
+        trigger_price=decimal_value(value["trigger_price"], "trigger_price"),
     )
 
 

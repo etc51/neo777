@@ -161,6 +161,7 @@ def test_installer_is_atomic_runs_tests_and_migrations_and_can_roll_back() -> No
         "-m neobitcoin_paper.cli migrate --confirm PAPER_ONLY",
         "previous_target",
         "restore_previous_release",
+        'systemctl reset-failed "${SERVICE}"',
         "mv -Tf",
     ):
         assert expected in installer
