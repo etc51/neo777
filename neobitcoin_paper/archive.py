@@ -11,11 +11,12 @@ import shutil
 import tarfile
 import tempfile
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import suppress
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -155,6 +156,9 @@ class DailyArchiveBuilder:
             for name in REQUIRED_DATASETS:
                 shutil.copy2(parquet_dir / name, data_dir / name)
 
+            carryovers = _normalize_daily_carryovers(data_dir, start_utc=start_utc)
+            _write_json(stage / "CARRYOVER_REFERENCES.json", carryovers)
+
             row_counts = {
                 name: int(pq.ParquetFile(data_dir / name).metadata.num_rows)
                 for name in REQUIRED_DATASETS
@@ -199,6 +203,9 @@ class DailyArchiveBuilder:
                 "oos_included": coverage["oos_included"],
                 "investigation_required": coverage["investigation_required"],
                 "coverage_report_sha256": coverage["report_sha256"],
+                "carryover_schema_version": 1,
+                "carryover_reference_count": carryovers["reference_count"],
+                "carryover_report_sha256": carryovers["report_sha256"],
             }
             _write_json(stage / "MANIFEST.json", manifest)
             (stage / "MANIFEST.md").write_text(
@@ -346,6 +353,276 @@ def _quarantine_file(path: Path, quarantine_dir: Path, target_name: str) -> Path
     return target
 
 
+def _normalize_daily_carryovers(data_dir: Path, *, start_utc: datetime) -> dict[str, object]:
+    """Make cross-session references explicit without weakening daily validation."""
+
+    small_tables = {
+        name: pq.read_table(data_dir / name).to_pylist()
+        for name in REQUIRED_DATASETS
+        if name not in _STREAMED_VALIDATION_DATASETS
+    }
+    signal_ids = {
+        str(row["signal_id"])
+        for row in small_tables["candidate_signals.parquet"]
+        if row.get("signal_id") not in (None, "")
+    }
+    fill_ids = {
+        str(row["fill_id"])
+        for row in small_tables["paper_fills.parquet"]
+        if row.get("fill_id") not in (None, "")
+    }
+    position_rows = small_tables["paper_positions.parquet"]
+    position_ids = {
+        str(row["position_id"])
+        for row in position_rows
+        if row.get("position_id") not in (None, "")
+    }
+    opened_here = {
+        str(row["position_id"])
+        for row in position_rows
+        if str(row.get("event_kind") or "").upper() == "OPEN"
+    }
+    carryover_positions = position_ids - opened_here
+
+    external_signal_ids: set[str] = set()
+    for name in ("shadow_stop_results.parquet", "shadow_exit_results.parquet"):
+        for row in small_tables[name]:
+            signal_id = str(row.get("signal_id") or "")
+            if (
+                signal_id
+                and signal_id not in signal_ids
+                and str(row.get("position_id") or "") in carryover_positions
+            ):
+                external_signal_ids.add(signal_id)
+
+    raw_source_ids: set[str] = set()
+    raw_signal_ids: dict[str, set[str]] = {}
+    for name in _STREAMED_VALIDATION_DATASETS:
+        parquet = pq.ParquetFile(data_dir / name)
+        dataset_signal_ids: set[str] = set()
+        try:
+            for batch in parquet.iter_batches(
+                columns=["raw_event_id", "source_event_id", "signal_id"]
+            ):
+                for column in range(2):
+                    raw_source_ids.update(
+                        str(value)
+                        for value in batch.column(column).to_pylist()
+                        if value
+                    )
+                dataset_signal_ids.update(
+                    str(value) for value in batch.column(2).to_pylist() if value
+                )
+        finally:
+            parquet.close(force=True)
+        raw_signal_ids[name] = dataset_signal_ids
+
+    references: list[dict[str, str]] = []
+
+    def externalize(
+        dataset: str,
+        row: dict[str, Any],
+        field: str,
+        reason: str,
+    ) -> bool:
+        external_id = str(row.get(field) or "")
+        if not external_id:
+            return False
+        schema = DATASET_SCHEMAS[dataset]
+        primary_key = (schema.metadata or {})[b"primary_key"].decode("utf-8")
+        raw_extra = row.get("extra_json")
+        try:
+            extra = json.loads(str(raw_extra)) if raw_extra else {}
+        except json.JSONDecodeError as exc:
+            raise ArchiveError(f"invalid extra_json in {dataset}") from exc
+        if not isinstance(extra, dict):
+            raise ArchiveError(f"invalid extra_json object in {dataset}")
+        external = extra.setdefault("external_references", {})
+        if not isinstance(external, dict):
+            raise ArchiveError(f"invalid external references in {dataset}")
+        declared = {"id": external_id, "reason": reason}
+        existing = external.get(field)
+        if existing not in (None, declared):
+            raise ArchiveError(f"conflicting external reference in {dataset}.{field}")
+        external[field] = declared
+        row[field] = None
+        row["extra_json"] = json.dumps(
+            extra, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        references.append(
+            {
+                "dataset": dataset,
+                "primary_key": primary_key,
+                "row_id": str(row.get(primary_key) or ""),
+                "field": field,
+                "external_id": external_id,
+                "reason": reason,
+            }
+        )
+        return True
+
+    mutable: dict[str, list[dict[str, Any]]] = {
+        name: [dict(row) for row in rows] for name, rows in small_tables.items()
+    }
+    for name in (
+        "paper_orders.parquet",
+        "shadow_stop_results.parquet",
+        "shadow_exit_results.parquet",
+    ):
+        for row in mutable[name]:
+            signal_id = str(row.get("signal_id") or "")
+            if signal_id in external_signal_ids:
+                externalize(name, row, "signal_id", "CARRYOVER_SIGNAL")
+
+    for row in mutable["paper_trades.parquet"]:
+        position_id = str(row.get("position_id") or "")
+        entry_fill_id = str(row.get("entry_fill_id") or "")
+        entry_ts = row.get("entry_ts")
+        if (
+            position_id in carryover_positions
+            and entry_fill_id
+            and entry_fill_id not in fill_ids
+            and isinstance(entry_ts, datetime)
+            and entry_ts < start_utc
+        ):
+            externalize(
+                "paper_trades.parquet",
+                row,
+                "entry_fill_id",
+                "CARRYOVER_ENTRY_FILL",
+            )
+
+    for name, fields in (
+        ("mfe_mae.parquet", ("mfe_source_event_id", "mae_source_event_id")),
+        ("shadow_stop_results.parquet", ("source_event_id",)),
+        ("shadow_exit_results.parquet", ("source_event_id",)),
+    ):
+        for row in mutable[name]:
+            if str(row.get("position_id") or "") not in carryover_positions:
+                continue
+            for field in fields:
+                source_id = str(row.get(field) or "")
+                if source_id and source_id not in raw_source_ids:
+                    externalize(name, row, field, "CARRYOVER_SOURCE_EVENT")
+
+    for name, rows in mutable.items():
+        if rows != small_tables[name]:
+            _rewrite_parquet_rows(data_dir / name, name, lambda _row: False, rows=rows)
+
+    if external_signal_ids:
+        def raw_mutator(dataset: str) -> Callable[[dict[str, Any]], bool]:
+            def mutate(row: dict[str, Any]) -> bool:
+                if str(row.get("signal_id") or "") not in external_signal_ids:
+                    return False
+                return externalize(dataset, row, "signal_id", "CARRYOVER_SIGNAL")
+
+            return mutate
+
+        for name in _STREAMED_VALIDATION_DATASETS:
+            if not external_signal_ids.intersection(raw_signal_ids[name]):
+                continue
+            _rewrite_parquet_rows(
+                data_dir / name,
+                name,
+                raw_mutator(name),
+            )
+
+    references.sort(
+        key=lambda item: (
+            item["dataset"],
+            item["row_id"],
+            item["field"],
+            item["external_id"],
+        )
+    )
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "session_start_utc": start_utc.isoformat(),
+        "reference_count": len(references),
+        "references": references,
+    }
+    report["report_sha256"] = hashlib.sha256(
+        json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return report
+
+
+def _rewrite_parquet_rows(
+    path: Path,
+    dataset: str,
+    mutator: Callable[[dict[str, Any]], bool],
+    *,
+    rows: list[dict[str, Any]] | None = None,
+) -> None:
+    """Atomically rewrite one archive-view Parquet while preserving its schema."""
+
+    schema = DATASET_SCHEMAS[dataset]
+    temporary = path.with_suffix(path.suffix + ".carryover")
+    source_path: Path | None = None
+    writer: pq.ParquetWriter | None = None
+    changed = rows is not None
+
+    def write_batches(batches: Iterable[list[dict[str, Any]]]) -> None:
+        nonlocal writer, changed
+        for batch_rows in batches:
+            for row in batch_rows:
+                changed = mutator(row) or changed
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temporary,
+                    schema,
+                    compression="zstd",
+                    use_dictionary=dataset not in _STREAMED_VALIDATION_DATASETS,
+                    write_statistics=dataset not in _STREAMED_VALIDATION_DATASETS,
+                    version="2.6",
+                    data_page_version="2.0",
+                )
+            writer.write_table(pa.Table.from_pylist(batch_rows, schema=schema))
+    try:
+        try:
+            if rows is not None:
+                write_batches((rows,))
+            else:
+                source_fd, source_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.",
+                    suffix=".source",
+                    dir=path.parent.parent.parent,
+                )
+                os.close(source_fd)
+                source_path = Path(source_name)
+                source_path.unlink()
+                os.replace(path, source_path)
+                with source_path.open("rb") as source:
+                    parquet = pq.ParquetFile(source)
+                    try:
+                        write_batches(
+                            [dict(row) for row in batch.to_pylist()]
+                            for batch in parquet.iter_batches(batch_size=2_048)
+                        )
+                    finally:
+                        parquet.close(force=True)
+        finally:
+            if writer is not None:
+                writer.close()
+        if changed:
+            os.replace(temporary, path)
+        else:
+            temporary.unlink(missing_ok=True)
+            if source_path is not None:
+                os.replace(source_path, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        if source_path is not None and source_path.exists() and not path.exists():
+            os.replace(source_path, path)
+        raise
+    finally:
+        if source_path is not None and path.exists():
+            # The source lives outside the staged bundle. A delayed Windows
+            # handle release must not invalidate an otherwise complete rewrite.
+            with suppress(OSError):
+                source_path.unlink(missing_ok=True)
+
+
 class ArchiveValidator:
     """Independent bundle checks using PyArrow, DuckDB, hashes, and zstd."""
 
@@ -419,6 +696,7 @@ class ArchiveValidator:
                     errors.append(f"DuckDB cannot read {name}: {type(exc).__name__}")
 
             _validate_foreign_key_paths(root, connection, errors)
+            _validate_carryover_references(root, connection, errors)
             _validate_source_lineage_paths(root, connection, tables, errors)
             _validate_event_window_coverage_paths(root, connection, tables, errors)
         finally:
@@ -497,6 +775,7 @@ def _expected_bundle_files(*, verify_sums: bool) -> set[str]:
     # manifest) but is allow-listed here so older schema-v1 archives remain
     # independently verifiable.
     documents.add("SESSION_COVERAGE.json")
+    documents.add("CARRYOVER_REFERENCES.json")
     return documents | {f"data/{name}" for name in REQUIRED_DATASETS}
 
 
@@ -537,6 +816,24 @@ def _validate_manifest(
                 != coverage.get("investigation_required")
             ):
                 errors.append("manifest session coverage mismatch")
+    if manifest.get("carryover_schema_version") is not None:
+        carryover_path = root / "CARRYOVER_REFERENCES.json"
+        try:
+            carryovers = json.loads(carryover_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            errors.append("CARRYOVER_REFERENCES.json is unreadable")
+        else:
+            if not isinstance(carryovers, dict):
+                errors.append("carryover report is not an object")
+            elif (
+                manifest.get("carryover_schema_version")
+                != carryovers.get("schema_version")
+                or manifest.get("carryover_reference_count")
+                != carryovers.get("reference_count")
+                or manifest.get("carryover_report_sha256")
+                != carryovers.get("report_sha256")
+            ):
+                errors.append("manifest carryover report mismatch")
     expected_datasets = [f"data/{name}" for name in REQUIRED_DATASETS]
     if manifest.get("datasets") != expected_datasets:
         errors.append("manifest dataset list mismatch")
@@ -552,6 +849,158 @@ def _validate_manifest(
         return
     if normalized_counts != row_counts:
         errors.append("manifest row_counts mismatch")
+
+
+def _validate_carryover_references(
+    root: Path,
+    connection: duckdb.DuckDBPyConnection,
+    errors: list[str],
+) -> None:
+    path = root / "CARRYOVER_REFERENCES.json"
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    if not isinstance(report, dict):
+        return
+    expected_hash = report.get("report_sha256")
+    body = dict(report)
+    body.pop("report_sha256", None)
+    actual_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    references = report.get("references")
+    if (
+        report.get("schema_version") != 1
+        or expected_hash != actual_hash
+        or not isinstance(references, list)
+        or report.get("reference_count") != len(references)
+    ):
+        errors.append("carryover report hash or count mismatch")
+        return
+    try:
+        session_start = datetime.fromisoformat(
+            str(report.get("session_start_utc") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        errors.append("carryover session start is invalid")
+        return
+    if session_start.tzinfo is None:
+        errors.append("carryover session start is not UTC-aware")
+        return
+
+    position_path = root / "data" / "paper_positions.parquet"
+    carryover_positions: set[str] = set()
+    if position_path.is_file():
+        rows = connection.execute(
+            "SELECT position_id FROM "
+            f"{_duckdb_parquet(position_path)} GROUP BY position_id "
+            "HAVING sum(CASE WHEN upper(coalesce(event_kind, '')) = 'OPEN' THEN 1 ELSE 0 END) = 0"
+        ).fetchall()
+        carryover_positions = {str(row[0]) for row in rows if row and row[0]}
+
+    seen: set[tuple[str, str, str, str]] = set()
+    anchored_signals: set[str] = set()
+    deferred_signals: list[str] = []
+    allowed_reasons = {
+        "CARRYOVER_SIGNAL",
+        "CARRYOVER_ENTRY_FILL",
+        "CARRYOVER_SOURCE_EVENT",
+    }
+    for item in references:
+        if not isinstance(item, dict):
+            errors.append("carryover reference row is invalid")
+            continue
+        dataset = str(item.get("dataset") or "")
+        primary_key = str(item.get("primary_key") or "")
+        row_id = str(item.get("row_id") or "")
+        field = str(item.get("field") or "")
+        external_id = str(item.get("external_id") or "")
+        reason = str(item.get("reason") or "")
+        key = (dataset, row_id, field, external_id)
+        if key in seen:
+            errors.append("duplicate carryover reference")
+            continue
+        seen.add(key)
+        schema = DATASET_SCHEMAS.get(dataset)
+        expected_primary = (
+            (schema.metadata or {}).get(b"primary_key", b"").decode() if schema else ""
+        )
+        if (
+            schema is None
+            or primary_key != expected_primary
+            or field not in schema.names
+            or not row_id
+            or not external_id
+            or reason not in allowed_reasons
+        ):
+            errors.append(f"invalid carryover reference {dataset}:{row_id}:{field}")
+            continue
+        dataset_path = root / "data" / dataset
+        row = connection.execute(
+            f"SELECT {_duckdb_identifier(field)}, extra_json"
+            f" FROM {_duckdb_parquet(dataset_path)}"
+            f" WHERE {_duckdb_identifier(primary_key)} = ?",
+            [row_id],
+        ).fetchall()
+        if len(row) != 1 or row[0][0] is not None:
+            errors.append(f"carryover row mismatch {dataset}:{row_id}:{field}")
+            continue
+        try:
+            extra = json.loads(str(row[0][1])) if row[0][1] else {}
+            declared = extra["external_references"][field]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            errors.append(f"carryover metadata missing {dataset}:{row_id}:{field}")
+            continue
+        if declared != {"id": external_id, "reason": reason}:
+            errors.append(f"carryover metadata mismatch {dataset}:{row_id}:{field}")
+            continue
+
+        names = set(schema.names)
+        position_id = ""
+        if "position_id" in names:
+            found = connection.execute(
+                f"SELECT position_id FROM {_duckdb_parquet(dataset_path)}"
+                f" WHERE {_duckdb_identifier(primary_key)} = ?",
+                [row_id],
+            ).fetchone()
+            position_id = str(found[0] or "") if found else ""
+        if reason == "CARRYOVER_ENTRY_FILL":
+            found = connection.execute(
+                f"SELECT position_id, CAST(entry_ts AS VARCHAR)"
+                f" FROM {_duckdb_parquet(dataset_path)}"
+                f" WHERE {_duckdb_identifier(primary_key)} = ?",
+                [row_id],
+            ).fetchone()
+            try:
+                entry_ts = (
+                    datetime.fromisoformat(str(found[1]).replace("Z", "+00:00"))
+                    if found
+                    else None
+                )
+            except ValueError:
+                entry_ts = None
+            if (
+                not found
+                or str(found[0] or "") not in carryover_positions
+                or entry_ts is None
+                or entry_ts.tzinfo is None
+                or entry_ts >= session_start
+            ):
+                errors.append(f"invalid carryover entry fill {dataset}:{row_id}")
+        elif reason == "CARRYOVER_SOURCE_EVENT":
+            if position_id not in carryover_positions:
+                errors.append(f"invalid carryover source event {dataset}:{row_id}")
+        elif reason == "CARRYOVER_SIGNAL":
+            if position_id:
+                if position_id not in carryover_positions:
+                    errors.append(f"invalid carryover signal {dataset}:{row_id}")
+                else:
+                    anchored_signals.add(external_id)
+            else:
+                deferred_signals.append(external_id)
+    if any(signal_id not in anchored_signals for signal_id in deferred_signals):
+        errors.append("unanchored carryover signal reference")
 
 
 def _validate_parquet_compression(name: str, path: Path, errors: list[str]) -> None:
@@ -882,7 +1331,7 @@ def _validate_temporal_and_position_reconciliation(
     for position_id, rows in position_events.items():
         ordered = sorted(
             rows,
-            key=_row_event_timestamp,
+            key=_position_event_sort_key,
         )
         closed_seen = False
         for row in ordered:
@@ -907,6 +1356,19 @@ def _validate_temporal_and_position_reconciliation(
 def _row_event_timestamp(row: dict[str, object]) -> datetime:
     value = row.get("event_ts")
     return value if isinstance(value, datetime) else datetime.min.replace(tzinfo=UTC)
+
+
+def _position_event_sort_key(row: dict[str, object]) -> tuple[datetime, int, str]:
+    event_kind = str(row.get("event_kind") or "").upper()
+    status = str(row.get("status") or "").upper()
+    transition_rank = 2 if status == "CLOSED" or event_kind == "CLOSED" else 0
+    if event_kind == "MARK":
+        transition_rank = 1
+    return (
+        _row_event_timestamp(row),
+        transition_rank,
+        str(row.get("position_event_id") or ""),
+    )
 
 
 def _validate_source_lineage(tables: dict[str, pa.Table], errors: list[str]) -> None:

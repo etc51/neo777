@@ -21,6 +21,10 @@ from neobitcoin_paper.archive import (
     DailyArchiveBuilder,
     _contains_secret,
     _extract_tar_zst,
+    _normalize_daily_carryovers,
+    _validate_carryover_references,
+    _validate_foreign_key_paths,
+    _validate_temporal_and_position_reconciliation,
 )
 from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS, DatasetStore
 
@@ -95,6 +99,7 @@ def test_zero_event_test_archive_has_exact_typed_bundle_and_hashes(
         f"data/{name}" for name in REQUIRED_DATASETS
     }
     expected_files.add("SESSION_COVERAGE.json")
+    expected_files.add("CARRYOVER_REFERENCES.json")
     actual_files = {
         path.relative_to(extracted).as_posix()
         for path in extracted.rglob("*")
@@ -191,3 +196,147 @@ def test_post_compression_failure_moves_artifacts_to_quarantine(tmp_path: Path) 
     assert failure["status"] == "QUARANTINED"
     assert failure["error_type"] == "ArchiveError"
     assert tuple((root / "reports").glob("archive_failure_*.json"))
+
+
+def test_daily_archive_normalizes_only_proven_carryover_references(tmp_path: Path) -> None:
+    root = tmp_path / "bundle"
+    data = root / "data"
+    data.mkdir(parents=True)
+    started = datetime(2026, 7, 15, 4, 0, tzinfo=UTC)
+    closed = datetime(2026, 7, 15, 7, 0, tzinfo=UTC)
+    rows: dict[str, list[dict[str, object]]] = {name: [] for name in REQUIRED_DATASETS}
+    rows["paper_orders.parquet"] = [
+        {
+            "order_id": "exit-order",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "signal_id": "external-signal",
+            "status": "FULL_FILL",
+        }
+    ]
+    rows["paper_fills.parquet"] = [
+        {
+            "fill_id": "exit-fill",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "order_id": "exit-order",
+            "quantity": 1,
+            "price": 95,
+            "fee": 0,
+        }
+    ]
+    rows["paper_positions.parquet"] = [
+        {
+            "position_event_id": "mark-at-close",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "position_id": "carry-position",
+            "quantity": 1,
+            "realized_pnl": 0,
+            "status": "OPEN",
+            "event_kind": "MARK",
+        },
+        {
+            "position_event_id": "closed-at-same-time",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "position_id": "carry-position",
+            "quantity": 1,
+            "realized_pnl": -5,
+            "status": "CLOSED",
+            "event_kind": "CLOSED",
+        },
+    ]
+    rows["paper_trades.parquet"] = [
+        {
+            "trade_id": "carry-trade",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "position_id": "carry-position",
+            "entry_fill_id": "external-entry-fill",
+            "exit_fill_id": "exit-fill",
+            "side": "LONG",
+            "quantity": 1,
+            "entry_price": 100,
+            "exit_price": 95,
+            "gross_pnl": -5,
+            "fees": 0,
+            "net_pnl": -5,
+            "entry_ts": started.replace(day=14),
+            "exit_ts": closed,
+            "holding_duration_seconds": (closed - started.replace(day=14)).total_seconds(),
+            "spread_cost": 0,
+            "slippage_cost": 0,
+            "simulated_latency_cost": 0,
+            "holding_cost": 0,
+        }
+    ]
+    rows["mfe_mae.parquet"] = [
+        {
+            "result_id": "carry-mfe",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "trade_id": "carry-trade",
+            "position_id": "carry-position",
+            "mfe": 1,
+            "mae": 5,
+            "mfe_source_event_id": "external-mfe-source",
+            "mae_source_event_id": "external-mae-source",
+        }
+    ]
+    rows["shadow_stop_results.parquet"] = [
+        {
+            "result_id": "carry-shadow-stop",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "signal_id": "external-signal",
+            "position_id": "carry-position",
+            "source_event_id": "external-stop-source",
+        }
+    ]
+    rows["raw_orderbook_event_windows.parquet"] = [
+        {
+            "raw_event_id": "raw-current",
+            "source_event_id": "source-current",
+            "session_date": SESSION_DATE,
+            "event_ts": closed,
+            "receive_ts": closed,
+            "window_id": "external-signal",
+            "signal_id": "external-signal",
+        }
+    ]
+    for name, values in rows.items():
+        pq.write_table(
+            pa.Table.from_pylist(values, schema=DATASET_SCHEMAS[name]),
+            data / name,
+            compression="zstd",
+        )
+
+    report = _normalize_daily_carryovers(data, start_utc=started)
+    (root / "CARRYOVER_REFERENCES.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+
+    assert report["reference_count"] == 7
+    assert pq.read_table(data / "paper_trades.parquet").to_pylist()[0]["entry_fill_id"] is None
+    positions = pq.read_table(data / "paper_positions.parquet")
+    tables = {
+        name: pq.read_table(data / name)
+        for name in REQUIRED_DATASETS
+        if name not in {
+            "raw_orderbook_event_windows.parquet",
+            "raw_trades_event_windows.parquet",
+            "raw_last_price_event_windows.parquet",
+            "raw_candles_event_windows.parquet",
+        }
+    }
+    assert positions.num_rows == 2
+    errors: list[str] = []
+    connection = duckdb.connect(":memory:")
+    try:
+        _validate_foreign_key_paths(root, connection, errors)
+        _validate_carryover_references(root, connection, errors)
+    finally:
+        connection.close()
+    _validate_temporal_and_position_reconciliation(tables, errors)
+    assert errors == []
