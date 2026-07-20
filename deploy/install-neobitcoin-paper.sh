@@ -15,6 +15,7 @@ fi
 SOURCE_DIR=$1
 TARGET_DIR=/opt/neobitcoin-paper
 RELEASES_DIR=/opt/neobitcoin-paper-releases
+RELEASE_RETENTION=3
 DATA_DIR=/var/lib/neobitcoin-paper
 CONFIG_DIR=/etc/neobitcoin-paper
 ENV_FILE=${CONFIG_DIR}/paper.env
@@ -307,6 +308,34 @@ fi
 
 rollback_armed=false
 trap - ERR
+
+prune_old_releases() {
+  local current candidate resolved basename kept_previous=0
+  current=$(readlink -f "${TARGET_DIR}")
+  [[ ${current} == "${RELEASES_DIR}/"* && -d ${current} ]] || return 1
+  while IFS= read -r candidate; do
+    [[ -n ${candidate} && -d ${candidate} && ! -L ${candidate} ]] || continue
+    basename=${candidate##*/}
+    [[ ${basename} =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]] || continue
+    resolved=$(readlink -f "${candidate}")
+    [[ ${resolved} == "${RELEASES_DIR}/${basename}" ]] || return 1
+    if [[ ${resolved} == "${current}" ]]; then
+      continue
+    fi
+    if (( kept_previous < RELEASE_RETENTION - 1 )); then
+      ((kept_previous += 1))
+      continue
+    fi
+    rm -rf --one-file-system -- "${resolved}"
+  done < <(
+    find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | sort -r
+  )
+}
+
+if ! prune_old_releases; then
+  echo "warning: old paper releases were not pruned safely" >&2
+fi
+
 echo "${SERVICE}=active"
 echo "${ARCHIVE_TIMER}=active"
 echo "${DELIVERY_TIMER}=active"

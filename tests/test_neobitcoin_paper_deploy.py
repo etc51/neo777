@@ -151,6 +151,7 @@ def test_installer_is_atomic_runs_tests_and_migrations_and_can_roll_back() -> No
     for expected in (
         "TARGET_DIR=/opt/neobitcoin-paper",
         "RELEASES_DIR=/opt/neobitcoin-paper-releases",
+        "RELEASE_RETENTION=3",
         "DATA_DIR=/var/lib/neobitcoin-paper",
         "CONFIG_DIR=/etc/neobitcoin-paper",
         "USER_NAME=neopaper",
@@ -163,6 +164,8 @@ def test_installer_is_atomic_runs_tests_and_migrations_and_can_roll_back() -> No
         "-m neobitcoin_paper.cli migrate --confirm PAPER_ONLY",
         "previous_target",
         "restore_previous_release",
+        "prune_old_releases",
+        'rm -rf --one-file-system -- "${resolved}"',
         'systemctl reset-failed "${SERVICE}"',
         "mv -Tf",
     ):
