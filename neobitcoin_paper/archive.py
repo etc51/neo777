@@ -41,6 +41,8 @@ REQUIRED_DOCUMENTS: Final = (
     "CODE_VERSION.json",
     "SHA256SUMS",
 )
+ARCHIVE_FORMAT_VERSION: Final = 2
+ARCHIVE_SCHEMA_VERSION: Final = "neobitcoin-paper-schema-v2"
 _TOKEN_PATTERN: Final = re.compile(rb"(?<![A-Za-z0-9_.=-])t\.[A-Za-z0-9_.=-]{20,}")
 _SECRET_ASSIGNMENT: Final = re.compile(
     rb"(?i)[\"']?(authorization|token|api[_-]?key|secret)[\"']?"
@@ -204,7 +206,7 @@ class DailyArchiveBuilder:
             manifest: dict[str, object] = {
                 "archive_id": archive_id,
                 "archive_type": "TEST" if request.test_archive else "OOS_DAILY",
-                "schema_version": "neobitcoin-paper-schema-v1",
+                "schema_version": ARCHIVE_SCHEMA_VERSION,
                 "session_date": request.session_date.isoformat(),
                 "start_utc": start_utc.isoformat(),
                 "end_utc": end_utc.isoformat(),
@@ -214,6 +216,10 @@ class DailyArchiveBuilder:
                 "row_counts": row_counts,
                 "strategies": len(request.strategy_registry),
                 "datasets": [f"data/{name}" for name in REQUIRED_DATASETS],
+                "dataset_schema_sha256": {
+                    name: _schema_sha256(pq.read_schema(data_dir / name))
+                    for name in REQUIRED_DATASETS
+                },
                 "validation_policy": "zero unexplained discrepancies",
                 "coverage_schema_version": 1,
                 "session_classification": coverage["classification"],
@@ -708,6 +714,7 @@ class ArchiveValidator:
             errors.append(f"unexpected bundle file {relative}")
 
         tables: dict[str, pa.Table] = {}
+        declared_schema_hashes = _declared_schema_hashes(root)
         pyarrow_ok = True
         duckdb_ok = True
         connection = duckdb.connect(":memory:")
@@ -728,8 +735,15 @@ class ArchiveValidator:
                     duckdb_ok = False
                     errors.append(f"PyArrow cannot read {name}: {type(exc).__name__}")
                     continue
-                expected = DATASET_SCHEMAS[name]
-                if not parquet.schema_arrow.equals(expected, check_metadata=True):
+                expected_schema_hash = (
+                    declared_schema_hashes.get(name)
+                    if declared_schema_hashes is not None
+                    else None
+                )
+                if (
+                    declared_schema_hashes is not None
+                    and _schema_sha256(parquet.schema_arrow) != expected_schema_hash
+                ):
                     errors.append(f"schema mismatch {name}")
                 if name not in _STREAMED_VALIDATION_DATASETS:
                     tables[name] = pq.read_table(path)
@@ -835,6 +849,19 @@ def _expected_bundle_files(*, verify_sums: bool) -> set[str]:
     return documents | {f"data/{name}" for name in REQUIRED_DATASETS}
 
 
+def _declared_schema_hashes(root: Path) -> dict[str, str] | None:
+    try:
+        manifest = json.loads((root / "MANIFEST.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or "dataset_schema_sha256" not in manifest:
+        return None
+    declared = manifest.get("dataset_schema_sha256")
+    if not isinstance(declared, dict):
+        return {}
+    return {str(name): str(digest) for name, digest in declared.items()}
+
+
 def _validate_manifest(
     root: Path,
     row_counts: dict[str, int],
@@ -905,6 +932,17 @@ def _validate_manifest(
         return
     if normalized_counts != row_counts:
         errors.append("manifest row_counts mismatch")
+    if manifest.get("schema_version") == ARCHIVE_SCHEMA_VERSION:
+        schema_hashes = manifest.get("dataset_schema_sha256")
+        if (
+            not isinstance(schema_hashes, dict)
+            or set(schema_hashes) != set(REQUIRED_DATASETS)
+            or any(
+                not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value)
+                for value in schema_hashes.values()
+            )
+        ):
+            errors.append("manifest dataset schema fingerprints mismatch")
 
 
 def _validate_carryover_references(
@@ -1702,13 +1740,17 @@ def _archive_filename(request: ArchiveBuildRequest) -> str:
     marker = "_TEST" if request.test_archive else ""
     return (
         f"neobitcoin_paper_{request.session_date.isoformat()}_"
-        f"{_stamp(request.start_utc)}_{_stamp(request.end_utc)}_schema-v1{marker}.tar.zst"
+        f"{_stamp(request.start_utc)}_{_stamp(request.end_utc)}_"
+        f"schema-v{ARCHIVE_FORMAT_VERSION}{marker}.tar.zst"
     )
 
 
 def _archive_id(request: ArchiveBuildRequest) -> str:
     prefix = "TEST" if request.test_archive else "DAILY"
-    raw = f"{request.session_date}:{_stamp(request.start_utc)}:{_stamp(request.end_utc)}"
+    raw = (
+        f"{request.session_date}:{_stamp(request.start_utc)}:{_stamp(request.end_utc)}:"
+        f"schema-v{ARCHIVE_FORMAT_VERSION}"
+    )
     return f"{prefix}-{request.session_date}-{hashlib.sha256(raw.encode()).hexdigest()[:12]}"
 
 
@@ -1728,6 +1770,10 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _schema_sha256(schema: pa.Schema) -> str:
+    return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
 
 
 def _write_json(path: Path, value: object) -> None:

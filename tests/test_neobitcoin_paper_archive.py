@@ -81,6 +81,7 @@ def test_zero_event_test_archive_has_exact_typed_bundle_and_hashes(
     built = _zero_event_archive(root)
 
     assert built.archive_id.startswith("TEST-")
+    assert "_schema-v2_TEST.tar.zst" in built.archive_path.name
     assert "_TEST.tar.zst" in built.archive_path.name
     assert built.validation.passed
     assert built.validation.pyarrow_verified
@@ -111,9 +112,16 @@ def test_zero_event_test_archive_has_exact_typed_bundle_and_hashes(
 
     manifest = json.loads((extracted / "MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["archive_type"] == "TEST"
+    assert manifest["schema_version"] == "neobitcoin-paper-schema-v2"
     assert manifest["paper_only"] is True
     assert manifest["datasets"] == [f"data/{name}" for name in REQUIRED_DATASETS]
     assert manifest["row_counts"] == {name: 0 for name in REQUIRED_DATASETS}
+    assert set(manifest["dataset_schema_sha256"]) == set(REQUIRED_DATASETS)
+    for name in REQUIRED_DATASETS:
+        expected_schema_sha = hashlib.sha256(
+            DATASET_SCHEMAS[name].serialize().to_pybytes()
+        ).hexdigest()
+        assert manifest["dataset_schema_sha256"][name] == expected_schema_sha
 
     connection = duckdb.connect(":memory:")
     try:
