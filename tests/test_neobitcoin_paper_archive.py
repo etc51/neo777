@@ -177,7 +177,20 @@ class _PostCompressionTamperValidator(ArchiveValidator):
         return super().validate_archive(archive, expected_sha256=expected_sha256)
 
 
-def test_post_compression_failure_moves_artifacts_to_quarantine(tmp_path: Path) -> None:
+class _SourceMutationValidator(ArchiveValidator):
+    def __init__(self, source: Path) -> None:
+        self._source = source
+
+    def validate_archive(
+        self, archive: Path, *, expected_sha256: str | None = None
+    ) -> ArchiveValidationResult:
+        result = super().validate_archive(archive, expected_sha256=expected_sha256)
+        with self._source.open("ab") as stream:
+            stream.write(b"changed-after-snapshot")
+        return result
+
+
+def test_post_compression_failure_leaves_no_archive_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "paper"
     datasets = DatasetStore(root, SESSION_DATE, durable_writes=False)
     builder = DailyArchiveBuilder(validator=_PostCompressionTamperValidator())
@@ -187,15 +200,47 @@ def test_post_compression_failure_moves_artifacts_to_quarantine(tmp_path: Path) 
 
     assert not tuple((root / "daily_archives").glob("*.tar.zst"))
     assert not tuple(root.rglob("*.inprogress"))
-    quarantined_archives = tuple((root / "quarantine").glob("*.tar.zst"))
-    assert len(quarantined_archives) == 1
-    assert tuple((root / "quarantine").glob("*.tar.zst.sha256"))
-    failure_markers = tuple((root / "quarantine").glob("*.failure.json"))
+    assert not tuple((root / "quarantine").glob("*.tar.zst*"))
+    assert not tuple(root.rglob("*.tar.zst"))
+    failure_markers = tuple((root / "reports").glob("archive_failure_*.json"))
     assert len(failure_markers) == 1
     failure = json.loads(failure_markers[0].read_text(encoding="utf-8"))
-    assert failure["status"] == "QUARANTINED"
+    assert failure["status"] == "FAILED_VALIDATION_NO_ARCHIVE"
     assert failure["error_type"] == "ArchiveError"
-    assert tuple((root / "reports").glob("archive_failure_*.json"))
+
+
+def test_corrupt_finalized_source_never_reaches_archive_directory(tmp_path: Path) -> None:
+    root = tmp_path / "paper"
+    datasets = DatasetStore(root, SESSION_DATE, durable_writes=False)
+    datasets.close()
+    corrupt = root / "parquet" / SESSION_DATE.isoformat() / "paper_trades.parquet"
+    corrupt.write_bytes(b"not parquet")
+
+    with pytest.raises(ArchiveError, match="daily source is unreadable"):
+        DailyArchiveBuilder().build(_request(root))
+
+    assert not tuple((root / "daily_archives").iterdir())
+    assert not tuple(root.rglob("*.tar.zst"))
+    assert not tuple(root.rglob("*.inprogress"))
+    failure_markers = tuple((root / "reports").glob("archive_failure_*.json"))
+    assert len(failure_markers) == 1
+    failure = json.loads(failure_markers[0].read_text(encoding="utf-8"))
+    assert failure["status"] == "FAILED_VALIDATION_NO_ARCHIVE"
+
+
+def test_source_change_during_build_prevents_atomic_publication(tmp_path: Path) -> None:
+    root = tmp_path / "paper"
+    datasets = DatasetStore(root, SESSION_DATE, durable_writes=False)
+    datasets.close()
+    source = root / "parquet" / SESSION_DATE.isoformat() / "paper_trades.parquet"
+    builder = DailyArchiveBuilder(validator=_SourceMutationValidator(source))
+
+    with pytest.raises(ArchiveError, match="daily source changed during archive build"):
+        builder.build(_request(root))
+
+    assert not tuple((root / "daily_archives").iterdir())
+    assert not tuple(root.rglob("*.tar.zst"))
+    assert not tuple(root.rglob("*.inprogress"))
 
 
 def test_daily_archive_normalizes_only_proven_carryover_references(tmp_path: Path) -> None:

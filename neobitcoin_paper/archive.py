@@ -135,26 +135,43 @@ class DailyArchiveBuilder:
         destination.mkdir(parents=True, exist_ok=True)
         filename = _archive_filename(request)
         final_path = destination / filename
-        temporary = final_path.with_suffix(final_path.suffix + ".inprogress")
         sidecar = Path(str(final_path) + ".sha256")
-        sidecar_tmp = Path(str(sidecar) + ".inprogress")
-        quarantine_dir = root / "quarantine"
         existing = _reuse_existing_archive(
             archive_id=archive_id,
             final_path=final_path,
             sidecar=sidecar,
-            quarantine_dir=quarantine_dir,
             validator=self._validator,
         )
         if existing is not None:
             return existing
 
-        stage = Path(tempfile.mkdtemp(prefix=f".{archive_id}-", dir=destination))
+        work_root = root / "state" / "archive_work"
+        work_root.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f".{archive_id}-", dir=work_root))
+        stage = work_dir / "bundle"
+        stage.mkdir()
+        temporary = work_dir / "payload.tar.zst"
+        sidecar_tmp = work_dir / "payload.tar.zst.sha256"
+        published_archive = False
+        published_sidecar = False
         try:
             data_dir = stage / "data"
             data_dir.mkdir()
+            source_fingerprints = _inspect_daily_parquet_sources(parquet_dir)
             for name in REQUIRED_DATASETS:
-                shutil.copy2(parquet_dir / name, data_dir / name)
+                source = parquet_dir / name
+                copied = data_dir / name
+                os.link(source, copied)
+                expected_size, expected_mtime_ns, expected_sha = source_fingerprints[name]
+                source_stat = source.stat()
+                if (
+                    source_stat.st_size != expected_size
+                    or source_stat.st_mtime_ns != expected_mtime_ns
+                    or not os.path.samefile(source, copied)
+                    or copied.stat().st_size != expected_size
+                    or _sha256_file(copied) != expected_sha
+                ):
+                    raise ArchiveError(f"daily source changed while staging {name}")
 
             carryovers = _normalize_daily_carryovers(data_dir, start_utc=start_utc)
             _write_json(stage / "CARRYOVER_REFERENCES.json", carryovers)
@@ -226,18 +243,26 @@ class DailyArchiveBuilder:
                 )
 
             _write_tar_zst(stage, temporary)
-            os.replace(temporary, final_path)
-            final_path.chmod(0o640)
-            sha = _sha256_file(final_path)
-            sidecar_tmp.write_text(f"{sha}  {final_path.name}\n", encoding="ascii")
-            os.replace(sidecar_tmp, sidecar)
-            sidecar.chmod(0o640)
-            archive_validation = self._validator.validate_archive(final_path, expected_sha256=sha)
+            sha = _sha256_file(temporary)
+            archive_validation = self._validator.validate_archive(
+                temporary, expected_sha256=sha
+            )
             if not archive_validation.passed:
                 raise ArchiveError(
                     "compressed archive validation failed: "
                     + "; ".join(archive_validation.errors)
                 )
+            _verify_daily_parquet_sources(parquet_dir, source_fingerprints)
+            sidecar_tmp.write_text(f"{sha}  {final_path.name}\n", encoding="ascii")
+            _fsync_file(sidecar_tmp)
+            temporary.chmod(0o640)
+            sidecar_tmp.chmod(0o640)
+            os.replace(sidecar_tmp, sidecar)
+            published_sidecar = True
+            _fsync_directory(destination)
+            os.replace(temporary, final_path)
+            published_archive = True
+            _fsync_directory(destination)
             return BuiltArchive(
                 archive_id=archive_id,
                 archive_path=final_path,
@@ -248,33 +273,24 @@ class DailyArchiveBuilder:
                 manifest=manifest,
             )
         except Exception as exc:
-            quarantine_dir.mkdir(parents=True, exist_ok=True)
-            _quarantine_file(final_path, quarantine_dir, final_path.name)
-            _quarantine_file(
-                temporary,
-                quarantine_dir,
-                final_path.name + ".partial",
-            )
-            _quarantine_file(sidecar, quarantine_dir, sidecar.name)
-            _quarantine_file(
-                sidecar_tmp,
-                quarantine_dir,
-                sidecar.name + ".partial",
-            )
+            if published_archive:
+                final_path.unlink(missing_ok=True)
+            if published_sidecar:
+                sidecar.unlink(missing_ok=True)
+            _fsync_directory(destination)
             failure_payload = {
                 "archive_id": archive_id,
                 "failed_at": datetime.now(UTC).isoformat(),
-                "status": "QUARANTINED",
+                "status": "FAILED_VALIDATION_NO_ARCHIVE",
                 "error_type": type(exc).__name__,
             }
             report_dir = root / "reports"
             report_dir.mkdir(parents=True, exist_ok=True)
             failure = report_dir / f"archive_failure_{archive_id}.json"
             _write_json(failure, failure_payload)
-            _write_json(quarantine_dir / f"{archive_id}.failure.json", failure_payload)
             raise
         finally:
-            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _reuse_existing_archive(
@@ -282,10 +298,9 @@ def _reuse_existing_archive(
     archive_id: str,
     final_path: Path,
     sidecar: Path,
-    quarantine_dir: Path,
     validator: ArchiveValidator,
 ) -> BuiltArchive | None:
-    """Reuse a previously verified finalization; quarantine incomplete pairs."""
+    """Reuse a verified finalization; discard and rebuild any incomplete pair."""
 
     if not final_path.exists() and not sidecar.exists():
         return None
@@ -308,10 +323,62 @@ def _reuse_existing_archive(
                         validation=validation,
                         manifest=manifest,
                     )
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-    _quarantine_file(final_path, quarantine_dir, final_path.name)
-    _quarantine_file(sidecar, quarantine_dir, sidecar.name)
+    final_path.unlink(missing_ok=True)
+    sidecar.unlink(missing_ok=True)
     return None
+
+
+def _inspect_daily_parquet_sources(parquet_dir: Path) -> dict[str, tuple[int, int, str]]:
+    """Prove the finalized source set is immutable and readable before copying."""
+
+    fingerprints: dict[str, tuple[int, int, str]] = {}
+    connection = duckdb.connect(":memory:")
+    try:
+        for name in REQUIRED_DATASETS:
+            path = parquet_dir / name
+            if path.is_symlink() or not path.is_file():
+                raise ArchiveError(f"daily source is not a regular file: {name}")
+            try:
+                schema = pq.read_schema(path)
+                metadata = pq.read_metadata(path)
+                counted = connection.execute(
+                    "SELECT count(*) FROM read_parquet(?)", [str(path)]
+                ).fetchone()
+            except (duckdb.Error, OSError, pa.ArrowException) as exc:
+                raise ArchiveError(f"daily source is unreadable: {name}") from exc
+            if not schema.equals(DATASET_SCHEMAS[name], check_metadata=True):
+                raise ArchiveError(f"daily source schema mismatch: {name}")
+            if counted is None or int(counted[0]) != metadata.num_rows:
+                raise ArchiveError(f"daily source row-count mismatch: {name}")
+            source_stat = path.stat()
+            fingerprints[name] = (
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+                _sha256_file(path),
+            )
+    finally:
+        connection.close()
+    return fingerprints
+
+
+def _verify_daily_parquet_sources(
+    parquet_dir: Path,
+    fingerprints: dict[str, tuple[int, int, str]],
+) -> None:
+    """Reject publication if any finalized source changed during the build."""
+
+    for name in REQUIRED_DATASETS:
+        path = parquet_dir / name
+        expected_size, expected_mtime_ns, expected_sha = fingerprints[name]
+        if path.is_symlink() or not path.is_file():
+            raise ArchiveError(f"daily source changed during archive build: {name}")
+        current = path.stat()
+        if (
+            current.st_size != expected_size
+            or current.st_mtime_ns != expected_mtime_ns
+            or _sha256_file(path) != expected_sha
+        ):
+            raise ArchiveError(f"daily source changed during archive build: {name}")
 
 
 def _read_sidecar_digest(sidecar: Path, archive_name: str) -> str | None:
@@ -340,17 +407,6 @@ def _read_archive_manifest(archive: Path) -> dict[str, object]:
         return {str(key): value for key, value in loaded.items()}
     finally:
         shutil.rmtree(extracted, ignore_errors=True)
-
-
-def _quarantine_file(path: Path, quarantine_dir: Path, target_name: str) -> Path | None:
-    if not path.exists():
-        return None
-    target = quarantine_dir / target_name
-    if target.exists():
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        target = quarantine_dir / f"{target_name}.{stamp}"
-    os.replace(path, target)
-    return target
 
 
 def _normalize_daily_carryovers(data_dir: Path, *, start_utc: datetime) -> dict[str, object]:
@@ -1593,6 +1649,23 @@ def _write_tar_zst(source: Path, destination: Path) -> None:
                 arcname=path.relative_to(source).as_posix(),
                 recursive=False,
             )
+    _fsync_file(destination)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("r+b") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _extract_tar_zst(archive: Path, destination: Path) -> None:
