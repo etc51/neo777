@@ -125,6 +125,7 @@ class PaperTradingEngine:
         self._positions: dict[str, PaperPosition] = {}
         self._position_policies: dict[str, ExitPolicy] = {}
         self._pending_exits: dict[str, ExitDecision] = {}
+        self._invalidated_positions: set[str] = set()
         self._position_signals: dict[str, str] = {}
         self._entry_fills: dict[str, str] = {}
         self._active_windows: set[str] = set()
@@ -357,6 +358,7 @@ class PaperTradingEngine:
 
     def _observe_quality(self, event: CanonicalMarketEvent) -> DataQualitySnapshot:
         if event.event_type == "reconnect":
+            self._invalidate_gap_sensitive_positions()
             self._quality_gate.on_connect()
             self._features.reset_continuity()
             self._reset_plugin_continuity()
@@ -366,9 +368,17 @@ class PaperTradingEngine:
             self._reset_plugin_continuity()
         snapshot = self._quality_gate.observe(event)
         if event.gap_status != "OK":
+            self._invalidate_gap_sensitive_positions()
             self._features.reset_continuity()
             self._reset_plugin_continuity()
         return snapshot
+
+    def _invalidate_gap_sensitive_positions(self) -> None:
+        self._invalidated_positions.update(
+            position_id
+            for position_id, position in self._positions.items()
+            if position.strategy_id == "MICRO_FLOW_FAST_60"
+        )
 
     def _reset_plugin_continuity(self) -> None:
         for plugin in self._plugins:
@@ -809,13 +819,21 @@ class PaperTradingEngine:
             )
             decision = self._pending_exits.get(position_id)
             if decision is None:
-                decision = self._execution.evaluate_exit(
-                    marked,
-                    book,
-                    tick_size=self._tick_size,
-                    policy=self._position_policies[position_id],
-                    session_closing=session_closing,
-                )
+                if position_id in self._invalidated_positions:
+                    decision = ExitDecision(
+                        reason=ExitReason.DATA_GAP_INVALIDATED,
+                        trigger_ts=book.receive_ts,
+                        trigger_event_id=book.event_id,
+                        trigger_price=mark_price,
+                    )
+                else:
+                    decision = self._execution.evaluate_exit(
+                        marked,
+                        book,
+                        tick_size=self._tick_size,
+                        policy=self._position_policies[position_id],
+                        session_closing=session_closing,
+                    )
                 if decision is not None:
                     self._pending_exits[position_id] = decision
                     # An exit decision cannot consume the same book that
@@ -844,6 +862,7 @@ class PaperTradingEngine:
             if updated.status is PositionStatus.CLOSED:
                 account = account.without_open_position(position_id)
                 self._positions.pop(position_id, None)
+                self._invalidated_positions.discard(position_id)
                 self._pending_exits.pop(position_id, None)
                 self._state.remove_open_position(position_id)
                 self._record_position(updated, account, event, "CLOSED")
@@ -1143,6 +1162,77 @@ class PaperTradingEngine:
                     ),
                 },
             )
+        for raw_ticks in specification.parameters.get("shadow_trailing_ticks", ()):
+            trailing_ticks = int(raw_ticks)
+            trigger = self._shadow_trailing_trigger(position, trailing_ticks)
+            exit_price = trigger[0] if trigger is not None else None
+            source_event_id = trigger[1] if trigger is not None else position.exit_event_id
+            trigger_ts = trigger[2] if trigger is not None else event.processing_ts
+            direction = Decimal("1") if position.is_long else Decimal("-1")
+            pnl = (
+                (exit_price - position.entry_price) * position.quantity * direction
+                if exit_price is not None
+                else None
+            )
+            self._datasets.append(
+                "shadow_exit_results",
+                {
+                    "result_id": deterministic_id(
+                        "shadow-trailing", trade_id, trailing_ticks
+                    ),
+                    "event_ts": trigger_ts,
+                    "signal_id": signal_id,
+                    "order_id": None,
+                    "position_id": position.position_id,
+                    "strategy_id": position.strategy_id,
+                    "strategy_version": position.strategy_version,
+                    "exit_model": f"TRAILING_{trailing_ticks}_TICKS",
+                    "triggered": trigger is not None,
+                    "trigger_reason": (
+                        "TRAILING_DRAWDOWN_REACHED"
+                        if trigger is not None
+                        else "NOT_REACHED"
+                    ),
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                    "source_event_id": source_event_id,
+                },
+            )
+
+    def _shadow_trailing_trigger(
+        self, position: PaperPosition, trailing_ticks: int
+    ) -> tuple[Decimal, str, datetime] | None:
+        distance = Decimal(trailing_ticks) * self._tick_size
+        extreme = position.entry_price
+        for raw in self._raw_buffer:
+            if (
+                raw.event_type != "orderbook"
+                or raw.instrument_uid != position.instrument_uid
+                or raw.receive_ts < position.opened_ts
+                or (position.closed_ts is not None and raw.receive_ts > position.closed_ts)
+                or raw.gap_status != "OK"
+            ):
+                continue
+            payload: Mapping[str, object] = raw.payload
+            nested = raw.payload.get("orderbook") or raw.payload.get("order_book")
+            if isinstance(nested, Mapping):
+                payload = cast(Mapping[str, object], nested)
+            bids = _levels(payload.get("bids"), descending=True)
+            asks = _levels(payload.get("asks"), descending=False)
+            if not bids or not asks or bids[0].price >= asks[0].price:
+                continue
+            executable = bids[0].price if position.is_long else asks[0].price
+            if position.is_long:
+                extreme = max(extreme, executable)
+                activated = extreme > position.entry_price
+                triggered = activated and extreme - executable >= distance
+            else:
+                extreme = min(extreme, executable)
+                activated = extreme < position.entry_price
+                triggered = activated and executable - extreme >= distance
+            if triggered:
+                return executable, raw.event_id, raw.receive_ts
+        return None
 
     def _persist_position(
         self,
@@ -1173,6 +1263,7 @@ class PaperTradingEngine:
                 "position": _position_state(position),
                 "exit_policy": _policy_state(policy),
                 "signal_id": self._position_signals.get(position.position_id),
+                "data_gap_invalidated": position.position_id in self._invalidated_positions,
                 "entry_fill_id": self._entry_fills.get(position.position_id),
                 "source_event_id": source_event_id,
             },
@@ -1436,6 +1527,7 @@ class PaperTradingEngine:
                     position_id: _exit_decision_state(decision)
                     for position_id, decision in sorted(self._pending_exits.items())
                 },
+                "invalidated_positions": sorted(self._invalidated_positions),
                 "last_book": _book_state(self._last_book) if self._last_book is not None else None,
                 "plugin_states": {
                     plugin.specification.key: _jsonable(snapshot())
@@ -1540,6 +1632,9 @@ class PaperTradingEngine:
                         self._pending_exits[str(position_id)] = _exit_decision_from_state(
                             cast(Mapping[str, Any], value)
                         )
+            invalidated = checkpoint.get("invalidated_positions", [])
+            if isinstance(invalidated, list):
+                self._invalidated_positions.update(str(item) for item in invalidated)
 
         for row in recovery.pending_intents:
             state = row.get("state", {})
@@ -1603,6 +1698,8 @@ class PaperTradingEngine:
             self._position_signals[position.position_id] = str(
                 trailing.get("signal_id") or position.position_id
             )
+            if bool(trailing.get("data_gap_invalidated", False)):
+                self._invalidated_positions.add(position.position_id)
             entry_fill = trailing.get("entry_fill_id")
             if entry_fill:
                 self._entry_fills[position.position_id] = str(entry_fill)

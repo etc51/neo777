@@ -299,6 +299,70 @@ def test_time_exit_waits_for_next_causal_book_and_survives_restart(tmp_path: Pat
         datasets.abort()
 
 
+def test_fast_60_gap_invalidation_is_durable_and_uses_real_next_book(
+    tmp_path: Path,
+) -> None:
+    strategy_spec = spec("MICRO_FLOW_FAST_60")
+    registry = registry_for(strategy_spec)
+    database = tmp_path / "gap.sqlite"
+    data_root = tmp_path / "gap-data"
+    signal_at = BASE + timedelta(seconds=20)
+    with PaperStateStore(database) as state:
+        engine, datasets = build_engine(
+            data_root,
+            state,
+            registry,
+            [SignalStrategy(strategy_spec)],
+            decision_latency=timedelta(milliseconds=100),
+        )
+        asyncio.run(make_ready(engine))
+        asyncio.run(
+            engine.process_event(
+                canonical("gap-signal", "trade", signal_at, payload={"signal": True})
+            )
+        )
+        opened = asyncio.run(
+            engine.process_event(orderbook("gap-entry", signal_at + timedelta(seconds=1)))
+        )
+        assert len(opened.opened_position_ids) == 1
+        asyncio.run(
+            engine.process_event(
+                canonical(
+                    "critical-gap",
+                    "trade",
+                    signal_at + timedelta(seconds=2),
+                    gap="TRADES_GAP",
+                )
+            )
+        )
+        datasets.abort()
+
+    with PaperStateStore(database) as state:
+        restored, datasets = build_engine(
+            data_root,
+            state,
+            registry,
+            [SignalStrategy(strategy_spec)],
+            decision_latency=timedelta(milliseconds=100),
+        )
+        trigger = asyncio.run(
+            restored.process_event(orderbook("real-gap-trigger", signal_at + timedelta(seconds=3)))
+        )
+        assert not trigger.closed_position_ids
+        closed = asyncio.run(
+            restored.process_event(
+                orderbook("real-gap-execution", signal_at + timedelta(seconds=4))
+            )
+        )
+        assert len(closed.closed_position_ids) == 1
+        datasets.close()
+
+    trades = pq.read_table(
+        data_root / "parquet" / "2026-07-15" / "paper_trades.parquet"
+    ).to_pylist()
+    assert trades[-1]["exit_reason"] == "DATA_GAP_INVALIDATED"
+    assert trades[-1]["exit_event_id"] == "real-gap-execution"
+
 def test_identical_equity_state_for_same_event_is_written_once(tmp_path: Path) -> None:
     strategy_spec = spec("EQUITY_ONCE")
     with PaperStateStore(tmp_path / "state.sqlite") as state:
