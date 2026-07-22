@@ -490,7 +490,14 @@ def canonicalize_record(
     uid = record.instrument_uid or expected_uid
     if uid != expected_uid:
         raise InstrumentIdentityError("stream event belongs to an unexpected UID")
-    latency = max(0.0, (record.received_at - exchange).total_seconds() * 1000)
+    # A streaming candle timestamp denotes the start of its interval, not the
+    # time the update traversed the network.  Comparing a 15-minute candle's
+    # opening timestamp with receive time creates a fictitious latency of up
+    # to 900 seconds and incorrectly closes the paper entry gate.  For candles
+    # measure local transport/dispatch delay; keep exchange_ts unchanged for
+    # causal feature calculation.
+    latency_origin = record.received_at if record.event_type == "candle" else exchange
+    latency = max(0.0, (processing - latency_origin).total_seconds() * 1000)
     consistent = record.is_consistent
     gap = "OK" if consistent is not False else "ORDERBOOK_GAP"
     identity = {

@@ -2,7 +2,7 @@
 Description=Archive each completed Neobitcoin paper session
 
 [Timer]
-OnCalendar=*-*-* 00:05:00 Europe/Moscow
+OnCalendar=*-*-* 00:15:00 Europe/Moscow
 AccuracySec=30s
 RandomizedDelaySec=30s
 Persistent=true

@@ -10,9 +10,10 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
 from collections import Counter
-from collections.abc import Callable, Iterable
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -58,6 +59,26 @@ _STREAMED_VALIDATION_DATASETS: Final = frozenset(
         "raw_candles_event_windows.parquet",
     }
 )
+_ARCHIVE_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _exclusive_archive_lock(path: Path) -> Iterator[None]:
+    """Serialize archive publication across threads and Linux processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _ARCHIVE_THREAD_LOCK, path.open("a+b") as handle:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            if os.name == "posix":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 class ArchiveError(RuntimeError):
@@ -108,6 +129,17 @@ class DailyArchiveBuilder:
         self._validator = validator or ArchiveValidator()
 
     def build(
+        self,
+        request: ArchiveBuildRequest,
+        *,
+        dataset_store: DatasetStore | None = None,
+    ) -> BuiltArchive:
+        root = request.data_root.resolve()
+        lock_path = root / "state" / "archive-build.lock"
+        with _exclusive_archive_lock(lock_path):
+            return self._build_locked(request, dataset_store=dataset_store)
+
+    def _build_locked(
         self,
         request: ArchiveBuildRequest,
         *,

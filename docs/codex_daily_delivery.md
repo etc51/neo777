@@ -17,7 +17,7 @@ task. A path string that the task cannot open is not delivery.
    official Codex SDK's equivalent resume API), start one turn there, and wait
    for completion acknowledgement.
 4. Bind daily scheduled work to this existing task for the analysis/check loop,
-   nominally around 00:10 MSK after the 00:05 archive finalizer. It must return to
+   nominally around 00:25 MSK after the 00:15 archive finalizer. It must return to
    the current task, not create an independent scheduled task.
 
 Browser automation, ChatGPT cookies, DOM scraping, simulated clicks, private web

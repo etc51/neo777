@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Event
 
 import duckdb
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -20,6 +22,7 @@ from neobitcoin_paper.archive import (
     BuiltArchive,
     DailyArchiveBuilder,
     _contains_secret,
+    _exclusive_archive_lock,
     _extract_tar_zst,
     _normalize_daily_carryovers,
     _validate_carryover_references,
@@ -29,6 +32,36 @@ from neobitcoin_paper.archive import (
 from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS, DatasetStore
 
 SESSION_DATE = date(2026, 7, 15)
+
+
+def test_archive_lock_serializes_concurrent_publishers(tmp_path: Path) -> None:
+    lock_path = tmp_path / "state" / "archive-build.lock"
+    first_entered = Event()
+    release_first = Event()
+    second_started = Event()
+    second_entered = Event()
+
+    def first() -> None:
+        with _exclusive_archive_lock(lock_path):
+            first_entered.set()
+            assert release_first.wait(2)
+
+    def second() -> None:
+        second_started.set()
+        with _exclusive_archive_lock(lock_path):
+            second_entered.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first)
+        assert first_entered.wait(2)
+        second_future = pool.submit(second)
+        assert second_started.wait(2)
+        assert not second_entered.wait(0.05)
+        release_first.set()
+        first_future.result(timeout=2)
+        second_future.result(timeout=2)
+
+    assert second_entered.is_set()
 
 
 def test_secret_scan_reads_logical_parquet_strings(tmp_path: Path) -> None:

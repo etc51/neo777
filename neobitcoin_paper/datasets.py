@@ -9,6 +9,7 @@ small operational SQLite database.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -715,24 +716,33 @@ def _build_table(
     session: date,
     *,
     seen_primary_keys: set[str] | None = None,
+    seen_equity_rows: dict[str, str] | None = None,
 ) -> pa.Table:
     schema = DATASET_SCHEMAS[dataset]
     primary_key = (schema.metadata or {})[b"primary_key"].decode("utf-8")
     normalized = [_normalize_row(row, schema, primary_key, session) for row in rows]
     seen = seen_primary_keys if seen_primary_keys is not None else set()
+    unique_rows: list[dict[str, Any]] = []
     for row in normalized:
         identifier = str(row[primary_key])
         if identifier in seen:
+            if seen_equity_rows is not None:
+                fingerprint = _normalized_row_sha256(row)
+                if seen_equity_rows.get(identifier) == fingerprint:
+                    continue
             raise DuplicatePrimaryKeyError(f"{dataset}: duplicate {primary_key}={identifier}")
         seen.add(identifier)
-    normalized.sort(
+        if seen_equity_rows is not None:
+            seen_equity_rows[identifier] = _normalized_row_sha256(row)
+        unique_rows.append(row)
+    unique_rows.sort(
         key=lambda row: (
             row.get("event_ts") or datetime.max.replace(tzinfo=UTC),
             str(row.get(primary_key) or ""),
         )
     )
     try:
-        return pa.Table.from_pylist(normalized, schema=schema)
+        return pa.Table.from_pylist(unique_rows, schema=schema)
     except (ArrowError, TypeError, ValueError) as exc:
         raise DatasetMaterializationError(f"{dataset}: {exc}") from exc
 
@@ -751,6 +761,9 @@ def _materialize_parquet(
     # performs the global DISTINCT check with DuckDB after Parquet is written.
     # A fresh per-batch set still rejects immediate duplicates while writing.
     seen_primary_keys: set[str] | None = None if dataset in _RAW_EVENT_WINDOW_DATASETS else set()
+    seen_equity_rows: dict[str, str] | None = (
+        {} if dataset == "equity_curve.parquet" else None
+    )
     previous_event_ts: datetime | None = None
     writer: pq.ParquetWriter | None = None
     try:
@@ -761,6 +774,7 @@ def _materialize_parquet(
                 rows,
                 session,
                 seen_primary_keys=seen_primary_keys,
+                seen_equity_rows=seen_equity_rows,
             )
             timestamps = table["event_ts"].to_pylist()
             if (
@@ -860,6 +874,17 @@ def _normalize_row(
             drawdown=normalized["drawdown"],
         )
     return normalized
+
+
+def _normalized_row_sha256(row: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        row,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _coerce(value: Any, data_type: pa.DataType) -> Any:

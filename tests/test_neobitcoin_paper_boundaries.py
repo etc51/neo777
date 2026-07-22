@@ -14,6 +14,7 @@ from neo_trader.neobitcoin_research.safety import (
     TBankRpcBlockedError,
     require_allowed_rpc_path,
 )
+from neo_trader.neobitcoin_research.tbank import TBankStreamRecord
 from neobitcoin_paper.calendar import SessionCalendar
 from neobitcoin_paper.config import PaperConfig
 from neobitcoin_paper.delivery import (
@@ -22,7 +23,7 @@ from neobitcoin_paper.delivery import (
     DeliveryError,
 )
 from neobitcoin_paper.domain import BookLevel, DataQuality, MarketEvent, OrderBook
-from neobitcoin_paper.ingest import CanonicalMarketEvent, DataQualityGate
+from neobitcoin_paper.ingest import CanonicalMarketEvent, DataQualityGate, canonicalize_record
 from neobitcoin_paper.observability import HealthRegistry, HealthServer, JsonLogFormatter
 from neobitcoin_paper.safety import (
     PAPER_ONLY,
@@ -137,6 +138,35 @@ def test_data_quality_reconnect_requires_acks_and_warmup() -> None:
     assert second.entry_allowed is True
     gate.on_disconnect()
     assert gate.snapshot().entry_allowed is False
+
+
+def test_streaming_candle_uses_transport_latency_not_interval_open_age() -> None:
+    received = datetime.now(UTC)
+    record = TBankStreamRecord(
+        event_type="candle",
+        subscription_kind=None,
+        received_at=received,
+        received_monotonic_ns=1,
+        exchange_timestamp=received - timedelta(minutes=15),
+        instrument_uid="4effa274-4e8f-422c-93ff-04aa34fe8e39",
+        ticker="BTCUSDperpA",
+        class_code="SPBDMFUT",
+        stream_id="stream-test",
+        subscription_id="subscription-test",
+        subscription_status=None,
+        is_consistent=True,
+        payload={"interval": "SUBSCRIPTION_INTERVAL_FIFTEEN_MINUTES"},
+    )
+
+    event = canonicalize_record(
+        record,
+        reconnect_generation=1,
+        instance_id="test-instance",
+        expected_uid="4effa274-4e8f-422c-93ff-04aa34fe8e39",
+    )
+
+    assert event.exchange_ts == record.exchange_timestamp
+    assert 0 <= event.latency_ms < 3_000
 
 
 def test_data_quality_numeric_normal_trading_status_is_open_fail_closed() -> None:

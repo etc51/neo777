@@ -131,6 +131,7 @@ class PaperTradingEngine:
         self._raw_written: dict[str, set[str]] = {}
         self._raw_buffer: deque[CanonicalMarketEvent] = deque()
         self._last_book: OrderBook | None = None
+        self._last_equity_id_by_account: dict[str, str] = {}
         self._validate_plugins()
         self._restore_and_register(self._state.recover())
 
@@ -1207,18 +1208,26 @@ class PaperTradingEngine:
                 "open_position_ids": account.open_position_ids,
             },
         )
+        equity_id = equity_point_id(
+            account.account_id,
+            event_ts,
+            cash=account.cash,
+            equity=account.equity,
+            realized_pnl=account.realized_pnl,
+            unrealized_pnl=account.unrealized_pnl,
+            drawdown=account.max_drawdown,
+        )
+        # Marking and closing a zero-PnL position can legitimately produce the
+        # same complete account state for the same market event.  Persist that
+        # immutable state once; a duplicate JSONL row would otherwise make the
+        # whole daily materialization fail on its primary-key invariant.
+        if self._last_equity_id_by_account.get(account.account_id) == equity_id:
+            return
+        self._last_equity_id_by_account[account.account_id] = equity_id
         self._datasets.append(
             "equity_curve",
             {
-                "equity_id": equity_point_id(
-                    account.account_id,
-                    event_ts,
-                    cash=account.cash,
-                    equity=account.equity,
-                    realized_pnl=account.realized_pnl,
-                    unrealized_pnl=account.unrealized_pnl,
-                    drawdown=account.max_drawdown,
-                ),
+                "equity_id": equity_id,
                 "event_ts": event_ts,
                 "account_id": account.account_id,
                 "strategy_id": account.strategy_id,

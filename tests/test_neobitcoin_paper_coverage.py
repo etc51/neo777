@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from neobitcoin_paper.coverage import SessionClassification, classify_session
 from neobitcoin_paper.datasets import DATASET_SCHEMAS, REQUIRED_DATASETS
@@ -68,3 +69,23 @@ def test_complete_feature_ready_zero_signal_day_is_valid_no_trade(tmp_path: Path
     assert report["classification"] == SessionClassification.VALID_NO_TRADE_SESSION
     assert report["oos_included"] is True
     assert report["investigation_required"] is False
+
+
+def test_sixty_second_maintenance_cadence_allows_scheduler_jitter(tmp_path: Path) -> None:
+    start = datetime(2026, 7, 18, 7, tzinfo=UTC)
+    end = start + timedelta(minutes=10)
+    rows = [
+        {
+            "event_id": f"quality-{index}",
+            "session_date": date(2026, 7, 18),
+            "event_ts": start + timedelta(seconds=index * 60.05),
+            "feature_ready": True,
+            "gap_status": "OK",
+        }
+        for index in range(11)
+    ]
+
+    report = classify_session(_datasets(tmp_path / "data", rows), start_utc=start, end_utc=end)
+
+    assert report["classification"] == SessionClassification.VALID_NO_TRADE_SESSION
+    assert report["longest_observed_gap_seconds"] == pytest.approx(60.05)

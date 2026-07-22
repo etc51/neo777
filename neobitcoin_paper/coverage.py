@@ -24,6 +24,7 @@ class SessionClassification(StrEnum):
 
 
 _CLOSED = {"NOT_AVAILABLE_FOR_TRADING", "DEALER_NOT_AVAILABLE_FOR_TRADING", "CLOSED"}
+_MAX_SCHEDULED_EVENT_GAP_SECONDS = 61.0
 
 
 def classify_session(
@@ -62,7 +63,13 @@ def classify_session(
     gap_events = sum(1 for row in quality if row.get("gap_status") not in {None, "OK"})
     status_values = {str(row.get("trading_status") or "UNKNOWN") for row in statuses}
     closed_only = bool(status_values) and status_values.issubset(_CLOSED)
-    adequate_transport = coverage_ratio >= 0.95 and max_gap <= 60.0
+    # The SDK emits closed/quiet-stream maintenance traffic on an approximate
+    # 60-second cadence.  One second of scheduler tolerance prevents normal
+    # millisecond jitter from invalidating an otherwise continuous full day;
+    # explicit unresolved gap events remain fail-closed below.
+    adequate_transport = (
+        coverage_ratio >= 0.95 and max_gap <= _MAX_SCHEDULED_EVENT_GAP_SECONDS
+    )
     adequate_features = ready_ratio >= 0.90 and gap_events == 0
     reasons: list[str] = []
     if test_archive:
@@ -74,8 +81,8 @@ def classify_session(
         classification = SessionClassification.INVALID_DATA_COVERAGE
         if coverage_ratio < 0.95:
             reasons.append("TEMPORAL_COVERAGE_BELOW_95_PERCENT")
-        if max_gap > 60.0:
-            reasons.append("LONGEST_OBSERVED_GAP_EXCEEDS_60_SECONDS")
+        if max_gap > _MAX_SCHEDULED_EVENT_GAP_SECONDS:
+            reasons.append("LONGEST_OBSERVED_GAP_EXCEEDS_61_SECONDS")
         if ready_ratio < 0.90:
             reasons.append("FEATURE_READY_BELOW_90_PERCENT")
         if gap_events:

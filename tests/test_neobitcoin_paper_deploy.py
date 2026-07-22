@@ -98,9 +98,9 @@ def test_archive_and_delivery_are_isolated_oneshots() -> None:
     delivery = _parse_unit("neobitcoin-paper-delivery.service")
     assert _one(archive, "Service", "Type") == "oneshot"
     assert _one(archive, "Service", "Restart") == "on-failure"
-    assert _one(archive, "Service", "RestartSec") == "60s"
-    assert _one(archive, "Unit", "StartLimitIntervalSec") == "15min"
-    assert _one(archive, "Unit", "StartLimitBurst") == "3"
+    assert _one(archive, "Service", "RestartSec") == "120s"
+    assert _one(archive, "Unit", "StartLimitIntervalSec") == "20min"
+    assert _one(archive, "Unit", "StartLimitBurst") == "5"
     assert _one(delivery, "Service", "Type") == "oneshot"
     assert _one(archive, "Service", "ExecStart").endswith(
         "-m neobitcoin_paper.cli archive --confirm PAPER_ONLY"
@@ -126,7 +126,7 @@ def test_archive_and_delivery_are_isolated_oneshots() -> None:
 def test_timers_archive_at_session_end_and_retry_delivery_frequently() -> None:
     archive = _parse_unit("neobitcoin-paper-archive.timer")
     delivery = _parse_unit("neobitcoin-paper-delivery.timer")
-    assert _one(archive, "Timer", "OnCalendar") == "*-*-* 00:05:00 Europe/Moscow"
+    assert _one(archive, "Timer", "OnCalendar") == "*-*-* 00:15:00 Europe/Moscow"
     assert _one(archive, "Timer", "Persistent") == "true"
     assert _one(archive, "Timer", "Unit") == "neobitcoin-paper-archive.service"
     assert _one(delivery, "Timer", "OnBootSec") == "90s"

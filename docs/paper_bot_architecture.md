@@ -260,7 +260,7 @@ Systemd owns three independent work paths:
 
 - `neobitcoin-paper.service` — continuous ingest/strategy/execution/state;
 - `neobitcoin-paper-archive.service` + `.timer` — isolated daily finalizer at
-  about 00:05 MSK;
+  about 00:15 MSK;
 - `neobitcoin-paper-delivery.service` + `.timer` — non-blocking outbox retry,
   nominally once per minute.
 

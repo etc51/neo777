@@ -31,7 +31,7 @@ off.
 | Unit | Role | Expected state |
 |---|---|---|
 | `neobitcoin-paper.service` | continuous ingest, strategies, simulation, state, health | enabled and active |
-| `neobitcoin-paper-archive.timer` | persistent 00:05 MSK finalizer trigger | enabled and active |
+| `neobitcoin-paper-archive.timer` | persistent 00:15 MSK finalizer trigger | enabled and active |
 | `neobitcoin-paper-archive.service` | close/materialize/validate one completed session | inactive between successful runs |
 | `neobitcoin-paper-delivery.timer` | retry durable outbox after boot and roughly every minute | enabled and active |
 | `neobitcoin-paper-delivery.service` | one delivery attempt batch | inactive between successful runs |
@@ -172,7 +172,7 @@ the state and next daily archive. Any logic change is a new version.
 
 ## Archive finalization and verification
 
-The normal timer triggers at about 00:05 MSK after the expected 00:00 Neo crypto
+The normal timer triggers at about 00:15 MSK after the expected 00:00 Neo crypto
 close. Final publication also requires an observed closed trading status and the
 configured grace period. A persistent timer and startup recovery catch missed or
 unfinished sessions.

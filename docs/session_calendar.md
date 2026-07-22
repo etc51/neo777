@@ -113,7 +113,7 @@ gate. A complete post-reconnect warmup is required before `feature_ready=true`.
 ## Session finalization
 
 Expected crypto Neo close is 00:00 MSK. The fallback finalizer checkpoint is
-00:05 MSK on the following calendar day, using the session date on which the
+00:15 MSK on the following calendar day, using the session date on which the
 window opened. The default sequence is:
 
 1. pass expected close;
@@ -124,7 +124,7 @@ window opened. The default sequence is:
 6. validate and publish the daily archive;
 7. queue same-task Codex delivery.
 
-The timer is persistent, so a missed 00:05 trigger is run after boot. Runtime
+The timer is persistent, so a missed 00:15 trigger is run after boot. Runtime
 recovery must also discover an unfinished prior session and finalize it
 idempotently. A zero-trade day produces a typed zero archive with health and
 quality evidence. No active `.inprogress` file enters the bundle.

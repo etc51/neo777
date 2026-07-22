@@ -12,7 +12,6 @@ from neobitcoin_paper.datasets import (
     DATASET_SCHEMAS,
     REQUIRED_DATASETS,
     DatasetStore,
-    DuplicatePrimaryKeyError,
 )
 from neobitcoin_paper.state import ImmutableStrategyError, PaperStateStore
 
@@ -301,7 +300,7 @@ def test_equity_close_transition_rekeys_legacy_same_event_collision(tmp_path: Pa
     assert "legacy-same-event-id" not in identifiers
 
 
-def test_equity_rekey_still_rejects_exact_duplicate_state(tmp_path: Path) -> None:
+def test_equity_exact_duplicate_state_is_idempotent(tmp_path: Path) -> None:
     root = tmp_path / "paper-data"
     store = DatasetStore(root, "2026-07-15", durable_writes=False)
     row = {
@@ -319,8 +318,8 @@ def test_equity_rekey_still_rejects_exact_duplicate_state(tmp_path: Path) -> Non
     store.append("equity_curve", row)
     store.append("equity_curve", {**row, "equity_id": "legacy-second"})
 
-    with pytest.raises(DuplicatePrimaryKeyError):
-        store.close()
+    table = pq.read_table(store.close()["equity_curve.parquet"])
+    assert table.num_rows == 1
 
 
 def test_raw_active_jsonl_is_zstd_compressed_and_restart_recoverable(

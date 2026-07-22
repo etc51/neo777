@@ -299,6 +299,32 @@ def test_time_exit_waits_for_next_causal_book_and_survives_restart(tmp_path: Pat
         datasets.abort()
 
 
+def test_identical_equity_state_for_same_event_is_written_once(tmp_path: Path) -> None:
+    strategy_spec = spec("EQUITY_ONCE")
+    with PaperStateStore(tmp_path / "state.sqlite") as state:
+        engine, datasets = build_engine(
+            tmp_path / "data",
+            state,
+            registry_for(strategy_spec),
+            [SignalStrategy(strategy_spec)],
+        )
+        account = engine.accounts[0]
+        at = BASE + timedelta(seconds=30)
+
+        engine._replace_account(account, at, "same-event")
+        engine._replace_account(account, at, "same-event")
+
+        text = datasets.active_path("equity_curve").read_text(encoding="utf-8")
+        rows = [json.loads(line) for line in text.splitlines()]
+        matching = [
+            row
+            for row in rows
+            if datetime.fromisoformat(row["event_ts"].replace("Z", "+00:00")) == at
+        ]
+        assert len(matching) == 1
+        datasets.abort()
+
+
 def test_gap_signal_is_rejected_and_strategy_failure_is_isolated(tmp_path: Path) -> None:
     good_spec = spec("GOOD")
     bad_spec = spec("BAD")
