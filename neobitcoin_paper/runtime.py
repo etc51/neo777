@@ -47,10 +47,12 @@ from .state import PaperStateStore
 from .strategies import (
     CounterflowFeatureEngine,
     FlowAlignmentStrategy,
+    MicroFlowFast60Strategy,
     PaperStrategy,
     StrongCounterflowAbsorptionStrategy,
     frozen_counterflow_version,
     frozen_flow_alignment_v1,
+    frozen_micro_flow_fast_60_v1,
 )
 
 LOGGER = logging.getLogger("neobitcoin_paper.runtime")
@@ -611,6 +613,8 @@ class PaperRuntime:
                     "L5_FLOW_ALIGNMENT",
                 }:
                     plugins.append(FlowAlignmentStrategy(specification))
+                elif specification.strategy_id == "MICRO_FLOW_FAST_60":
+                    plugins.append(MicroFlowFast60Strategy(specification))
                 elif specification.strategy_id == "STRONG_COUNTERFLOW_ABSORPTION":
                     plugins.append(
                         StrongCounterflowAbsorptionStrategy(
@@ -671,6 +675,14 @@ class PaperRuntime:
                     created + timedelta(seconds=1),
                     False,
                 ),
+                (
+                    frozen_micro_flow_fast_60_v1(
+                        created_at=created,
+                        activated_at=activated,
+                    ),
+                    created + timedelta(seconds=1),
+                    True,
+                ),
             )
         versions: list[tuple[StrategyVersion, datetime, bool]] = []
         installed: set[str] = set()
@@ -716,6 +728,22 @@ class PaperRuntime:
                     evaluation_cohort="LIVE_OOS",
                     lifecycle=strategy_lifecycle(specification),
                 )
+            elif strategy_id == "MICRO_FLOW_FAST_60":
+                if version != "v1":
+                    raise RuntimeError("unsupported immutable MICRO_FLOW_FAST_60 version")
+                specification = frozen_micro_flow_fast_60_v1(
+                    created_at=registered - timedelta(microseconds=1),
+                    activated_at=activated,
+                )
+                enabled = True
+                state.set_strategy_enabled(strategy_id, version, True)
+                state.set_strategy_lifecycle(
+                    strategy_id,
+                    version,
+                    lifecycle_status=specification.status.value,
+                    evaluation_cohort="LIVE_OOS",
+                    lifecycle=strategy_lifecycle(specification),
+                )
             else:
                 if enabled:
                     state.set_strategy_enabled(strategy_id, version, False)
@@ -726,18 +754,29 @@ class PaperRuntime:
             installed.add(strategy_id)
         created = self._now()
         activated = created + timedelta(seconds=5)
-        for strategy_id in ("MICRO_FLOW_ALIGNMENT", "L5_FLOW_ALIGNMENT"):
+        for strategy_id in (
+            "MICRO_FLOW_ALIGNMENT",
+            "L5_FLOW_ALIGNMENT",
+            "MICRO_FLOW_FAST_60",
+        ):
             if strategy_id in installed:
                 continue
             versions.append(
                 (
-                    frozen_flow_alignment_v1(
-                        strategy_id,
-                        created_at=created,
-                        activated_at=activated,
+                    (
+                        frozen_micro_flow_fast_60_v1(
+                            created_at=created,
+                            activated_at=activated,
+                        )
+                        if strategy_id == "MICRO_FLOW_FAST_60"
+                        else frozen_flow_alignment_v1(
+                            strategy_id,
+                            created_at=created,
+                            activated_at=activated,
+                        )
                     ),
                     created + timedelta(seconds=1),
-                    strategy_id == "MICRO_FLOW_ALIGNMENT",
+                    strategy_id in {"MICRO_FLOW_ALIGNMENT", "MICRO_FLOW_FAST_60"},
                 )
             )
         return tuple(versions)

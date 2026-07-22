@@ -163,8 +163,13 @@ class StrategyRegistry:
         initial_cash = decimal_value(initial_cash, "initial_cash")
         if initial_cash <= 0:
             raise DomainValidationError("initial virtual cash must be positive")
+        configured_account_id = version.parameters.get("account_id")
         account = VirtualAccount(
-            account_id=deterministic_id("account", version.strategy_id, version.version),
+            account_id=(
+                str(configured_account_id)
+                if configured_account_id is not None
+                else deterministic_id("account", version.strategy_id, version.version)
+            ),
             strategy_id=version.strategy_id,
             strategy_version=version.version,
             initial_cash=initial_cash,

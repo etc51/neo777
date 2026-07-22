@@ -126,7 +126,7 @@ class PaperStrategy(Protocol):
     @property
     def specification(self) -> StrategyVersion: ...
 
-    def evaluate(self, context: StrategyContext) -> StrategyDecision: ...
+    def evaluate(self, context: StrategyContext) -> StrategyDecision | None: ...
 
 
 class StatefulPaperStrategy(PaperStrategy, Protocol):
@@ -569,6 +569,217 @@ class FlowAlignmentStrategy:
         )
 
 
+class MicroFlowFast60Strategy:
+    """Frozen causal receive-time 1 Hz implementation of MICRO_FLOW_FAST_60_v1."""
+
+    _ID = "MICRO_FLOW_FAST_60"
+
+    def __init__(self, specification: StrategyVersion) -> None:
+        if specification.strategy_id != self._ID or specification.version != "v1":
+            raise ValueError("unexpected MICRO_FLOW_FAST_60 specification")
+        self._specification = specification
+        self._bucket: datetime | None = None
+        self._sample: StrategyContext | None = None
+        self._flow: deque[_FlowObservation] = deque()
+        self._long_active = False
+        self._short_active = False
+        self._cooldown_until: datetime | None = None
+
+    @property
+    def specification(self) -> StrategyVersion:
+        return self._specification
+
+    def on_intent_accepted(self, intent: PaperIntent) -> None:
+        if (intent.strategy_id, intent.strategy_version) != (
+            self._specification.strategy_id,
+            self._specification.version,
+        ):
+            raise ValueError("accepted intent belongs to another strategy version")
+        self._cooldown_until = intent.decision_ts + timedelta(seconds=120)
+
+    def snapshot_state(self) -> Mapping[str, object]:
+        return {
+            "long_active": self._long_active,
+            "short_active": self._short_active,
+            "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
+            "sampling_bucket": self._bucket.isoformat() if self._bucket else None,
+        }
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        self._long_active = bool(state.get("long_active", False))
+        self._short_active = bool(state.get("short_active", False))
+        raw = state.get("cooldown_until")
+        self._cooldown_until = (
+            datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(UTC)
+            if raw else None
+        )
+        # A partly sampled second is deliberately not restored: after restart a
+        # complete, causally observed second is required before evaluation.
+        self._bucket = None
+        self._sample = None
+        self._flow.clear()
+
+    def reset_continuity(self) -> None:
+        self._bucket = None
+        self._sample = None
+        self._flow.clear()
+        self._long_active = False
+        self._short_active = False
+
+    def evaluate(self, context: StrategyContext) -> StrategyDecision | None:
+        bucket = context.event.receive_ts.replace(microsecond=0)
+        decision: StrategyDecision | None = None
+        if self._bucket is None:
+            self._bucket = bucket
+        elif bucket > self._bucket:
+            if self._sample is not None:
+                decision = self._evaluate_sample(
+                    self._sample,
+                    evaluation_receive_ts=self._bucket + timedelta(seconds=1),
+                    decision_ts=context.event.processing_ts,
+                )
+            self._bucket = bucket
+            self._sample = None
+
+        observation = _flow_observation(context.event)
+        if observation is not None:
+            # This strategy's frozen window is receive-time, not exchange-time.
+            self._flow.append(
+                _FlowObservation(
+                    observation.event_id,
+                    context.event.receive_ts,
+                    context.event.receive_ts,
+                    observation.sequence,
+                    observation.side,
+                    observation.quantity,
+                )
+            )
+        cutoff = context.event.receive_ts - timedelta(seconds=6)
+        self._flow = deque(item for item in self._flow if item.receive_ts > cutoff)
+        if (
+            bucket == self._bucket
+            and context.event.event_type.casefold() == "orderbook"
+            and context.book is not None
+        ):
+            self._sample = context
+        return decision
+
+    def _evaluate_sample(
+        self,
+        sample: StrategyContext,
+        *,
+        evaluation_receive_ts: datetime,
+        decision_ts: datetime,
+    ) -> StrategyDecision:
+        quote = _quote_features(sample.book, Decimal("0.1"))
+        flow = _flow_windows(tuple(self._flow), evaluation_receive_ts, decision_ts)[0]
+        alignment = _decimal(quote.get("microprice_offset"))
+        spread_ticks = quote.get("spread_ticks")
+        ratio = flow.trade_flow_ratio
+        feature_ready = bool(
+            alignment is not None
+            and flow.known_trade_count >= 1
+            and flow.known_volume > 0
+            and sample.data_quality is DataQuality.GOOD
+        )
+        long_condition = bool(
+            feature_ready and alignment >= Decimal("0.60")
+            and ratio is not None and ratio >= Decimal("0.80")
+            and isinstance(spread_ticks, int) and spread_ticks <= 5
+        )
+        short_condition = bool(
+            feature_ready and alignment <= Decimal("-0.60")
+            and ratio is not None and ratio <= Decimal("-0.80")
+            and isinstance(spread_ticks, int) and spread_ticks <= 5
+        )
+        long_rising = long_condition and not self._long_active
+        short_rising = short_condition and not self._short_active
+        self._long_active, self._short_active = long_condition, short_condition
+        side = Side.BUY if long_rising else Side.SELL if short_rising else None
+        own = sample.own_state.get(self._specification.key, {})
+        own = own if isinstance(own, Mapping) else {}
+        gates = {
+            "feature_ready": feature_ready,
+            "directional_rising_edge": side is not None,
+            "spread_gate": isinstance(spread_ticks, int) and spread_ticks <= 5,
+            "cooldown_ready": self._cooldown_until is None or decision_ts >= self._cooldown_until,
+            "no_pending_order": not bool(own.get("pending", False)),
+            "no_open_position": not bool(own.get("open", False)),
+            "data_quality": sample.data_quality is DataQuality.GOOD,
+            "live_status": sample.session.entry_allowed,
+        }
+        signal = side is not None and all(bool(value) for value in gates.values())
+        failed = next((name for name, value in gates.items() if not value), None)
+        intent = None
+        if signal and side is not None:
+            intent = PaperIntent.create(
+                strategy_id=self._specification.strategy_id,
+                strategy_version=self._specification.version,
+                instrument_uid=sample.event.instrument_uid,
+                decision_ts=decision_ts,
+                eligible_ts=decision_ts,
+                side=side,
+                quantity=Decimal("1"),
+                execution_model=ExecutionModel.AGGRESSIVE,
+                reason="frozen receive-time 1 Hz micro-flow continuation",
+                confidence=min(Decimal("1"), abs(alignment or Decimal("0"))),
+                decision_event_id=sample.event.event_id,
+                exit_policy=ExitPolicy(time_exit_seconds=60, close_at_session_end=True),
+                metadata={
+                    "signal_receive_ts": evaluation_receive_ts.isoformat(),
+                    "signal_processing_ts": decision_ts.isoformat(),
+                    "signal_reconnect_generation": sample.event.reconnect_generation,
+                    "max_entry_wait_seconds": 5,
+                    "max_entry_spread_ticks": 5,
+                    "additional_slippage_ticks_each_side": 1,
+                    "evaluation_cohort": "LIVE_OOS",
+                    "sampling_semantics": "LAST_VALID_BOOK_PER_COMPLETED_RECEIVE_SECOND",
+                    "mm_regime": "UNKNOWN",
+                },
+            )
+        return StrategyDecision(
+            evaluation_id=deterministic_id(
+                "evaluation", self._specification.key, evaluation_receive_ts, sample.event.event_id
+            ),
+            strategy_id=self._specification.strategy_id,
+            version=self._specification.version,
+            feature_ts=evaluation_receive_ts,
+            side_considered=side,
+            signal=signal,
+            reason="SIGNAL" if signal else f"GATE:{failed or 'NO_EDGE'}",
+            conditions={
+                **gates,
+                "long_condition": long_condition,
+                "short_condition": short_condition,
+                "microprice_offset": alignment,
+                "trade_flow_ratio_5s": ratio,
+                "buy_volume_5s": flow.buy_volume,
+                "sell_volume_5s": flow.sell_volume,
+                "unknown_volume_5s": flow.unknown_side_volume,
+                "trade_count_5s": flow.trade_count,
+                "known_trade_count_5s": flow.known_trade_count,
+                "unknown_trade_count_5s": flow.unknown_side_trade_count,
+                "signal_spread_ticks": spread_ticks,
+                "evaluation_receive_ts": evaluation_receive_ts,
+                "sample_book_event_id": sample.event.event_id,
+                "mm_regime": "UNKNOWN",
+            },
+            thresholds={
+                "microprice_offset_abs_min": "0.60",
+                "trade_flow_ratio_5s_abs_min": "0.80",
+                "max_entry_spread_ticks": 5,
+                "cooldown_seconds": 120,
+                "evaluation_frequency_seconds": 1,
+                "time_exit_seconds": 60,
+            },
+            source_event_ids=tuple(
+                item for item in (flow.first_event_id, flow.last_event_id, sample.event.event_id)
+                if item is not None
+            ),
+            intent=intent,
+        )
+
+
 @dataclass(slots=True)
 class _WorkerHealth:
     failures: int = 0
@@ -642,7 +853,8 @@ class StrategySupervisor:
                 continue
             health.failures = 0
             health.circuit_until = None
-            decisions.append(decision)
+            if decision is not None:
+                decisions.append(decision)
         return tuple(decisions), tuple(errors)
 
 
@@ -654,6 +866,68 @@ def frozen_counterflow_v1(
         created_at=created_at,
         activated_at=activated_at,
         discovery_source="task specification control values; no later approved registry found",
+    )
+
+
+def frozen_micro_flow_fast_60_v1(
+    *, created_at: datetime, activated_at: datetime
+) -> StrategyVersion:
+    """Build the immutable forward-only MICRO_FLOW_FAST_60_v1 registry row."""
+
+    parameters: dict[str, object] = {
+        "account_id": "MICRO_FLOW_FAST_60_v1",
+        "evaluation_cohort": "LIVE_OOS",
+        "historical_backfill_to_live_account": False,
+        "evaluation_frequency_seconds": 1,
+        "sampling_semantics": "LAST_VALID_BOOK_PER_COMPLETED_RECEIVE_SECOND",
+        "microprice_offset_long_threshold": 0.60,
+        "microprice_offset_short_threshold": -0.60,
+        "trade_flow_window_seconds": 5,
+        "trade_flow_ratio_long_threshold": 0.80,
+        "trade_flow_ratio_short_threshold": -0.80,
+        "minimum_known_trades_5s": 1,
+        "cooldown_seconds": 120,
+        "max_concurrent_positions_per_strategy": 1,
+        "max_pending_orders": 1,
+        "max_entry_spread_ticks": 5,
+        "entry": "next_received_orderbook_aggressive",
+        "max_entry_wait_seconds": 5,
+        "time_exit_seconds": 60,
+        "additional_slippage_ticks_each_side": 1,
+        "virtual_quantity": 1,
+        "compounding": False,
+        "shadow_stop_ticks": [100, 200, 300, 500, 800, 1000],
+        "shadow_take_ticks": [100, 200, 300, 500, 800, 1000],
+        "shadow_trailing_ticks": [100, 200, 300, 500],
+        "minimum_live_oos_trades": 100,
+        "minimum_live_oos_sessions": 5,
+    }
+    canonical = json.dumps(parameters, sort_keys=True, separators=(",", ":"))
+    source = inspect.getsource(MicroFlowFast60Strategy)
+    return StrategyVersion(
+        strategy_id="MICRO_FLOW_FAST_60",
+        version="v1",
+        status=StrategyStatus.FROZEN_PAPER_OOS_ACCUMULATION,
+        created_at=created_at.astimezone(UTC),
+        activated_at=activated_at.astimezone(UTC),
+        discovery_source="DISCOVERY/PARAMETER_SELECTION 2026-07-15..21; forward OOS only",
+        description="One-second sampled L1 microprice and five-second receive-time flow",
+        parameters=parameters,
+        code_hash=hashlib.sha256(source.encode()).hexdigest(),
+        config_hash=hashlib.sha256(canonical.encode()).hexdigest(),
+        feature_schema_version="schema-v4.1-receive-time-1hz",
+        execution_model_version="paper-next-book-v1",
+        risk_model_version="paper-time-exit-stress-v1",
+        session_filters=(
+            SessionLabel.MORNING,
+            SessionLabel.MAIN,
+            SessionLabel.EVENING,
+            SessionLabel.NEO_LATE_SESSION,
+            SessionLabel.WEEKEND,
+        ),
+        minimum_warmup=1,
+        new_entry_cutoff_seconds=300,
+        position_carry_policy="INTRADAY_CLOSE",
     )
 
 

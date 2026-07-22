@@ -202,14 +202,20 @@ def test_runtime_is_restart_safe_idempotent_and_notifies_only_when_healthy(
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert generations == 2
     assert events == 1
-    assert strategies == 1
-    assert accounts == 2
+    assert strategies == 2
+    assert accounts == 3
     assert schema_version == 3
     assert lifecycle == [
         ("L5_FLOW_ALIGNMENT", "PAUSE_NEW_ENTRIES_OOS_FAILURE", "LIVE_OOS", 0),
         (
             "MICRO_FLOW_ALIGNMENT",
             "FROZEN_PAPER_DEGRADED_CONTINUE_OOS",
+            "LIVE_OOS",
+            1,
+        ),
+        (
+            "MICRO_FLOW_FAST_60",
+            "FROZEN_PAPER_OOS_ACCUMULATION",
             "LIVE_OOS",
             1,
         ),
